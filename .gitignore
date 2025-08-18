@@ -106,3 +106,5 @@ tests/
 test*
 input/
 output/
+reels-clips-automator/utils/RealESRGAN
+reels-clips-automator-ref
