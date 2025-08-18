@@ -1,0 +1,11 @@
+librosa>=0.10.1
+numpy>=1.24.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+pytube>=15.0.0
+opencv-python>=4.8.0
+ffmpeg-python>=0.2.0
+whisper>=1.1.10
+watchdog
+pytest
+eth-typing>=2.0.0
