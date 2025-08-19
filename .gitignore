@@ -104,7 +104,10 @@ tasks/tasks.md
 tasks/
 tests/
 test*
-input/
-output/
+input/*
+input_tmp/
+output/*
 reels-clips-automator/utils/RealESRGAN
 reels-clips-automator-ref
+core
+reels-clips-automator/utils/RealESRGAN

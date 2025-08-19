@@ -9,3 +9,4 @@ whisper>=1.1.10
 watchdog
 pytest
 eth-typing>=2.0.0
+ffprobe

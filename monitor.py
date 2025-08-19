@@ -107,7 +107,7 @@ class NewVideoHandler(FileSystemEventHandler):
                 
                 if result.returncode == 0:
                     print(f"✅ Successfully processed {Path(video_path).name}")
-                    self._organize_output_files(reelsfy_dir, video_output_dir, video_name)
+                    self._organize_output_files(reelsfy_dir, video_output_dir, Path(video_path).name)
                 else:
                     print(f"❌ Error processing {Path(video_path).name}")
                     print(f"Error output: {result.stderr}")
@@ -135,7 +135,8 @@ class NewVideoHandler(FileSystemEventHandler):
         """Move generated files to organized output directory"""
         try:
             # Look for generated files in reelsfy outputs directory
-            reelsfy_outputs_dir = reelsfy_dir / "outputs" / "input"
+            # reelsfy_outputs_dir = reelsfy_dir / "outputs" / "input"
+            reelsfy_outputs_dir = video_output_dir
             
             files_to_move = [
                 ("*.mp4", "final_video.mp4"),
@@ -171,11 +172,34 @@ class NewVideoHandler(FileSystemEventHandler):
             
             if moved_files:
                 print(f"Organized {len(moved_files)} files in {video_output_dir}")
+                
+                # Integrate social media publishing
+                self._publish_to_social_media(video_output_dir, video_name)
             else:
                 print("No output files found to organize")
                 
         except Exception as e:
             print(f"Error organizing output files: {e}")
+    
+    def _publish_to_social_media(self, video_output_dir, video_name):
+        """Publish video to social media platforms via Postiz API"""
+        try:
+            print("📱 Starting social media publishing...")
+            
+            # Import and initialize publisher
+            from social_media_publisher import PostizPublisher
+            publisher = PostizPublisher(str(video_output_dir))
+            
+            # Start async publishing (non-blocking)
+            publisher.publish_async()
+            print("📱 Social media publishing started in background")
+            
+        except ImportError:
+            print("📱 Social media publisher not available (module not found)")
+        except ValueError as e:
+            print(f"📱 Social media publishing configuration error: {e}")
+        except Exception as e:
+            print(f"📱 Social media publishing error: {e}")
 
 def main():
     # Load environment variables from the root .env file

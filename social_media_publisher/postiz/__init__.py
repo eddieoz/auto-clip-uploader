@@ -1,0 +1,1 @@
+# Postiz API integration package
