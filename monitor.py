@@ -3,6 +3,7 @@ import os
 import subprocess
 import shutil
 import threading
+import queue
 from pathlib import Path
 from datetime import datetime
 from watchdog.observers import Observer
@@ -14,18 +15,56 @@ class NewVideoHandler(FileSystemEventHandler):
     def __init__(self):
         self.processing_files = set()  # Track files currently being processed
         self.lock = threading.Lock()
+        self.video_queue = queue.Queue()  # FIFO queue for video files
+        self.queue_worker_thread = None
+        self.stop_worker = threading.Event()
         
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v")):
             file_path = Path(event.src_path)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] New video detected: {file_path.name}")
             
-            # Start monitoring this file in a separate thread
-            threading.Thread(
-                target=self._monitor_and_process_file,
-                args=(file_path,),
-                daemon=True
-            ).start()
+            # Add to queue for processing
+            self.video_queue.put(file_path)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Added {file_path.name} to processing queue (queue size: {self.video_queue.qsize()})")
+    
+    def start_queue_worker(self):
+        """Start the queue worker thread"""
+        if self.queue_worker_thread is None or not self.queue_worker_thread.is_alive():
+            self.stop_worker.clear()
+            self.queue_worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
+            self.queue_worker_thread.start()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Queue worker thread started")
+    
+    def stop_queue_worker(self):
+        """Stop the queue worker thread"""
+        if self.queue_worker_thread and self.queue_worker_thread.is_alive():
+            self.stop_worker.set()
+            self.queue_worker_thread.join(timeout=5)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Queue worker thread stopped")
+    
+    def _queue_worker(self):
+        """Worker thread that processes videos from the queue in FIFO order"""
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Queue worker started, waiting for videos...")
+        
+        while not self.stop_worker.is_set():
+            try:
+                # Wait for a video with timeout to allow checking stop event
+                file_path = self.video_queue.get(timeout=1.0)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing {file_path.name} from queue (remaining: {self.video_queue.qsize()})")
+                
+                # Process the file
+                self._monitor_and_process_file(file_path)
+                
+                # Mark task as done
+                self.video_queue.task_done()
+                
+            except queue.Empty:
+                # No video in queue, continue checking
+                continue
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Error in queue worker: {e}")
+                continue
     
     def _monitor_and_process_file(self, file_path):
         """Monitor a file until it's fully copied, then process it"""
@@ -245,6 +284,10 @@ def main():
     output_folder.mkdir(exist_ok=True)
 
     event_handler = NewVideoHandler()
+    
+    # Start the queue worker
+    event_handler.start_queue_worker()
+    
     observer = PollingObserver() if use_polling else Observer()
     observer.schedule(event_handler, str(video_folder_path), recursive=False)
     observer.start()
@@ -258,6 +301,7 @@ def main():
     except KeyboardInterrupt:
         print("\n🛑 Stopping monitor...")
         observer.stop()
+        event_handler.stop_queue_worker()
     observer.join()
     print("👋 Monitor stopped")
 
