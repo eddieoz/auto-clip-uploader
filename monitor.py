@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 from dotenv import load_dotenv
 
@@ -201,6 +202,16 @@ class NewVideoHandler(FileSystemEventHandler):
         except Exception as e:
             print(f"📱 Social media publishing error: {e}")
 
+def is_cifs_mount(path):
+    """Check if a path is on a CIFS/SMB mount"""
+    try:
+        import subprocess
+        result = subprocess.run(['stat', '-f', '-c', '%T', str(path)], 
+                              capture_output=True, text=True, check=False)
+        return 'cifs' in result.stdout.lower() or 'smb' in result.stdout.lower()
+    except:
+        return False
+
 def main():
     # Load environment variables from the root .env file
     load_dotenv()
@@ -219,9 +230,14 @@ def main():
     
     output_folder = Path(__file__).parent / "output"
     
+    # Check if the path is on a CIFS mount
+    use_polling = is_cifs_mount(video_folder_path)
+    observer_type = "PollingObserver (CIFS detected)" if use_polling else "Observer (native filesystem)"
+    
     print("🎬 Video File Monitor Starting...")
     print(f"👀 Monitoring: {video_folder_path.absolute()}")
     print(f"📁 Output to: {output_folder.absolute()}")
+    print(f"🔍 Observer type: {observer_type}")
     print("🎯 Supported formats: .mp4, .mov, .avi, .mkv, .webm, .flv, .wmv, .m4v")
 
     # Create directories if they don't exist
@@ -229,7 +245,7 @@ def main():
     output_folder.mkdir(exist_ok=True)
 
     event_handler = NewVideoHandler()
-    observer = Observer()
+    observer = PollingObserver() if use_polling else Observer()
     observer.schedule(event_handler, str(video_folder_path), recursive=False)
     observer.start()
     
