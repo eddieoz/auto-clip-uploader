@@ -523,7 +523,7 @@ class PostizClient:
             # Unknown/generic platform - use minimal safe settings
             return base_settings
     
-    def create_post(self, file_info: Dict[str, str], content: str, channel_ids: List[str], 
+    def create_post(self, file_info: Dict[str, str], content, channel_ids: List[str], 
                    posting_type: str = "now", scheduled_datetime: Optional[str] = None, 
                    metadata=None, platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
         """
@@ -548,7 +548,7 @@ class PostizClient:
         
         return self._real_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping)
     
-    def _mock_create_post(self, file_info: Dict[str, str], content: str, channel_ids: List[str], 
+    def _mock_create_post(self, file_info: Dict[str, str], content, channel_ids: List[str], 
                          posting_type: str, scheduled_datetime: Optional[str]) -> Dict[str, any]:
         """Mock post creation for testing"""
         if posting_type == "now":
@@ -577,7 +577,7 @@ class PostizClient:
             "message": "Mock post creation successful"
         }
     
-    def _real_create_post(self, file_info: Dict[str, str], content: str, channel_ids: List[str], 
+    def _real_create_post(self, file_info: Dict[str, str], content, channel_ids: List[str], 
                          posting_type: str, scheduled_datetime: Optional[str], metadata=None, 
                          platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
         """Real post creation implementation"""
@@ -586,22 +586,50 @@ class PostizClient:
         else:
             print(f"Scheduling multi-platform post for {len(channel_ids)} channels at {scheduled_datetime}")
         
+        # Handle both string content (backward compatibility) and dict content (platform-specific)
+        if isinstance(content, dict):
+            platform_content = content
+        else:
+            # Backward compatibility: use same content for all platforms
+            platform_content = {platform: content for platform in (platform_mapping.values() if platform_mapping else [])}
+            # Add fallback content for unmapped channels
+            platform_content["default"] = content
+        
         # Build platform posts for each channel with platform-specific settings
         posts = []
         for channel_id in channel_ids:
             # Get platform name for this channel (fallback to generic if not provided)
             platform = platform_mapping.get(channel_id) if platform_mapping else None
             
+            # Get platform-specific content
+            post_content = platform_content.get(platform, platform_content.get("default", list(platform_content.values())[0] if platform_content else ""))
+            
             # Get platform-specific settings
             settings = self._get_platform_settings(platform)
             
             # Add platform-specific settings
-            # YouTube and some platforms require a title
-            # Extract first 50 chars of content as title
-            if len(content) > 50:
-                title = content[:47] + "..."
+            # Import PLATFORM_LIMITS to respect platform-specific character limits
+            from ..utils.content_formatter import SocialMediaFormatter
+            
+            # Get platform-specific limits
+            platform_limits = SocialMediaFormatter.PLATFORM_LIMITS.get(platform, SocialMediaFormatter.PLATFORM_LIMITS["twitter"])
+            
+            # For title extraction, use platform-appropriate limits
+            if platform in ["twitter"]:
+                # Twitter needs shorter title due to character limits
+                title_limit = 47
+            elif platform in ["youtube"]:
+                # YouTube can handle longer titles
+                title_limit = 100
             else:
-                title = content
+                # For Instagram, TikTok, etc., use more generous limits since they don't strictly need titles
+                title_limit = min(200, platform_limits.max_length // 4)
+            
+            # Extract title based on platform limits
+            if len(post_content) > title_limit:
+                title = post_content[:title_limit-3] + "..."
+            else:
+                title = post_content
                 
             # Use metadata for YouTube title if available
             if metadata and hasattr(metadata, 'get_youtube_title'):
@@ -624,7 +652,7 @@ class PostizClient:
             post_data = {
                 "integration": {"id": channel_id},
                 "value": [{
-                    "content": content,
+                    "content": post_content,
                     "image": [{
                         "id": file_info["id"],
                         "path": file_info["path"]
@@ -651,8 +679,12 @@ class PostizClient:
             posts.append(post_data)
         
         # Fix posting type - API expects "schedule" not "date"
-        # api_posting_type = "schedule" if posting_type == "date" else posting_type
-        api_posting_type = "now"
+        api_posting_type = "schedule" if posting_type == "date" else posting_type
+        
+        # Debug: Log the posting type transformation
+        print(f"🕒 Posting type transformation:")
+        print(f"   Input posting_type: '{posting_type}'")
+        print(f"   Final api_posting_type: '{api_posting_type}'")
         
         # Build payload with all required fields
         payload = {
@@ -662,9 +694,13 @@ class PostizClient:
             "posts": posts
         }
         
-        # Add date field for scheduled posts  
+        # Add date field - required by Postiz API for all posts
         if posting_type == "date" and scheduled_datetime:
             payload["date"] = scheduled_datetime
+        else:
+            # For immediate posts, use current datetime
+            from datetime import datetime
+            payload["date"] = datetime.now().isoformat()
         
         try:
             print(f"Sending post creation request with payload: {len(posts)} posts")
@@ -707,7 +743,7 @@ class PostizClient:
         except Exception as e:
             raise PostizAPIError(f"Post creation failed: {str(e)}")
     
-    def create_post_with_fallback(self, file_info: Dict[str, str], content: str, channel_ids: List[str],
+    def create_post_with_fallback(self, file_info: Dict[str, str], content, channel_ids: List[str],
                                  posting_type: str = "now", scheduled_datetime: Optional[str] = None, 
                                  metadata=None, platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
         """

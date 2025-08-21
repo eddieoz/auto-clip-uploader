@@ -99,7 +99,7 @@ class PostizPublisher:
             
             # Step 2: Validate and prepare content
             self.logger.info("Step 2: Validating video files and extracting content")
-            video_path, content, metadata = self._prepare_content()
+            video_path, platform_content, metadata = self._prepare_content()
             
             # Step 3: Upload video to Postiz
             self.logger.info("Step 3: Uploading video to Postiz")
@@ -127,13 +127,16 @@ class PostizPublisher:
             posting_type = self.config.get_posting_type_for_postiz()
             scheduled_datetime = self.config.get_scheduled_datetime_iso()
             
+            # Debug: Log POSTIZ_POSTING_TIME processing
+            self.logger.info(f"🕒 POSTIZ_POSTING_TIME config: '{self.config.posting_time}'")
+            self.logger.info(f"🕒 Parsed posting type: '{posting_type}'")
             self.logger.info(f"Posting schedule: {posting_time_info['description']}")
             if posting_type == "date":
                 self.logger.info(f"Scheduled for: {scheduled_datetime}")
             
             try:
                 post_results = self.client.create_post_with_fallback(
-                    file_info, content, channel_ids, posting_type, scheduled_datetime,
+                    file_info, platform_content, channel_ids, posting_type, scheduled_datetime,
                     metadata=metadata,  # Pass metadata for platform-specific handling
                     platform_mapping=platform_mapping  # Pass platform mapping for platform-specific settings
                 )
@@ -233,14 +236,19 @@ class PostizPublisher:
         formatter = SocialMediaFormatter(metadata)
         enabled_platforms = list(self.config.get_enabled_channels().keys())
         
-        # Use unified content that works across all platforms
-        formatted_content = formatter.get_unified_content(enabled_platforms)
+        # Get platform-optimized content instead of unified content
+        # This allows each platform to use its full character limits
+        platform_content = formatter.get_platform_optimized_content(enabled_platforms)
+        
+        # For logging purposes, show the first platform's content
+        first_platform = list(enabled_platforms)[0] if enabled_platforms else "twitter"
+        formatted_content = platform_content.get(first_platform, "")
         
         self.logger.info(f"Video file: {video_path}")
         self.logger.info(f"Formatted content length: {len(formatted_content)} characters")
         self.logger.info(f"Content preview: {formatted_content[:100]}...")
         
-        return video_path, formatted_content, metadata
+        return video_path, platform_content, metadata
     
     def _log_results(self, results: Dict[str, str]):
         """Log successful publishing results"""
