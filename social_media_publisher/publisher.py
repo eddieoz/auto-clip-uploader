@@ -115,8 +115,12 @@ class PostizPublisher:
             enabled_channels = self.config.get_enabled_channels()
             channel_ids = list(enabled_channels.values())
             
+            # Create platform mapping for platform-specific settings (channel_id -> platform_name)
+            platform_mapping = {channel_id: platform for platform, channel_id in enabled_channels.items()}
+            
             self.logger.info(f"Target platforms: {list(enabled_channels.keys())}")
             self.logger.info(f"Channel IDs: {channel_ids}")
+            self.logger.info(f"Platform mapping: {platform_mapping}")
             
             # Get posting time configuration
             posting_time_info = self.config.parse_posting_time()
@@ -130,7 +134,8 @@ class PostizPublisher:
             try:
                 post_results = self.client.create_post_with_fallback(
                     file_info, content, channel_ids, posting_type, scheduled_datetime,
-                    metadata=metadata  # Pass metadata for platform-specific handling
+                    metadata=metadata,  # Pass metadata for platform-specific handling
+                    platform_mapping=platform_mapping  # Pass platform mapping for platform-specific settings
                 )
                 
                 if post_results["success"]:

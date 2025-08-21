@@ -127,7 +127,8 @@ class SocialMediaFormatter:
             content += f"\n\n{' '.join(hashtags)}"
             
         # Add trending hashtags specific to Instagram
-        instagram_hashtags = ["#reels", "#viral", "#explore", "#fyp"]
+        # instagram_hashtags = ["#reels", "#viral", "#explore", "#fyp"]
+        instagram_hashtags = ["#MorningCrypto"]
         remaining_space = limits.max_length - len(content) - 10
         
         for tag in instagram_hashtags:
@@ -158,7 +159,8 @@ class SocialMediaFormatter:
         
         # Add hashtags
         hashtags = self._select_hashtags(limits.hashtag_limit)
-        youtube_hashtags = ["#shorts", "#viral", "#trending"]
+        # youtube_hashtags = ["#shorts", "#viral", "#trending"]
+        youtube_hashtags = ["#MorningCrypto"]
         
         # Combine hashtags
         all_hashtags = hashtags + [tag for tag in youtube_hashtags if tag not in hashtags]
@@ -188,7 +190,8 @@ class SocialMediaFormatter:
         
         # Add TikTok-specific hashtags
         hashtags = self._select_hashtags(limits.hashtag_limit)
-        tiktok_hashtags = ["#fyp", "#viral", "#foryou", "#trending"]
+        # tiktok_hashtags = ["#fyp", "#viral", "#foryou", "#trending"]
+        tiktok_hashtags = ["#MorningCrypto"]
         
         # Prioritize TikTok hashtags
         final_hashtags = []
@@ -249,13 +252,15 @@ class SocialMediaFormatter:
         hashtags = self.metadata.hashtags.copy()
         
         # Add default hashtags if not present
-        default_tags = ["#viral", "#shorts", "#content"]
+        # default_tags = ["#viral", "#shorts", "#content"]
+        default_tags = ["#MorningCrypto"]
+        
         for tag in default_tags:
             if tag not in hashtags:
                 hashtags.append(tag)
         
         # Prioritize hashtags (viral content first)
-        priority_order = ["#viral", "#trending", "#fyp", "#shorts", "#content", "#video"]
+        priority_order = ["MorningCrypto", "#viral", "#trending", "#fyp", "#shorts", "#content", "#video"]
         
         prioritized = []
         remaining = []

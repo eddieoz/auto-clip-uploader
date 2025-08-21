@@ -463,7 +463,8 @@ class ContentExtractor:
         )
         
         # Add default hashtags
-        hashtags = ["#viral", "#shorts", "#content", "#video"]
+        # hashtags = ["#viral", "#shorts", "#content", "#video"]
+        hashtags = ["#MorningCrypto"]
         
         return VideoMetadata(
             title=title,

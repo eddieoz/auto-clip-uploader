@@ -467,9 +467,65 @@ class PostizClient:
         
         return mime_types.get(file_extension, 'video/mp4')  # Default to mp4
     
+    def _get_platform_settings(self, platform: Optional[str]) -> Dict[str, any]:
+        """
+        Get platform-specific settings for post creation
+        
+        Args:
+            platform: Platform name (e.g., 'tiktok', 'instagram', 'youtube', 'twitter')
+            
+        Returns:
+            Dict with platform-specific settings
+        """
+        # Base settings that work for most platforms
+        base_settings = {
+            "post_type": "post",  # Required: "post" or "story"
+            "type": "public",     # Required for YouTube: "public", "private", "unlisted"
+        }
+        
+        # Platform-specific settings
+        if platform == "tiktok":
+            # TikTok has many specific requirements
+            return {
+                **base_settings,
+                "privacy_level": "PUBLIC_TO_EVERYONE",  # TikTok specific values
+                "duet": True,         # TikTok: allow duets
+                "comment": True,      # TikTok: allow comments
+                "stitch": True,       # TikTok: allow stitching
+                "autoAddMusic": "no", # TikTok: "yes" or "no"
+                "brand_content_toggle": False,     # TikTok: branded content
+                "brand_organic_toggle": False,     # TikTok: organic content
+                "disclosure_enabled": False,       # TikTok: disclosure settings
+                "content_posting_method": "UPLOAD" # TikTok: "DIRECT_POST" or "UPLOAD"
+            }
+        elif platform == "instagram":
+            # Instagram uses minimal settings - avoid TikTok-specific parameters
+            # Instagram doesn't need title or many other settings
+            return {
+                "post_type": "post",  # Only essential settings for Instagram
+                # Remove "type": "public" as Instagram may not expect it
+                # Avoid any additional settings that could cause rejection
+            }
+        elif platform == "youtube":
+            # YouTube has its own requirements
+            return {
+                **base_settings,
+                "type": "public",  # YouTube: "public", "private", "unlisted"
+                # YouTube may need additional settings in the future
+            }
+        elif platform == "twitter":
+            # Twitter/X has minimal requirements
+            return {
+                **base_settings,
+                # Twitter typically only needs basic settings
+            }
+        else:
+            # Unknown/generic platform - use minimal safe settings
+            return base_settings
+    
     def create_post(self, file_info: Dict[str, str], content: str, channel_ids: List[str], 
                    posting_type: str = "now", scheduled_datetime: Optional[str] = None, 
-                   metadata=None) -> Dict[str, any]:
+                   metadata=None, platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
         """
         Create multi-platform post with uploaded video (mock-aware)
         
@@ -479,6 +535,7 @@ class PostizClient:
             channel_ids: List of channel IDs to post to
             posting_type: "now" for immediate posting or "date" for scheduled posting
             scheduled_datetime: ISO datetime string for scheduled posts
+            platform_mapping: Optional dict mapping channel_id -> platform_name for platform-specific settings
             
         Returns:
             Dict with post creation results including URLs and IDs
@@ -489,7 +546,7 @@ class PostizClient:
         if self.mock_mode:
             return self._mock_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime)
         
-        return self._real_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata)
+        return self._real_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping)
     
     def _mock_create_post(self, file_info: Dict[str, str], content: str, channel_ids: List[str], 
                          posting_type: str, scheduled_datetime: Optional[str]) -> Dict[str, any]:
@@ -521,30 +578,22 @@ class PostizClient:
         }
     
     def _real_create_post(self, file_info: Dict[str, str], content: str, channel_ids: List[str], 
-                         posting_type: str, scheduled_datetime: Optional[str], metadata=None) -> Dict[str, any]:
+                         posting_type: str, scheduled_datetime: Optional[str], metadata=None, 
+                         platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
         """Real post creation implementation"""
         if posting_type == "now":
             print(f"Creating immediate multi-platform post for {len(channel_ids)} channels")
         else:
             print(f"Scheduling multi-platform post for {len(channel_ids)} channels at {scheduled_datetime}")
         
-        # Build platform posts for each channel with required settings
+        # Build platform posts for each channel with platform-specific settings
         posts = []
         for channel_id in channel_ids:
-            # Base settings for all platforms with comprehensive TikTok requirements
-            settings = {
-                "post_type": "post",  # Required: "post" or "story"
-                "type": "public",     # Required for YouTube: "public", "private", "unlisted" 
-                "privacy_level": "PUBLIC_TO_EVERYONE",  # TikTok specific values
-                "duet": True,         # TikTok: allow duets
-                "comment": True,      # TikTok: allow comments
-                "stitch": True,       # TikTok: allow stitching
-                "autoAddMusic": "no", # TikTok: "yes" or "no"
-                "brand_content_toggle": False,     # TikTok: branded content
-                "brand_organic_toggle": False,     # TikTok: organic content
-                "disclosure_enabled": False,       # TikTok: disclosure settings
-                "content_posting_method": "UPLOAD" # TikTok: "DIRECT_POST" or "UPLOAD"
-            }
+            # Get platform name for this channel (fallback to generic if not provided)
+            platform = platform_mapping.get(channel_id) if platform_mapping else None
+            
+            # Get platform-specific settings
+            settings = self._get_platform_settings(platform)
             
             # Add platform-specific settings
             # YouTube and some platforms require a title
@@ -567,10 +616,12 @@ class PostizClient:
                 
             if not clean_title or len(clean_title) < 2:
                 clean_title = "Auto Generated Video"
-                
-            settings["title"] = clean_title[:100]  # Max 100 chars
             
-            posts.append({
+            # Only add title for platforms that need it (YouTube, not Instagram)
+            if platform in ["youtube", "twitter"] or platform is None:
+                settings["title"] = clean_title[:100]  # Max 100 chars
+            
+            post_data = {
                 "integration": {"id": channel_id},
                 "value": [{
                     "content": content,
@@ -580,10 +631,28 @@ class PostizClient:
                     }]
                 }],
                 "settings": settings
-            })
+            }
+            
+            # Debug: Log the request payload for Instagram to identify differences
+            if platform == "instagram":
+                print(f"📱 Instagram API payload:")
+                print(f"   Channel ID: {channel_id}")
+                print(f"   Channel ID type: {type(channel_id)}")
+                print(f"   Channel ID length: {len(str(channel_id))}")
+                print(f"   Settings: {settings}")
+                print(f"   File info: {file_info}")
+                
+                # Validate channel ID format
+                if not channel_id or not str(channel_id).strip():
+                    print(f"⚠️  WARNING: Invalid Instagram channel ID: '{channel_id}'")
+                elif len(str(channel_id).strip()) < 10:
+                    print(f"⚠️  WARNING: Instagram channel ID seems too short: '{channel_id}'")
+                
+            posts.append(post_data)
         
         # Fix posting type - API expects "schedule" not "date"
-        api_posting_type = "schedule" if posting_type == "date" else posting_type
+        # api_posting_type = "schedule" if posting_type == "date" else posting_type
+        api_posting_type = "now"
         
         # Build payload with all required fields
         payload = {
@@ -624,14 +693,23 @@ class PostizClient:
                     "message": "Post creation successful"
                 }
             
-        except PostizAPIError:
+        except PostizAPIError as e:
+            # Enhanced error handling for Instagram-specific issues
+            error_msg = str(e)
+            if "instagram" in error_msg.lower() or "GraphMethodException" in error_msg:
+                print(f"🔍 Instagram API Error Details:")
+                print(f"   Error: {error_msg}")
+                if platform_mapping:
+                    instagram_channels = [cid for cid, plat in platform_mapping.items() if plat == "instagram"]
+                    print(f"   Instagram channel IDs: {instagram_channels}")
+                print(f"   Payload that failed: {payload}")
             raise
         except Exception as e:
             raise PostizAPIError(f"Post creation failed: {str(e)}")
     
     def create_post_with_fallback(self, file_info: Dict[str, str], content: str, channel_ids: List[str],
                                  posting_type: str = "now", scheduled_datetime: Optional[str] = None, 
-                                 metadata=None) -> Dict[str, any]:
+                                 metadata=None, platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
         """
         Create multi-platform post with individual platform fallback handling
         
@@ -641,6 +719,7 @@ class PostizClient:
             channel_ids: List of channel IDs to post to
             posting_type: "now" for immediate posting or "date" for scheduled posting
             scheduled_datetime: ISO datetime string for scheduled posts
+            platform_mapping: Optional dict mapping channel_id -> platform_name for platform-specific settings
             
         Returns:
             Dict with results including successful and failed platforms
@@ -650,7 +729,7 @@ class PostizClient:
         
         # Try bulk creation first
         try:
-            result = self.create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata)
+            result = self.create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping)
             return {
                 "success": True,
                 "bulk_creation": True,
@@ -674,7 +753,7 @@ class PostizClient:
                     print(f"⏳ Waiting 2 seconds before next platform...")
                     time.sleep(2)
                 
-                single_result = self.create_post(file_info, content, [channel_id], posting_type, scheduled_datetime, metadata)
+                single_result = self.create_post(file_info, content, [channel_id], posting_type, scheduled_datetime, metadata, platform_mapping)
                 successful_posts.append({
                     "channel_id": channel_id,
                     "result": single_result

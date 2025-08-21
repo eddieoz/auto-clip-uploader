@@ -405,7 +405,8 @@ def generate_metadata(transcript):
     json_template = '''
         {
             "title": "Video Title",
-            "description": "Video Description"
+            "description": "Video Description",
+            "tags": "Video hashtags"
         }
     '''
 
@@ -414,7 +415,7 @@ def generate_metadata(transcript):
 1. Engagement: Include calls to action and elements that encourage viewers to interact, such as questions or invitations to subscribe to the channel.
 2. SEO: Optimize the text by incorporating keywords and relevant phrases related to the video's content.
 3. Chapters: List the chapters with their respective timestamps to facilitate navigation.
-4. Tags: Provide a list of relevant tags separated by commas, covering the main topics and keywords of the video.
+4. Tags: Provide a list of relevant tags in one word, separated by commas, covering the main topics and keywords of the video.
 
 The provided transcript is as follows: {transcript}
 
@@ -541,7 +542,8 @@ def generate_viral(transcript_content, audio_path=None, output_dir=None, min_dur
                 "start_time": "00:00:00,000",
                 "end_time": "00:00:00,000",
                 "title": "Title of the reels",
-                "description": "Description of the reels"
+                "description": "Description of the reels",
+                "tags": "Three relevant and objective one-word hashtags"
             }
         ]
     }
@@ -799,7 +801,8 @@ def generate_transcript(input_file):
     
     # Load Whisper model and transcribe
     print("Loading Whisper model...")
-    model = whisper.load_model("medium")
+    # model = whisper.load_model("medium")
+    model = whisper.load_model("small")
     print("Transcribing audio...")
     result = model.transcribe(audio_path)
     print("Transcription done")
@@ -1161,7 +1164,7 @@ def __main__():
             print('Thumbnail requires background images in workspace/backgrounds/reels/ directory')
             args.thumb = False
 
-__main__()
+#__main__()
 
 def generate_subtitle(input_file, video_id, output_dir):
     """Generate subtitle for a video using Whisper and FFmpeg"""
@@ -1190,7 +1193,7 @@ def generate_subtitle(input_file, video_id, output_dir):
         """Transcribe video using Whisper and return SRT content"""
         try:
             # Try different model sizes based on available memory
-            models_to_try = ["medium", "small", "base"]
+            models_to_try = ["small", "medium", "base"]
             
             for model_name in models_to_try:
                 try:
