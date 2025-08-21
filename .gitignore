@@ -107,7 +107,11 @@ test*
 input/*
 input_tmp/
 output/*
+logs/
+*.log
 reels-clips-automator/utils/RealESRGAN
 reels-clips-automator-ref
 core
 reels-clips-automator/utils/RealESRGAN
+start.sh 
+clean.sh
