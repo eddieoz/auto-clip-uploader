@@ -433,7 +433,7 @@ Please replace the placeholder values with the actual results from your analysis
     try:
         client = openai.OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=messages,
             n=1,
             stop=None
@@ -684,7 +684,7 @@ The provided transcript is as follows:
 {formatted_segments}
 {audio_context}
 
-Based on your analysis, return a JSON document containing the timestamps (start and end) in SRT format (HH:MM:SS,mmm), the engaging but objective title for the viral part in {title_language} language, and a creative and engaging description with lists, bullets and emojis in {title_language} language for social media. The JSON document should follow this format: {json_template}
+Based on your analysis, return a JSON document containing the timestamps (start and end) in SRT format (HH:MM:SS,mmm), the engaging but objective title for the viral part in {title_language} language, and a creative and engaging but explanatory description with lists, bullets and emojis in {title_language} language for social media. The JSON document should follow this format: {json_template}
 
 Please replace the placeholder values with the actual results from your analysis. Return ONLY the JSON object, without any markdown formatting or code block markers. Ensure all property names and string values are enclosed in double quotes."""
 
@@ -700,7 +700,7 @@ Please replace the placeholder values with the actual results from your analysis
 
     client = openai.OpenAI(api_key=api_key)
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5-mini",
         messages=messages,
         n=1,
         stop=None
