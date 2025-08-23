@@ -500,7 +500,7 @@ Please replace the placeholder values with the actual results from your analysis
     try:
         client = openai.OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-5-mini", messages=messages, n=1, stop=None
+            model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
         )
 
         content = response.choices[0].message.content
@@ -569,8 +569,8 @@ def generate_viral(
     transcript_content,
     audio_path=None,
     output_dir=None,
-    min_duration=20.0,
-    max_duration=120.0,
+    min_duration=1.0,
+    max_duration=90.0,
 ):
     # First generate metadata
     metadata = generate_metadata(transcript_content)
@@ -830,7 +830,7 @@ Return ONLY the JSON object, without any markdown formatting or code block marke
 
     client = openai.OpenAI(api_key=api_key)
     response = client.chat.completions.create(
-        model="gpt-5-mini", messages=messages, n=1, stop=None
+        model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
     )
 
     content = response.choices[0].message.content
@@ -931,7 +931,7 @@ def generate_transcript(input_file):
     # Load Whisper model and transcribe
     print("Loading Whisper model...")
     # model = whisper.load_model("medium")
-    model = whisper.load_model("small")
+    model = whisper.load_model(os.getenv('WHISPER_MODEL', 'small'))
     print("Transcribing audio...")
     result = model.transcribe(audio_path)
     print("Transcription done")
@@ -1455,7 +1455,7 @@ def generate_subtitle(input_file, video_id, output_dir):
             for model_name in models_to_try:
                 try:
                     print(f"Loading Whisper {model_name} model...")
-                    model = whisper.load_model(model_name)
+                    model = whisper.load_model(os.getenv('WHISPER_MODEL', model_name))
 
                     print(f"Transcribing video with {model_name} model...")
                     result = model.transcribe(video_path, word_timestamps=True)

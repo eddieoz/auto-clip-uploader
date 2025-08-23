@@ -117,14 +117,15 @@ class SocialMediaFormatter:
             components.append(f"✨ {self.metadata.description}")
         
         # Add call to action
-        components.append("💫 Follow for more viral content!")
+        components.append("💫 Siga para mais conteúdos como esse!")
         
         content = "\n\n".join(components)
         
         # Add hashtags (Instagram loves hashtags)
         hashtags = self._select_hashtags(limits.hashtag_limit)
         if hashtags:
-            content += f"\n\n{' '.join(hashtags)}"
+            # content += f"\n\n{' '.join(hashtags)}"
+            content += "\n"
             
         # Add trending hashtags specific to Instagram
         # instagram_hashtags = ["#reels", "#viral", "#explore", "#fyp"]
