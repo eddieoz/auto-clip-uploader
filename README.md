@@ -2,7 +2,7 @@
 
 An automated video processing system that monitors for new video files and converts them into social media-ready vertical clips with AI-powered viral segment detection.
 
-Built with Python 3.11, CUDA acceleration, and PyTorch for high-performance video processing. The core video processing engine is powered by [reels-clips-automator](https://github.com/eddieoz/reels-clips-automator).
+Built with Python 3.11, CUDA acceleration, and PyTorch for high-performance video processing. The core video processing engine is powered by [Izabella](https://github.com/eddieoz/reels-clips-automator).
 
 ## Features
 
