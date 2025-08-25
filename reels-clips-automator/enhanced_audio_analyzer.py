@@ -323,6 +323,17 @@ class EnhancedAudioAnalyzer(BaseAudioAnalyzer):
         if not segments:
             print("No segments provided for narrative moment detection")
             return []
+
+        # Filter out invalid segments before processing
+        original_segment_count = len(segments)
+        segments = [s for s in segments if isinstance(s, dict) and 'start' in s and 'end' in s]
+        
+        if len(segments) < original_segment_count:
+            print(f"Warning: Skipped {original_segment_count - len(segments)} invalid segments.")
+
+        if not segments:
+            print("No valid segments remaining for narrative analysis.")
+            return []
         
         print(f"Processing {len(segments)} segments for narrative optimization")
         
@@ -539,5 +550,4 @@ if __name__ == "__main__":
             print(f"❌ Test failed: {str(e)}")
             import traceback
             traceback.print_exc()
-
     test_enhanced_audio_analyzer()

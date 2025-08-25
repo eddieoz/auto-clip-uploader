@@ -18,6 +18,7 @@ import whisper
 import tempfile
 import ffmpeg
 from enhanced_audio_analyzer import EnhancedAudioAnalyzer
+from topic_analyzer import TopicAnalyzer
 
 # Define workspace directory
 WORKSPACE_DIR = os.getcwd()  # Use current working directory instead of script location
@@ -1712,27 +1713,43 @@ def generate_subtitle(input_file, video_id, output_dir):
         )
         last_filter = "v3"
 
-    # Build final FFmpeg command
+    # Build final FFmpeg command with proper spacing and quotes
     if filter_parts:
         filter_complex = ";".join(filter_parts)
         ffmpeg_command = (
-            f"ffmpeg -y -hwaccel cuda -i tmp/{input_file}"
-            f'-filter_complex "{filter_complex}" -map "[{last_filter}]" -map 0:a '
-            f"-c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p -c:a copy \"{output_path}\""
+            f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
+            f'-filter_complex "{filter_complex}" '  # Added space
+            f'-map "[{last_filter}]" -map 0:a '
+            f'-c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 '
+            f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
+            f'-c:a copy "{output_path}"'  # Added quotes around output path
         )
     else:
         # No overlays, just copy
         ffmpeg_command = (
-            f"ffmpeg -y -hwaccel cuda -i tmp/{input_file}" f" -c copy \"{output_path}\""
+            f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
+            f'-c copy "{output_path}"'  # Added quotes around output path
         )
 
     print(f"Applying overlays with command: {ffmpeg_command}")
-    result = subprocess.call(ffmpeg_command, shell=True)
-
-    if result == 0:
-        print(f"Video with subtitles and overlays saved to: {output_path}")
-    else:
-        print(f"Error applying overlays, result code: {result}")
+    
+    # Add error handling and logging
+    try:
+        result = subprocess.call(ffmpeg_command, shell=True)
+        if result == 0:
+            print(f"Video with subtitles and overlays saved to: {output_path}")
+            return True
+        else:
+            print(f"Error applying overlays, result code: {result}")
+            # Log the failed command
+            with open(f"{output_dir}/ffmpeg_errors.log", "a") as f:
+                f.write(f"Failed command: {ffmpeg_command}\n")
+                f.write(f"Error code: {result}\n")
+                f.write("=" * 80 + "\n")
+            return False
+    except Exception as e:
+        print(f"Exception during FFmpeg execution: {str(e)}")
+        return False
 
 
 if __name__ == "__main__":
