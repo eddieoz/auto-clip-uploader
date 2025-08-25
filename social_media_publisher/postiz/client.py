@@ -325,9 +325,9 @@ class PostizClient:
         file_size_mb = file_size_bytes / (1024 * 1024)
         
         # Common API file size limits to warn about
-        if file_size_mb > 50:
+        if file_size_mb > 1000:
             raise ValueError(f"File too large: {file_size_mb:.1f}MB exceeds typical API limits (50MB)")
-        elif file_size_mb > 25:
+        elif file_size_mb > 50:
             print(f"⚠️  Large file: {file_size_mb:.1f}MB - may hit API limits")
         elif file_size_mb > 10:
             print(f"📁 Medium file: {file_size_mb:.1f}MB")

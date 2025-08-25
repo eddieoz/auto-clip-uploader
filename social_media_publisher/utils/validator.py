@@ -218,9 +218,9 @@ class VideoValidator:
         """Validate basic video requirements"""
         
         # Check file size (basic limit: 100MB for safety)
-        max_size_bytes = 100 * 1024 * 1024  # 100MB
+        max_size_bytes = 1000 * 1024 * 1024  # 100MB
         if video_info.file_size > max_size_bytes:
-            result.add_error(f"File too large: {video_info.file_size / 1024 / 1024:.1f}MB (max 100MB)")
+            result.add_error(f"File too large: {video_info.file_size / 1024 / 1024:.1f}MB (max 1000MB)")
         
         # Check duration (basic limit: 5 minutes)
         if video_info.duration > 300:  # 5 minutes

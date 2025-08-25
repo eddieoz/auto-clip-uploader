@@ -32,39 +32,12 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 scale = 4
 target_face_size = 345
 
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from basicsr.utils.download_util import load_file_from_url
-
-## Added Real-ESRGAN to utils
-from realesrgan import RealESRGANer
-from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-
-# restorer
-upsampler = RealESRGANer(
-    scale=scale,
-    model_path="weights/realesr-general-x4v3.pth",
-    dni_weight=1,
-    model=SRVGGNetCompact(
-        num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
-    ),
-    tile=512,  # Use tile approach for better quality on large images
-    tile_pad=10,
-    pre_pad=0,
-    half=not True,
-    gpu_id=0,
-)
-
-from gfpgan import GFPGANer
-
-face_enhancer = GFPGANer(
-    model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
-    upscale=scale,
-    arch="clean",
-    channel_multiplier=2,
-    bg_upsampler=upsampler,
-)
+# Global variables for conditional loading
+upsampler = None
+face_enhancer = None
 
 import argparse
+import glob
 
 # Get the absolute path to the reels-clips-automator directory (where the .env file is)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +63,223 @@ if not api_key:
 # Remove any quotes from the API key if present
 api_key = api_key.strip("'")
 openai.api_key = api_key
+
+
+def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
+    """
+    Clean up temporary files after successful processing.
+    
+    Args:
+        tmp_dir (str): Path to temporary directory
+        preserve_outputs (bool): Whether to preserve output files (move them instead of delete)
+    
+    Returns:
+        bool: True if cleanup successful, False otherwise
+    """
+    try:
+        if not os.path.exists(tmp_dir):
+            print(f"✅ Cleanup: tmp directory '{tmp_dir}' doesn't exist")
+            return True
+            
+        print(f"🧹 Starting cleanup of temporary directory: {tmp_dir}")
+        
+        # Get all files in tmp directory
+        tmp_files = glob.glob(os.path.join(tmp_dir, "*"))
+        
+        if not tmp_files:
+            print(f"✅ Cleanup: tmp directory is already empty")
+            return True
+        
+        files_cleaned = 0
+        files_preserved = 0
+        
+        for file_path in tmp_files:
+            filename = os.path.basename(file_path)
+            
+            try:
+                # Check if this is an output file we might want to preserve
+                is_output_file = (
+                    filename.startswith("final-") or
+                    filename.endswith(".mp4") and "cropped" in filename or
+                    filename.endswith(".srt") and "final" in filename
+                )
+                
+                if preserve_outputs and is_output_file:
+                    # Check if outputs directory exists
+                    outputs_dir = "outputs/"
+                    if not os.path.exists(outputs_dir):
+                        os.makedirs(outputs_dir, exist_ok=True)
+                    
+                    # Move output file to outputs directory
+                    output_path = os.path.join(outputs_dir, filename)
+                    
+                    # Avoid overwriting existing files
+                    counter = 1
+                    base_name, ext = os.path.splitext(filename)
+                    while os.path.exists(output_path):
+                        output_path = os.path.join(outputs_dir, f"{base_name}_{counter}{ext}")
+                        counter += 1
+                    
+                    shutil.move(file_path, output_path)
+                    print(f"  📦 Preserved: {filename} → {output_path}")
+                    files_preserved += 1
+                else:
+                    # Remove temporary file
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                    print(f"  🗑️  Removed: {filename}")
+                    files_cleaned += 1
+                    
+            except Exception as e:
+                print(f"  ⚠️  Warning: Could not handle {filename}: {str(e)}")
+        
+        print(f"✅ Cleanup completed:")
+        print(f"   • Files cleaned: {files_cleaned}")
+        print(f"   • Files preserved: {files_preserved}")
+        print(f"   • Temporary directory ready for next processing")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Cleanup failed: {str(e)}")
+        return False
+
+
+def cleanup_on_success(video_id, preserve_outputs=True):
+    """
+    Perform cleanup operations after successful video processing.
+    
+    Args:
+        video_id (str): The processed video identifier
+        preserve_outputs (bool): Whether to preserve output files
+    """
+    print(f"\n🎉 Processing completed successfully for: {video_id}")
+    print("=" * 50)
+    
+    # Clean up tmp directory
+    cleanup_success = cleanup_tmp_directory(preserve_outputs=preserve_outputs)
+    
+    if cleanup_success:
+        print("✅ All cleanup operations completed successfully")
+        print("🚀 System ready for next video processing")
+    else:
+        print("⚠️  Some cleanup operations failed - manual cleanup may be needed")
+    
+    return cleanup_success
+
+
+def cleanup_on_failure(video_id, preserve_logs=True):
+    """
+    Perform cleanup operations after failed video processing.
+    
+    Args:
+        video_id (str): The video identifier that failed processing
+        preserve_logs (bool): Whether to preserve log files for debugging
+    """
+    print(f"\n❌ Processing failed for: {video_id}")
+    print("=" * 50)
+    
+    if preserve_logs:
+        print("🔍 Preserving temporary files for debugging")
+        print("   Manual cleanup of tmp/ directory may be needed later")
+        return True
+    else:
+        print("🧹 Cleaning up after failed processing...")
+        return cleanup_tmp_directory(preserve_outputs=False)
+
+
+def initialize_upsampler():
+    """
+    Initialize the RealESRGAN upsampler only when needed.
+    
+    Returns:
+        RealESRGANer: The initialized upsampler object, or None if initialization fails
+    """
+    global upsampler
+    
+    if upsampler is not None:
+        return upsampler
+    
+    try:
+        print("🔧 Initializing RealESRGAN upsampler...")
+        
+        # Check if weights file exists
+        weights_path = "weights/realesr-general-x4v3.pth"
+        if not os.path.exists(weights_path):
+            print(f"❌ Weights file not found: {weights_path}")
+            print("   Please download the weights file or run without --upscale")
+            return None
+        
+        # Import dependencies only when needed
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from basicsr.utils.download_util import load_file_from_url
+        from realesrgan import RealESRGANer
+        from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+        
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=weights_path,
+            dni_weight=1,
+            model=SRVGGNetCompact(
+                num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
+            ),
+            tile=512,  # Use tile approach for better quality on large images
+            tile_pad=10,
+            pre_pad=0,
+            half=not True,
+            gpu_id=0,
+        )
+        
+        print("✅ RealESRGAN upsampler initialized successfully")
+        return upsampler
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize RealESRGAN upsampler: {str(e)}")
+        print("   Please check your dependencies or run without --upscale")
+        return None
+
+
+def initialize_face_enhancer():
+    """
+    Initialize the GFPGAN face enhancer only when needed.
+    
+    Returns:
+        GFPGANer: The initialized face enhancer object, or None if initialization fails
+    """
+    global face_enhancer
+    
+    if face_enhancer is not None:
+        return face_enhancer
+    
+    try:
+        print("🔧 Initializing GFPGAN face enhancer...")
+        
+        # Initialize upsampler first (face_enhancer depends on it)
+        bg_upsampler = initialize_upsampler()
+        if bg_upsampler is None:
+            print("❌ Cannot initialize face enhancer without upsampler")
+            return None
+        
+        # Import GFPGAN only when needed
+        from gfpgan import GFPGANer
+        
+        face_enhancer = GFPGANer(
+            model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
+            upscale=scale,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=bg_upsampler,
+        )
+        
+        print("✅ GFPGAN face enhancer initialized successfully")
+        return face_enhancer
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize GFPGAN face enhancer: {str(e)}")
+        print("   Please check your dependencies or run without --enhance")
+        return None
 
 
 # Download video
@@ -406,17 +596,25 @@ def generate_short(
                         if max(h, w) < target_face_size:
                             if upscale:
                                 # Higher quality upscaling
-                                crop_img, _ = upsampler.enhance(
-                                    crop_img, outscale=scale
-                                )
+                                active_upsampler = initialize_upsampler()
+                                if active_upsampler is not None:
+                                    crop_img, _ = active_upsampler.enhance(
+                                        crop_img, outscale=scale
+                                    )
+                                else:
+                                    print("⚠️  Upscaling requested but upsampler not available, skipping...")
                             if enhance:
                                 # Enhanced face
-                                _, _, crop_img = face_enhancer.enhance(
-                                    crop_img,
-                                    has_aligned=False,
-                                    only_center_face=False,
-                                    paste_back=True,
-                                )
+                                active_face_enhancer = initialize_face_enhancer()
+                                if active_face_enhancer is not None:
+                                    _, _, crop_img = active_face_enhancer.enhance(
+                                        crop_img,
+                                        has_aligned=False,
+                                        only_center_face=False,
+                                        paste_back=True,
+                                    )
+                                else:
+                                    print("⚠️  Face enhancement requested but enhancer not available, skipping...")
 
                     resized = cv2.resize(
                         crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC
@@ -1520,6 +1718,7 @@ def __main__():
         generate_segments(parsed_content["segments"])
     except (json.JSONDecodeError, KeyError) as e:
         print(f"Error: Failed to process content: {str(e)}")
+        cleanup_on_failure(video_id if 'video_id' in locals() else 'unknown', preserve_logs=True)
         sys.exit(1)
 
     # Loop through each segment
@@ -1563,6 +1762,13 @@ def __main__():
 
     print(f"\n==== Processing Complete ====")
     print(f"Results saved to: {output_dir}/")
+
+    # Clean up temporary files after successful processing
+    try:
+        cleanup_on_success(video_id, preserve_outputs=True)
+    except Exception as e:
+        print(f"⚠️  Warning: Cleanup failed: {str(e)}")
+        print("   Manual cleanup of tmp/ directory may be needed")
 
     # Check if backgrounds directory exists
     if (
