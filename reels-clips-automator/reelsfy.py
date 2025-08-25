@@ -17,6 +17,7 @@ from dotenv import dotenv_values
 import whisper
 import tempfile
 import ffmpeg
+from enhanced_audio_analyzer import EnhancedAudioAnalyzer
 
 # Define workspace directory
 WORKSPACE_DIR = os.getcwd()  # Use current working directory instead of script location
@@ -86,7 +87,7 @@ if not api_key:
     )
 
 # Remove any quotes from the API key if present
-api_key = api_key.strip("'\"")
+api_key = api_key.strip("'")
 openai.api_key = api_key
 
 
@@ -264,7 +265,6 @@ def calculate_target_face_size(frame_width, frame_height):
     # Calculate scaled threshold with bounds
     scaled_threshold = int(base_threshold * scale_factor)
     return max(min_threshold, min(scaled_threshold, max_threshold))
-
 
 def generate_short(
     input_file,
@@ -514,8 +514,8 @@ Please replace the placeholder values with the actual results from your analysis
         except json.JSONDecodeError as e:
             # If JSON is invalid, try to fix common issues
             content = content.replace(
-                "'", '"'
-            )  # Replace single quotes with double quotes
+                "'", '"' # Replace single quotes with double quotes
+            )
             content = content.replace("\n", " ")  # Remove newlines
             content = content.replace("  ", " ")  # Remove extra spaces
             try:
@@ -565,6 +565,84 @@ def check_audio_file(audio_path):
         return False, f"Error loading audio with librosa: {str(e)}"
 
 
+def create_content_centric_prompt(segment_info, concluding_topic, supporting_segments, title_language, json_template):
+    """
+    Create content-centric prompt focused on concluding topic representation. 
+    
+    This replaces the traditional viral detection prompt with a focus on:
+    - Best representation of the concluding topic
+    - Complete narrative with supporting context
+    - Content quality over viral tricks
+    """
+    supporting_context = ""
+    if supporting_segments:
+        supporting_context = "\nSupporting Context:\n"
+        for i, seg in enumerate(supporting_segments[:3]):  # Show top 3
+            supporting_context += f"• {seg['text'][:80]}...\n"
+    
+    prompt = f"""You are analyzing a video segment that has been optimized for content completeness and narrative flow. 
+
+SEGMENT ANALYSIS:
+• Duration: {segment_info['duration']:.1f} seconds (optimized for complete storytelling)
+• Time Range: {segment_info['start_time']} → {segment_info['end_time']}
+• Pre-generated Title: {segment_info['title']}
+
+CONCLUDING TOPIC (Primary Focus):
+"{concluding_topic['text']}"
+
+Key Elements: {', '.join(concluding_topic['topic_keywords'][:5])}
+Confidence Score: {concluding_topic['topic_confidence']:.2f}/1.0
+{supporting_context}
+
+CONTENT STRATEGY:
+This segment represents the CONCLUDING topic from a 90-second conversation. Your task is to create content that:
+1. Emphasizes the concluding message/topic as the primary value
+2. Uses supporting context to provide necessary background
+3. Creates a complete, standalone narrative
+4. Focuses on content quality and information completeness over viral tricks
+5. Ensures the audience gets the full context and conclusion
+
+Create a title and Instagram description in {title_language} that presents this concluding topic with proper context and narrative completeness.
+
+The Instagram description should:
+1. Lead with the concluding topic/message
+2. Provide necessary context from supporting segments
+3. Use clear, informative language
+4. Include natural engagement elements
+5. Focus on educational/informational value
+6. Use relevant emojis and hashtags appropriately
+
+Return the response as JSON following this format: {json_template}
+
+Replace placeholder values with content that emphasizes the CONCLUDING TOPIC while providing complete context."""
+
+    return prompt
+
+
+def create_content_centric_system_prompt(title_language):
+    """Create system prompt for content-centric approach."""
+    return f"""You are a Content Optimization Specialist focused on creating complete, informative social media content.
+
+Your role is to transform video segments that have been pre-analyzed for concluding topics into engaging {title_language} social media posts.
+
+KEY PRINCIPLES:
+- Prioritize content completeness over viral tricks
+- Focus on the concluding topic as the main value proposition
+- Ensure supporting context enhances understanding
+- Create educational and informative content
+- Maintain narrative flow and logical progression
+
+CONTENT APPROACH:
+- Lead with the concluding message/topic
+- Provide necessary background context
+- Create standalone, complete narratives
+- Use clear, accessible language
+- Include natural engagement elements
+
+For {title_language} content, ensure cultural appropriateness and natural language flow.
+
+Return ONLY the JSON object without markdown formatting."""
+
 def generate_viral(
     transcript_content,
     audio_path=None,
@@ -572,45 +650,75 @@ def generate_viral(
     min_duration=1.0,
     max_duration=90.0,
 ):
+    # GEMINI WAS HERE
+
+    """
+    Generate optimized content segments focusing on concluding topics. 
+    
+    This function has been refactored as part of the improve-extraction EPIC
+    to prioritize content completeness and concluding topic identification
+    over traditional viral detection.
+    """
+    # Import TopicAnalyzer for advanced topic detection
+    from topic_analyzer import TopicAnalyzer
+    # Initialize TopicAnalyzer for content-centric approach
+    print("\n==== Topic-Focused Content Analysis ====")
+    topic_analyzer = TopicAnalyzer()
+    
     # First generate metadata
     metadata = generate_metadata(transcript_content)
     metadata_json = json.loads(metadata["content"])
 
-    # Parse SRT content into segments
-    segments = []
-    current_segment = {}
+    # Use TopicAnalyzer to analyze transcript and identify concluding topics
+    print("Analyzing transcript for concluding topics and supporting context...")
+    topic_analysis = topic_analyzer.analyze_transcript(transcript_content)
+    
+    if 'error' in topic_analysis:
+        print(f"Topic analysis failed: {topic_analysis['error']}")
+        # Fallback to original parsing for compatibility
+        segments = []
+        current_segment = {}
 
-    for line in transcript_content.split("\n"):
-        line = line.strip()
-        if not line:
-            if current_segment:
-                segments.append(current_segment)
-                current_segment = {}
-            continue
+        for line in transcript_content.split("\n"):
+            line = line.strip()
+            if not line:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = {}
+                continue
 
-        if "-->" in line:
-            # Parse timestamp line
-            start_time, end_time = line.split(" --> ")
-            # Convert SRT timestamp to seconds for audio analysis
-            start_seconds = sum(
-                float(x) * 60**i
-                for i, x in enumerate(reversed(start_time.replace(",", ".").split(":")))
-            )
-            end_seconds = sum(
-                float(x) * 60**i
-                for i, x in enumerate(reversed(end_time.replace(",", ".").split(":")))
-            )
-            current_segment["start_time"] = start_time
-            current_segment["end_time"] = end_time
-            current_segment["start"] = start_seconds
-            current_segment["end"] = end_seconds
-        elif line and not line.isdigit() and not current_segment.get("text"):
-            # This is the text line
-            current_segment["text"] = line
+            if "-->" in line:
+                start_time, end_time = line.split(" --> ")
+                start_seconds = sum(
+                    float(x) * 60**i
+                    for i, x in enumerate(reversed(start_time.replace(",", ".").split(":")))
+                )
+                end_seconds = sum(
+                    float(x) * 60**i
+                    for i, x in enumerate(reversed(end_time.replace(",", ".").split(":")))
+                )
+                current_segment["start_time"] = start_time
+                current_segment["end_time"] = end_time
+                current_segment["start"] = start_seconds
+                current_segment["end"] = end_seconds
+            elif line and not line.isdigit() and not current_segment.get("text"):
+                current_segment["text"] = line
 
-    # Add the last segment if exists
-    if current_segment:
-        segments.append(current_segment)
+        if current_segment:
+            segments.append(current_segment)
+    else:
+        # Use TopicAnalyzer results
+        segments = topic_analysis['segments']
+        concluding_topic = topic_analysis['concluding_topic']
+        supporting_segments = topic_analysis['supporting_segments']
+        optimized_segment = topic_analysis['optimized_segment']
+        
+        print(f"✅ Topic Analysis Results:")
+        print(f"   • Total segments: {len(segments)}")
+        print(f"   • Concluding topic: \"{concluding_topic['text'][:50]}...\"")
+        print(f"   • Supporting segments: {len(supporting_segments)}")
+        print(f"   • Optimized duration: {optimized_segment['duration']:.1f}s")
+        print(f"   • Target range: 45-59 seconds")
 
     # Debug: Print segment information
     print(f"DEBUG: Parsed {len(segments)} segments from transcript")
@@ -635,23 +743,62 @@ def generate_viral(
     """
 
     title_language = "Portuguese"
+    
+    # If we have topic analysis results, use the optimized approach
+    if 'topic_analysis' in locals() and 'error' not in topic_analysis:
+        print("\n==== Using Topic-Focused Content Generation ====")
+        
+        # Use the pre-analyzed optimized segment from TopicAnalyzer
+        optimized_segment = topic_analysis['optimized_segment']
+        concluding_topic = topic_analysis['concluding_topic']
+        supporting_segments = topic_analysis['supporting_segments']
+        
+        # Create content description based on optimized segment
+        segment_info = {
+            "start_time": optimized_segment['start_time'],
+            "end_time": optimized_segment['end_time'],
+            "title": optimized_segment['title'],
+            "duration": optimized_segment['duration'],
+            "concluding_topic_text": concluding_topic['text'],
+            "supporting_count": len(supporting_segments)
+        }
+        
+        print(f"✅ Using optimized segment:")
+        print(f"   • Duration: {segment_info['duration']:.1f}s")
+        print(f"   • Title: {segment_info['title']}")
+        print(f"   • Time: {segment_info['start_time']} → {segment_info['end_time']}")
+        
+        # Use content-centric prompt instead of viral detection
+        prompt = create_content_centric_prompt(
+            segment_info, concluding_topic, supporting_segments, title_language, json_template
+        )
+        
+        system = create_content_centric_system_prompt(title_language)
+        
+        # Skip audio analysis since we already have optimized content
+        print("Skipping traditional audio analysis - using topic-focused approach")
+        
+    else:
+        print("\n==== Fallback to Traditional Analysis ====")
+        print("Topic analysis unavailable, using original viral detection approach")
 
-    # Add debug information
-    print("\n==== Audio Analysis Debug Information ====")
-    print(f"Audio path: {audio_path}")
-    print(f"Output directory: {output_dir}")
-    print(
-        f"Audio file exists: {os.path.exists(audio_path) if audio_path else 'No audio path provided'}"
-    )
-    print(f"Number of segments parsed from transcript: {len(segments)}")
+        # Add debug information
+        print("Audio Analysis Debug Information:")
+        print(f"Audio path: {audio_path}")
+        print(f"Output directory: {output_dir}")
+        print(
+            f"Audio file exists: {os.path.exists(audio_path) if audio_path else 'No audio path provided'}"
+        )
+        print(f"Number of segments parsed from transcript: {len(segments)}")
 
-    # Check output directory exists
-    if output_dir and not os.path.exists(output_dir):
-        try:
-            print(f"Creating output directory: {output_dir}")
-            os.makedirs(output_dir, exist_ok=True)
-        except Exception as e:
-            print(f"Error creating output directory: {str(e)}")
+        # Continue with traditional analysis
+        # Check output directory exists
+        if output_dir and not os.path.exists(output_dir):
+            try:
+                print(f"Creating output directory: {output_dir}")
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception as e:
+                print(f"Error creating output directory: {str(e)}")
 
     # Check audio file validity
     valid_audio, audio_message = check_audio_file(audio_path)
@@ -666,7 +813,7 @@ def generate_viral(
             print("Analyzing audio...")
             # Debug import statement
             print("Importing AudioAnalyzer...")
-            from audio_analyzer import AudioAnalyzer
+            from enhanced_audio_analyzer import EnhancedAudioAnalyzer
 
             print("AudioAnalyzer imported successfully")
 
@@ -675,18 +822,28 @@ def generate_viral(
             print(f"Audio file size: {file_size:.2f} MB")
 
             # Initialize analyzer
-            print("Creating AudioAnalyzer instance...")
-            analyzer = AudioAnalyzer(audio_path)
-            print("AudioAnalyzer instance created")
+            print("Creating EnhancedAudioAnalyzer instance...")
+            analyzer = EnhancedAudioAnalyzer(audio_path)
+            print("EnhancedAudioAnalyzer instance created")
 
-            # Find viral moments
-            print("Finding viral moments...")
-            audio_viral_segments = analyzer.find_viral_moments(
+            # Find narrative moments
+            print("Finding narrative moments...")
+            narrative_segments = analyzer.find_narrative_moments(
                 segments, min_duration=min_duration, max_duration=max_duration
             )
-            print(f"Found {len(audio_viral_segments)} viral segments")
+            print(f"Found {len(narrative_segments)} narrative segments")
 
-            if len(audio_viral_segments) == 0:
+            if len(narrative_segments) > 0:
+                # Get optimal boundaries
+                optimal_boundaries = analyzer.get_optimal_boundaries(
+                    segments, target_duration_range=(45.0, 59.0)
+                )
+
+                if optimal_boundaries:
+                    print(f"Optimal boundaries found: {optimal_boundaries}")
+                    # TODO: Use these boundaries to create the video segment
+
+            if len(narrative_segments) == 0:
                 print(
                     "Warning: No viral segments found in audio analysis, using a fallback approach"
                 )
@@ -696,7 +853,7 @@ def generate_viral(
                 # Sort segments by duration
                 sorted_segments = sorted(
                     segments,
-                    key=lambda x: float(x.get("end", x.get("end_time", 0)))
+                    key=lambda x: float(x.get("end", x.get("end_time", 0))) 
                     - float(x.get("start", x.get("start_time", 0))),
                     reverse=True,
                 )
@@ -966,7 +1123,8 @@ Description:
 
 
 def direct_process_file(
-    input_file, output_dir, upscale=False, enhance=False, thumb=False
+    input_file,
+    output_dir, upscale=False, enhance=False, thumb=False
 ):
     """Process a file directly without viral segment detection"""
     print(f"\n==== Direct File Processing ====")
@@ -996,7 +1154,6 @@ def direct_process_file(
         print(f"Error: Failed to create reel from {input_file}")
 
     return output_file
-
 
 def __main__():
     # Check command line argument
@@ -1559,14 +1716,14 @@ def generate_subtitle(input_file, video_id, output_dir):
     if filter_parts:
         filter_complex = ";".join(filter_parts)
         ffmpeg_command = (
-            f"ffmpeg -y -hwaccel cuda -i tmp/{input_file} "
+            f"ffmpeg -y -hwaccel cuda -i tmp/{input_file}"
             f'-filter_complex "{filter_complex}" -map "[{last_filter}]" -map 0:a '
-            f'-c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p -c:a copy "{output_path}"'
+            f"-c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p -c:a copy \"{output_path}\""
         )
     else:
         # No overlays, just copy
         ffmpeg_command = (
-            f"ffmpeg -y -hwaccel cuda -i tmp/{input_file} " f'-c copy "{output_path}"'
+            f"ffmpeg -y -hwaccel cuda -i tmp/{input_file}" f" -c copy \"{output_path}\""
         )
 
     print(f"Applying overlays with command: {ffmpeg_command}")

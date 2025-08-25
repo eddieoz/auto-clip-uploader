@@ -1,0 +1,265 @@
+{
+  "processing_speed": {
+    "individual_results": {
+      "crypto_analysis": {
+        "avg_time_sec": 0.00037457149956026113,
+        "min_time_sec": 0.00035661999572766945,
+        "max_time_sec": 0.00041051700100069866,
+        "std_dev_sec": 1.7573267469284225e-05,
+        "content_size_chars": 1232,
+        "chars_per_second": 3289091.672608144,
+        "iterations": 10
+      },
+      "tech_product": {
+        "avg_time_sec": 0.0003401720998226665,
+        "min_time_sec": 0.0003112009944743477,
+        "max_time_sec": 0.00037070599501021206,
+        "std_dev_sec": 1.9678202706741007e-05,
+        "content_size_chars": 1263,
+        "chars_per_second": 3712826.5388560924,
+        "iterations": 10
+      },
+      "educational": {
+        "avg_time_sec": 0.00040556829917477445,
+        "min_time_sec": 0.0003861310033244081,
+        "max_time_sec": 0.00043080299656139687,
+        "std_dev_sec": 1.2910017973764736e-05,
+        "content_size_chars": 1184,
+        "chars_per_second": 2919360.3208365417,
+        "iterations": 10
+      },
+      "general_discussion": {
+        "avg_time_sec": 0.00042814079934032633,
+        "min_time_sec": 0.00041456700273556635,
+        "max_time_sec": 0.0004464559970074333,
+        "std_dev_sec": 1.2005467541167383e-05,
+        "content_size_chars": 1295,
+        "chars_per_second": 3024705.895806517,
+        "iterations": 10
+      },
+      "short_conclusion": {
+        "avg_time_sec": 0.00029947709845146164,
+        "min_time_sec": 0.0002839989974745549,
+        "max_time_sec": 0.00031563099764753133,
+        "std_dev_sec": 1.0403745665670535e-05,
+        "content_size_chars": 1003,
+        "chars_per_second": 3349170.9555966705,
+        "iterations": 10
+      },
+      "context_heavy": {
+        "avg_time_sec": 0.0003974322004069109,
+        "min_time_sec": 0.00038024800596758723,
+        "max_time_sec": 0.0004188639941276051,
+        "std_dev_sec": 1.1902185491969614e-05,
+        "content_size_chars": 1307,
+        "chars_per_second": 3288611.2364872005,
+        "iterations": 10
+      },
+      "real_portuguese": {
+        "avg_time_sec": 0.0007282768994627987,
+        "min_time_sec": 0.000708763996954076,
+        "max_time_sec": 0.0007470659984392114,
+        "std_dev_sec": 1.2588892011627434e-05,
+        "content_size_chars": 1599,
+        "chars_per_second": 2195593.463392119,
+        "iterations": 10
+      }
+    },
+    "overall_statistics": {
+      "overall_avg_time_sec": 0.0004248055566027428,
+      "overall_min_time_sec": 0.00029947709845146164,
+      "overall_max_time_sec": 0.0007282768994627987,
+      "overall_avg_chars_per_sec": 3111337.154797612,
+      "total_scenarios_tested": 7
+    }
+  },
+  "memory_usage": {
+    "profiles": [
+      {
+        "cycle": 1,
+        "initial_memory_mb": 15.78125,
+        "peak_memory_mb": 15.78125,
+        "final_memory_mb": 15.78125,
+        "memory_increase_mb": 0.0,
+        "memory_cleanup_mb": 0.0,
+        "initial_tracemalloc_mb": 0.0056934356689453125,
+        "peak_tracemalloc_mb": 0.044999122619628906,
+        "final_tracemalloc_mb": 0.025712966918945312
+      },
+      {
+        "cycle": 2,
+        "initial_memory_mb": 15.78125,
+        "peak_memory_mb": 15.78125,
+        "final_memory_mb": 15.78125,
+        "memory_increase_mb": 0.0,
+        "memory_cleanup_mb": 0.0,
+        "initial_tracemalloc_mb": 0.0013866424560546875,
+        "peak_tracemalloc_mb": 0.042224884033203125,
+        "final_tracemalloc_mb": 0.01924610137939453
+      },
+      {
+        "cycle": 3,
+        "initial_memory_mb": 15.78125,
+        "peak_memory_mb": 15.78125,
+        "final_memory_mb": 15.78125,
+        "memory_increase_mb": 0.0,
+        "memory_cleanup_mb": 0.0,
+        "initial_tracemalloc_mb": 0.001354217529296875,
+        "peak_tracemalloc_mb": 0.04219245910644531,
+        "final_tracemalloc_mb": 0.01921367645263672
+      },
+      {
+        "cycle": 4,
+        "initial_memory_mb": 15.78125,
+        "peak_memory_mb": 15.78125,
+        "final_memory_mb": 15.78125,
+        "memory_increase_mb": 0.0,
+        "memory_cleanup_mb": 0.0,
+        "initial_tracemalloc_mb": 0.001354217529296875,
+        "peak_tracemalloc_mb": 0.04219245910644531,
+        "final_tracemalloc_mb": 0.01921367645263672
+      },
+      {
+        "cycle": 5,
+        "initial_memory_mb": 15.78125,
+        "peak_memory_mb": 15.78125,
+        "final_memory_mb": 15.78125,
+        "memory_increase_mb": 0.0,
+        "memory_cleanup_mb": 0.0,
+        "initial_tracemalloc_mb": 0.001354217529296875,
+        "peak_tracemalloc_mb": 0.04219245910644531,
+        "final_tracemalloc_mb": 0.01921367645263672
+      }
+    ],
+    "avg_memory_increase_mb": 0.0,
+    "avg_memory_cleanup_mb": 0.0,
+    "max_memory_usage_mb": 15.78125,
+    "memory_efficiency_score": 100.0
+  },
+  "scalability": {
+    "load_test_results": {
+      "1": {
+        "concurrent_requests": 1,
+        "total_wall_time_sec": 0.0010893090002355166,
+        "avg_processing_time_sec": 0.0006405239982996136,
+        "throughput_req_per_sec": 918.0131622742424,
+        "success_rate_percent": 100.0,
+        "efficiency_percent": 58.80094611915697,
+        "successful_requests": 1
+      },
+      "2": {
+        "concurrent_requests": 2,
+        "total_wall_time_sec": 0.0015371469999081455,
+        "avg_processing_time_sec": 0.0006156085000839084,
+        "throughput_req_per_sec": 1301.111734999654,
+        "success_rate_percent": 100.0,
+        "efficiency_percent": 40.04877218123543,
+        "successful_requests": 2
+      },
+      "5": {
+        "concurrent_requests": 5,
+        "total_wall_time_sec": 0.003912479995051399,
+        "avg_processing_time_sec": 0.0006348053997498937,
+        "throughput_req_per_sec": 1277.9618058939914,
+        "success_rate_percent": 100.0,
+        "efficiency_percent": 16.225141101112627,
+        "successful_requests": 5
+      },
+      "10": {
+        "concurrent_requests": 10,
+        "total_wall_time_sec": 0.0062732570004300214,
+        "avg_processing_time_sec": 0.0005293986010656227,
+        "throughput_req_per_sec": 1594.0682805302758,
+        "success_rate_percent": 100.0,
+        "efficiency_percent": 8.438975177158106,
+        "successful_requests": 10
+      },
+      "20": {
+        "concurrent_requests": 20,
+        "total_wall_time_sec": 0.011778132000472397,
+        "avg_processing_time_sec": 0.0005205678000493208,
+        "throughput_req_per_sec": 1698.0621374593052,
+        "success_rate_percent": 100.0,
+        "efficiency_percent": 4.419782356221189,
+        "successful_requests": 20
+      }
+    },
+    "max_throughput_req_per_sec": 1698.0621374593052,
+    "min_efficiency_percent": 4.419782356221189,
+    "scalability_score": 75.05065074909876,
+    "optimal_concurrent_requests": 20
+  },
+  "content_size": {
+    "size_test_results": {
+      "0.5": {
+        "size_multiplier": 0.5,
+        "content_size_chars": 587,
+        "avg_processing_time_sec": 0.00019510720012476667,
+        "processing_rate_chars_per_sec": 3008602.4484213125,
+        "iterations": 5
+      },
+      "1": {
+        "size_multiplier": 1,
+        "content_size_chars": 1232,
+        "avg_processing_time_sec": 0.00041156380029860884,
+        "processing_rate_chars_per_sec": 2993460.5499952286,
+        "iterations": 5
+      },
+      "2": {
+        "size_multiplier": 2,
+        "content_size_chars": 2464,
+        "avg_processing_time_sec": 0.0005795078017399646,
+        "processing_rate_chars_per_sec": 4251884.086119069,
+        "iterations": 5
+      },
+      "3": {
+        "size_multiplier": 3,
+        "content_size_chars": 3696,
+        "avg_processing_time_sec": 0.0006957719990168699,
+        "processing_rate_chars_per_sec": 5312085.000865903,
+        "iterations": 5
+      },
+      "5": {
+        "size_multiplier": 5,
+        "content_size_chars": 6160,
+        "avg_processing_time_sec": 0.0011115544009953737,
+        "processing_rate_chars_per_sec": 5541789.042878917,
+        "iterations": 5
+      }
+    },
+    "scaling_correlation": 0.9897995665627184,
+    "scaling_behavior": "Linear scaling (expected)",
+    "size_range_tested": "587 - 6,160 chars"
+  },
+  "regression": {
+    "regression_analysis": {
+      "processing_speed": {
+        "baseline_value": 0.0003980877998401411,
+        "current_value": 0.00039748760173097253,
+        "change_percent": -0.15077028469839815,
+        "regression_detected": false
+      },
+      "memory_usage": {
+        "baseline_value": 0.0,
+        "current_value": 0.0,
+        "change_percent": 0,
+        "regression_detected": false
+      },
+      "throughput": {
+        "baseline_value": 2578.0278810830077,
+        "current_value": 2545.099158787676,
+        "change_percent": -1.2772834047666932,
+        "regression_detected": false
+      }
+    },
+    "overall_regression": false,
+    "regressions_detected": 0
+  },
+  "benchmark_summary": {
+    "total_duration": 0.23289625899633393,
+    "successful_benchmarks": 5,
+    "total_benchmarks": 5,
+    "success_rate": 100.0,
+    "optimization_recommendations_count": 2
+  }
+}
