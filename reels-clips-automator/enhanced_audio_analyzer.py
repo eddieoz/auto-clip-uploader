@@ -409,8 +409,8 @@ class EnhancedAudioAnalyzer(BaseAudioAnalyzer):
                 (1.0 if features.get('boundary_count', 0) > 0 else 0.5) * 0.10  # Natural boundaries
             )
             
-            # Duration optimization (prefer segments closer to 50 seconds for complete narratives)
-            ideal_duration = 50.0
+            # Duration optimization (prefer segments closer to 45 seconds for complete narratives)
+            ideal_duration = 45.0
             duration_factor = 1.0 - min(1.0, abs(duration - ideal_duration) / ideal_duration)
             score = score * (1.0 + duration_factor * 0.3)
             
@@ -434,7 +434,7 @@ class EnhancedAudioAnalyzer(BaseAudioAnalyzer):
         
         return narrative_segments
 
-    def get_optimal_boundaries(self, segments, target_duration_range=(45.0, 59.0)):
+    def get_optimal_boundaries(self, segments, target_duration_range=(35.0, 59.0)):
         """
         Find optimal segment boundaries using natural pause detection.
         """

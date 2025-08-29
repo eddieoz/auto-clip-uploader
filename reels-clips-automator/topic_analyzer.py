@@ -698,7 +698,7 @@ class TopicAnalyzer:
         self, 
         concluding_segment: TopicSegment,
         supporting_segments: List[TopicSegment],
-        target_duration_range: Tuple[float, float] = (45.0, 59.0)
+        target_duration_range: Tuple[float, float] = (35.0, 59.0)
     ) -> Dict:
         """
         PHASE 4: Enhanced segment optimization with narrative completeness validation.
@@ -929,7 +929,7 @@ class TopicAnalyzer:
         context_coverage = min(context_coverage, 1.0)
         
         # Overall completeness score
-        duration_score = 1.0 if 45 <= duration <= 59 else 0.8
+        duration_score = 1.0 if 35 <= duration <= 59 else 0.8
         overall_score = (arc_quality * 0.4 + context_coverage * 0.3 + duration_score * 0.3)
         
         return {
@@ -1048,7 +1048,7 @@ class TopicAnalyzer:
                 
                 # Get optimal boundaries
                 optimal_boundaries = audio_analyzer.get_optimal_boundaries(
-                    audio_segments, target_duration_range=(45.0, 59.0)
+                    audio_segments, target_duration_range=(35.0, 59.0)
                 )
                 
                 # Enhance the optimized segment with audio insights

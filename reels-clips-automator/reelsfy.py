@@ -846,8 +846,8 @@ def generate_viral(
     transcript_content,
     audio_path=None,
     output_dir=None,
-    min_duration=1.0,
-    max_duration=90.0,
+    min_duration=35.0,
+    max_duration=59.0,
 ):
     # GEMINI WAS HERE
 
@@ -917,7 +917,7 @@ def generate_viral(
         print(f"   • Concluding topic: \"{concluding_topic['text'][:50]}...\"")
         print(f"   • Supporting segments: {len(supporting_segments)}")
         print(f"   • Optimized duration: {optimized_segment['duration']:.1f}s")
-        print(f"   • Target range: 45-59 seconds")
+        print(f"   • Target range: 35-59 seconds")
 
     # Debug: Print segment information
     print(f"DEBUG: Parsed {len(segments)} segments from transcript")
@@ -1035,7 +1035,7 @@ def generate_viral(
             if len(narrative_segments) > 0:
                 # Get optimal boundaries
                 optimal_boundaries = analyzer.get_optimal_boundaries(
-                    segments, target_duration_range=(45.0, 59.0)
+                    segments, target_duration_range=(35.0, 59.0)
                 )
 
                 if optimal_boundaries:
