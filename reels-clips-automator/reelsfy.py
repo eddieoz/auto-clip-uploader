@@ -482,7 +482,13 @@ def generate_short(
         # Constants for cropping
         CROP_RATIO_BIG = 1  # Adjust the ratio to control how much of the image (around face) is visible in the cropped video
         CROP_RATIO_SMALL = 0.5
+        CROP_RATIO_WIDE = 0.3  # For extra wide shots
         VERTICAL_RATIO = 9 / 16  # Aspect ratio for the vertical video
+        
+        # Constants for dynamic tracking behavior
+        TRACKING_STATIC_PROBABILITY = 0.4  # 40% chance for static tracking
+        ZOOM_CLOSEUP_PROBABILITY = 0.5  # 50% chance for close-up shots
+        ZOOM_IN_PROBABILITY = 0.4  # 40% chance for smooth zoom-in effect
 
         # Load pre-trained face detector from OpenCV
         face_cascade = cv2.CascadeClassifier(
@@ -517,6 +523,17 @@ def generate_short(
         smile_found = False
         boxes = None
         trackers = None
+        
+        # Dynamic tracking variables
+        tracking_mode = "static"  # Values: "static", "frame_by_frame"
+        zoom_mode = "close_up"  # Values: "close_up", "wide_shot"
+        frame_tracking_enabled = False
+        zoom_in_enabled = False  # Whether to apply smooth zoom-in effect
+        
+        # Smoothing variables to reduce camera shake
+        prev_face_center = None
+        smoothing_factor = 0.7  # 0.7 = 70% previous position, 30% new position
+        movement_threshold = 5  # Ignore movements smaller than 5 pixels
 
         while cap.isOpened():
             # Read frame from video
@@ -551,6 +568,24 @@ def generate_short(
                         except Exception as e:
                             print(f"Error update trackers: {e}")
 
+                    # Randomly select tracking and zoom modes for this 5-second interval
+                    if random.random() < TRACKING_STATIC_PROBABILITY:
+                        tracking_mode = "static"
+                    else:
+                        tracking_mode = "frame_by_frame"
+                    
+                    if random.random() < ZOOM_CLOSEUP_PROBABILITY:
+                        zoom_mode = "close_up"
+                    else:
+                        zoom_mode = "wide_shot"
+                    
+                    # Randomly decide whether to apply smooth zoom-in effect
+                    zoom_in_enabled = random.random() < ZOOM_IN_PROBABILITY
+                    
+                    frame_tracking_enabled = (tracking_mode == "frame_by_frame")
+                    
+                    print(f"Interval {frame_count // switch_interval}: tracking_mode={tracking_mode}, zoom_mode={zoom_mode}, zoom_in={zoom_in_enabled}")
+
                     # Switch faces if it's time to do so
                     current_face_index = (current_face_index + 1) % len(face_positions)
                     x, y, w, h = [int(v) for v in boxes[current_face_index]]
@@ -559,7 +594,51 @@ def generate_short(
                         f"Frame: {frame_count}, Current Face index {current_face_index} height {h} width {w} total faces {len(face_positions)}"
                     )
 
-                    face_center = (x + w // 2, y + h // 2)
+                # Update face positions for frame-by-frame tracking (not in 5-second intervals)
+                elif frame_tracking_enabled and len(face_positions) > 0 and trackers is not None:
+                    try:
+                        # Update trackers to get current face positions
+                        success, boxes = trackers.update(frame)
+                        if success and len(boxes) > current_face_index:
+                            # Update current face position from tracker
+                            x, y, w, h = [int(v) for v in boxes[current_face_index]]
+                            print(f"Frame-by-frame tracking - Frame: {frame_count}, Face: ({x}, {y}, {w}, {h})")
+                        else:
+                            # Fallback to static positioning if tracking fails
+                            print(f"Frame-by-frame tracking failed, falling back to static mode")
+                            frame_tracking_enabled = False
+                    except Exception as e:
+                        print(f"Error in frame-by-frame tracking: {e}, falling back to static mode")
+                        frame_tracking_enabled = False
+
+                # Calculate face center and crop parameters (for both modes)
+                if len(face_positions) > 0:
+                    # Calculate raw face center
+                    raw_face_center = (x + w // 2, y + h // 2)
+                    
+                    # Apply smoothing to reduce camera shake
+                    if prev_face_center is not None and frame_tracking_enabled:
+                        # Calculate distance moved
+                        dx = raw_face_center[0] - prev_face_center[0]
+                        dy = raw_face_center[1] - prev_face_center[1]
+                        movement_distance = (dx**2 + dy**2)**0.5
+                        
+                        # Only apply movement if it's above threshold (dead zone)
+                        if movement_distance > movement_threshold:
+                            # Apply exponential smoothing
+                            face_center = (
+                                int(prev_face_center[0] * smoothing_factor + raw_face_center[0] * (1 - smoothing_factor)),
+                                int(prev_face_center[1] * smoothing_factor + raw_face_center[1] * (1 - smoothing_factor))
+                            )
+                        else:
+                            # Movement too small, keep previous position
+                            face_center = prev_face_center
+                    else:
+                        # First frame or static mode, use raw position
+                        face_center = raw_face_center
+                    
+                    # Update previous position for next frame
+                    prev_face_center = face_center
 
                     if w * 16 > h * 9:
                         w_916 = w
@@ -569,12 +648,51 @@ def generate_short(
                         w_916 = int(h * 9 / 16)
 
                     # Calculate the target width and height for cropping (vertical format)
-                    if max(h, w) < target_face_size:
-                        target_height = int(frame_height * CROP_RATIO_SMALL)
-                        target_width = int(target_height * VERTICAL_RATIO)
+                    # Dynamic zoom based on randomly selected zoom mode, but respect face size
+                    base_crop_ratio = CROP_RATIO_BIG  # Default base ratio
+                    
+                    if zoom_mode == "close_up":
+                        # For close-up: use smaller crop ratio for small faces, bigger for large faces
+                        if max(h, w) < target_face_size:
+                            base_crop_ratio = CROP_RATIO_SMALL  # 0.5 - more zoom for small faces
+                        else:
+                            base_crop_ratio = CROP_RATIO_BIG    # 1.0 - normal zoom for large faces
+                    elif zoom_mode == "wide_shot":
+                        # For wide shots: always use less zoom (wider view)
+                        base_crop_ratio = CROP_RATIO_BIG        # 1.0 - always wide view
                     else:
-                        target_height = int(frame_height * CROP_RATIO_BIG)
-                        target_width = int(target_height * VERTICAL_RATIO)
+                        # Fallback to original face size threshold logic
+                        if max(h, w) < target_face_size:
+                            base_crop_ratio = CROP_RATIO_SMALL
+                        else:
+                            base_crop_ratio = CROP_RATIO_BIG
+                    
+                    # Apply progressive zoom-in effect if enabled
+                    final_crop_ratio = base_crop_ratio
+                    if zoom_in_enabled:
+                        # Calculate progress within current 5-second interval (0.0 to 1.0)
+                        interval_frame = frame_count % switch_interval
+                        zoom_progress = interval_frame / switch_interval if switch_interval > 0 else 0
+                        
+                        # Start from base ratio and gradually zoom in (reduce ratio) over 5 seconds
+                        # Zoom in by reducing crop ratio by up to 30% over the interval
+                        zoom_reduction = 0.3 * zoom_progress
+                        final_crop_ratio = base_crop_ratio * (1 - zoom_reduction)
+                        
+                        # Ensure minimum crop ratio to prevent over-zoom
+                        final_crop_ratio = max(final_crop_ratio, 0.3)
+                    
+                    target_height = int(frame_height * final_crop_ratio)
+                    target_width = int(target_height * VERTICAL_RATIO)
+
+                    # Debug output for cropping parameters
+                    crop_ratio = target_height / frame_height if frame_height > 0 else 0
+                    if zoom_in_enabled:
+                        interval_frame = frame_count % switch_interval
+                        zoom_progress = interval_frame / switch_interval if switch_interval > 0 else 0
+                        print(f"Cropping: target_width={target_width}, target_height={target_height}, crop_ratio={crop_ratio:.3f}, zoom_mode={zoom_mode}, zoom_in_progress={zoom_progress:.2f}")
+                    else:
+                        print(f"Cropping: target_width={target_width}, target_height={target_height}, crop_ratio={crop_ratio:.3f}, zoom_mode={zoom_mode}")
 
                 # Calculate the top-left corner of the 9:16 rectangle (only if we have face positions)
                 if len(face_positions) > 0:
@@ -682,6 +800,7 @@ def generate_metadata(transcript):
 2. SEO: Optimize the text by incorporating keywords and relevant phrases related to the video's content.
 3. Chapters: List the chapters with their respective timestamps to facilitate navigation.
 4. Tags: Provide a list of relevant tags in one word, separated by commas, covering the main topics and keywords of the video.
+5. Do not use (),[] or other special characters on title or description.
 
 The provided transcript is as follows: {transcript}
 
@@ -810,6 +929,7 @@ The Instagram description should:
 4. Include natural engagement elements
 5. Focus on educational/informational value
 6. Use relevant emojis and hashtags appropriately
+7. Do not use (),[] or other special characters on title or description.
 
 Return the response as JSON following this format: {json_template}
 
@@ -837,6 +957,7 @@ CONTENT APPROACH:
 - Create standalone, complete narratives
 - Use clear, accessible language
 - Include natural engagement elements
+- Do not use (),[] or other special characters on title or description.
 
 For {title_language} content, ensure cultural appropriateness and natural language flow.
 
