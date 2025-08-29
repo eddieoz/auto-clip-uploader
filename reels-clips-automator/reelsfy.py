@@ -38,6 +38,61 @@ face_enhancer = None
 
 import argparse
 import glob
+import re
+
+def sanitize_filename(filename):
+    """
+    Sanitize filename by removing or replacing problematic characters.
+    
+    Args:
+        filename (str): Original filename
+        
+    Returns:
+        str: Sanitized filename safe for filesystem
+    """
+    if not filename:
+        return "untitled"
+    
+    # Convert to string if not already
+    filename = str(filename)
+    
+    # Replace problematic characters with underscores or remove them
+    # Remove/replace: parentheses, brackets, colons, question marks, exclamation marks, quotes
+    filename = filename.replace("(", "").replace(")", "")
+    filename = filename.replace("[", "").replace("]", "")
+    filename = filename.replace("{", "").replace("}", "")
+    filename = filename.replace(":", "").replace(";", "")
+    filename = filename.replace("?", "").replace("!", "")
+    filename = filename.replace('"', "").replace("'", "")
+    filename = filename.replace("/", "_").replace("\\", "_")
+    filename = filename.replace("|", "_").replace("*", "_")
+    filename = filename.replace("<", "_").replace(">", "_")
+    filename = filename.replace("&", "and")
+    filename = filename.replace("#", "")
+    filename = filename.replace("%", "")
+    filename = filename.replace("@", "at")
+    filename = filename.replace("$", "")
+    
+    # Replace multiple spaces with single space, then replace spaces with underscores
+    filename = re.sub(r'\s+', ' ', filename.strip())
+    filename = filename.replace(" ", "_")
+    
+    # Replace multiple underscores with single underscore
+    filename = re.sub(r'_+', '_', filename)
+    
+    # Remove leading/trailing underscores
+    filename = filename.strip('_')
+    
+    # Ensure filename is not empty after sanitization
+    if not filename:
+        filename = "untitled"
+    
+    # Limit length to prevent filesystem issues
+    max_length = 200  # Leave room for extensions and prefixes
+    if len(filename) > max_length:
+        filename = filename[:max_length].rstrip('_')
+    
+    return filename
 
 # Get the absolute path to the reels-clips-automator directory (where the .env file is)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -318,7 +373,7 @@ def generate_segments(response):
         if end_time - start_time < 30:
             end_time += 30 - (end_time - start_time)
 
-        output_file = f"{str(title).replace(' ', '_').replace(':', '').replace('?', '').replace('!', '')}{str(i).zfill(3)}.mp4"
+        output_file = f"{sanitize_filename(title)}{str(i).zfill(3)}.mp4"
         command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -vf scale='1920:1080' -c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
         subprocess.call(command, shell=True)
 
@@ -435,7 +490,7 @@ def generate_thumbnail(face, text, thumb_dir):
     os.makedirs(thumbs_dir, exist_ok=True)
 
     # Save thumbnail in the thumbs subdirectory
-    thumbnail_path = os.path.join(thumbs_dir, f"thumb-{text}.png")
+    thumbnail_path = os.path.join(thumbs_dir, f"thumb-{sanitize_filename(text)}.png")
     newthumb.save(thumbnail_path, "PNG")
     print(f"Thumbnail saved to: {thumbnail_path}")
 
@@ -468,10 +523,8 @@ def generate_short(
 ):
     try:
         # Sanitize input and output file names
-        sanitized_input = input_file.replace(":", "").replace("?", "").replace("!", "")
-        sanitized_output = (
-            output_file.replace(":", "").replace("?", "").replace("!", "")
-        )
+        sanitized_input = sanitize_filename(os.path.splitext(input_file)[0]) + os.path.splitext(input_file)[1]
+        sanitized_output = sanitize_filename(os.path.splitext(output_file)[0]) + os.path.splitext(output_file)[1]
 
         # Frame counter
         frame_count = 0
@@ -1925,13 +1978,7 @@ def __main__():
             f"Processing segment {i+1}/{len(parsed_content['segments'])}: {segment['title']}"
         )
         # Just pass the output_dir, the generate_thumbnail function will handle the thumbs subdirectory
-        safe_title = (
-            str(segment["title"])
-            .replace(" ", "_")
-            .replace(":", "")
-            .replace("?", "")
-            .replace("!", "")
-        )
+        safe_title = sanitize_filename(segment["title"])
         input_file = f"{safe_title}{str(i).zfill(3)}.mp4"
         output_file = f"{safe_title}_cropped{str(i).zfill(3)}.mp4"
 
@@ -1947,8 +1994,9 @@ def __main__():
                 output_dir,
             )
             print(f"Adding subtitles to video for segment {i+1}...")
+            final_output_name = sanitize_filename(f"final-{os.path.splitext(output_file)[0]}") + os.path.splitext(output_file)[1]
             generate_subtitle(
-                f"final-{output_file.replace(':', '').replace('?', '').replace('!', '')}",
+                final_output_name,
                 video_id,
                 output_dir,
             )
@@ -2079,13 +2127,9 @@ def generate_subtitle(input_file, video_id, output_dir):
 
     # Create output path for final video with overlays
     output_filename = os.path.basename(input_file)
-    output_filename = (
-        output_filename.replace(" ", "_")
-        .replace(":", "")
-        .replace("?", "")
-        .replace("!", "")
-        .replace("-", "_")
-    )
+    base_name = os.path.splitext(output_filename)[0]
+    extension = os.path.splitext(output_filename)[1]
+    output_filename = sanitize_filename(base_name) + extension
     output_path = f"{output_dir}/{output_filename}"
 
     # Check if subtitle file was generated
