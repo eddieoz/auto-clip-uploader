@@ -539,7 +539,7 @@ def generate_short(
         VERTICAL_RATIO = 9 / 16  # Aspect ratio for the vertical video
         
         # Constants for dynamic tracking behavior
-        TRACKING_STATIC_PROBABILITY = 0.4  # 40% chance for static tracking
+        TRACKING_STATIC_PROBABILITY = 0.3  # 30% chance for static tracking
         ZOOM_CLOSEUP_PROBABILITY = 0.5  # 50% chance for close-up shots
         ZOOM_IN_PROBABILITY = 0.4  # 40% chance for smooth zoom-in effect
 
