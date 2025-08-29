@@ -682,17 +682,66 @@ def generate_short(
                         # Ensure minimum crop ratio to prevent over-zoom
                         final_crop_ratio = max(final_crop_ratio, 0.3)
                     
-                    target_height = int(frame_height * final_crop_ratio)
-                    target_width = int(target_height * VERTICAL_RATIO)
+                    # Calculate crop dimensions ensuring proper 9:16 aspect ratio
+                    # and preventing content stretching
+                    
+                    # Method 1: Calculate based on height (current approach)
+                    target_height_from_height = int(frame_height * final_crop_ratio)
+                    target_width_from_height = int(target_height_from_height * VERTICAL_RATIO)
+                    
+                    # Method 2: Calculate based on width to ensure it fits
+                    target_width_from_width = int(frame_width * final_crop_ratio) 
+                    target_height_from_width = int(target_width_from_width / VERTICAL_RATIO)
+                    
+                    # Choose the method that results in a crop region that fits within frame bounds
+                    if (target_width_from_height <= frame_width and 
+                        target_height_from_height <= frame_height):
+                        # Height-based calculation fits
+                        target_width = target_width_from_height
+                        target_height = target_height_from_height
+                    elif (target_width_from_width <= frame_width and 
+                          target_height_from_width <= frame_height):
+                        # Width-based calculation fits
+                        target_width = target_width_from_width
+                        target_height = target_height_from_width
+                    else:
+                        # Neither fits perfectly, use the smaller one that maintains aspect ratio
+                        if target_width_from_height <= frame_width:
+                            target_width = target_width_from_height
+                            target_height = target_height_from_height
+                        else:
+                            target_width = target_width_from_width
+                            target_height = target_height_from_width
+                    
+                    # Ensure minimum dimensions and proper bounds
+                    target_width = max(min(target_width, frame_width), 100)
+                    target_height = max(min(target_height, frame_height), int(100 / VERTICAL_RATIO))
+                    
+                    # Validation for crop region dimensions
+                    calculated_aspect_ratio = target_width / target_height if target_height > 0 else VERTICAL_RATIO
+                    if abs(calculated_aspect_ratio - VERTICAL_RATIO) > 0.01:
+                        print(f"⚠️  Aspect ratio mismatch: calculated={calculated_aspect_ratio:.3f}, expected={VERTICAL_RATIO:.3f}")
+                        # Fix aspect ratio by adjusting width to match height
+                        target_width = int(target_height * VERTICAL_RATIO)
+                        target_width = max(min(target_width, frame_width), 100)
+                    
+                    # Final validation
+                    if target_width <= 0 or target_height <= 0:
+                        print(f"⚠️  Invalid crop dimensions: {target_width}x{target_height}, using fallback")
+                        target_width = min(frame_width, int(frame_height * VERTICAL_RATIO))
+                        target_height = min(frame_height, int(frame_width / VERTICAL_RATIO))
 
-                    # Debug output for cropping parameters
+                    # Debug output for cropping parameters with aspect ratio tracking
                     crop_ratio = target_height / frame_height if frame_height > 0 else 0
+                    final_aspect_ratio = target_width / target_height if target_height > 0 else VERTICAL_RATIO
+                    face_size_category = "small" if max(h, w) < target_face_size else "large"
+                    
                     if zoom_in_enabled:
                         interval_frame = frame_count % switch_interval
                         zoom_progress = interval_frame / switch_interval if switch_interval > 0 else 0
-                        print(f"Cropping: target_width={target_width}, target_height={target_height}, crop_ratio={crop_ratio:.3f}, zoom_mode={zoom_mode}, zoom_in_progress={zoom_progress:.2f}")
+                        print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}, zoom_in_progress={zoom_progress:.2f}")
                     else:
-                        print(f"Cropping: target_width={target_width}, target_height={target_height}, crop_ratio={crop_ratio:.3f}, zoom_mode={zoom_mode}")
+                        print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}")
 
                 # Calculate the top-left corner of the 9:16 rectangle (only if we have face positions)
                 if len(face_positions) > 0:
@@ -734,9 +783,36 @@ def generate_short(
                                 else:
                                     print("⚠️  Face enhancement requested but enhancer not available, skipping...")
 
-                    resized = cv2.resize(
-                        crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC
-                    )
+                    # Ensure proper aspect ratio preservation during resize
+                    crop_h, crop_w = crop_img.shape[:2]
+                    crop_aspect_ratio = crop_w / crop_h if crop_h > 0 else VERTICAL_RATIO
+                    target_aspect_ratio = VERTICAL_RATIO
+                    
+                    if abs(crop_aspect_ratio - target_aspect_ratio) < 0.01:
+                        # Aspect ratios are close enough, direct resize
+                        resized = cv2.resize(
+                            crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC
+                        )
+                    else:
+                        # Aspect ratios don't match, need to pad or crop to prevent stretching
+                        print(f"🔧 Aspect ratio correction: crop={crop_aspect_ratio:.3f} -> target={target_aspect_ratio:.3f}")
+                        if crop_aspect_ratio > target_aspect_ratio:
+                            # Crop is wider than 9:16, crop width to match
+                            new_width = int(crop_h * target_aspect_ratio)
+                            x_offset = (crop_w - new_width) // 2
+                            crop_img = crop_img[:, x_offset:x_offset + new_width]
+                            print(f"   Cropped width: {crop_w} -> {new_width}")
+                        else:
+                            # Crop is taller than 9:16, crop height to match  
+                            new_height = int(crop_w / target_aspect_ratio)
+                            y_offset = (crop_h - new_height) // 2
+                            crop_img = crop_img[y_offset:y_offset + new_height, :]
+                            print(f"   Cropped height: {crop_h} -> {new_height}")
+                        
+                        # Now resize the properly cropped image
+                        resized = cv2.resize(
+                            crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC
+                        )
 
                     if thumb and not smile_found:
                         smile_found, smile_frame = find_smile(
