@@ -29,12 +29,12 @@ class PostizConfig:
             "tiktok": os.getenv("POSTIZ_TIKTOK_CHANNEL_ID"),
         }
         
-        # Platform enable/disable flags
+        # Platform enable/disable flags and posting times
+        self.platform_configs = self._parse_platform_configs()
+        
+        # Backward compatibility - extract enabled status
         self.enabled_platforms = {
-            "twitter": os.getenv("PUBLISH_TO_TWITTER", "true").lower() == "true",
-            "instagram": os.getenv("PUBLISH_TO_INSTAGRAM", "true").lower() == "true",
-            "youtube": os.getenv("PUBLISH_TO_YOUTUBE", "true").lower() == "true",
-            "tiktok": os.getenv("PUBLISH_TO_TIKTOK", "true").lower() == "true",
+            platform: config["enabled"] for platform, config in self.platform_configs.items()
         }
         
         # Posting time configuration
@@ -59,6 +59,103 @@ class PostizConfig:
         else:
             print(f"Warning: .env file not found at {env_path}")
     
+    def _parse_platform_configs(self) -> Dict[str, Dict[str, any]]:
+        """
+        Parse platform configurations supporting both old boolean format and new comma-separated format
+        
+        Supported formats:
+        - "true" / "false" (backward compatibility) -> uses global POSTIZ_POSTING_TIME
+        - "true, now" -> enabled with immediate posting
+        - "true, now + 2 hours" -> enabled with specific posting time
+        - "false, ..." -> disabled (posting time ignored)
+        
+        Returns:
+            Dict[platform_name, {"enabled": bool, "posting_time": str}]
+        """
+        platforms = ["twitter", "instagram", "youtube", "tiktok"]
+        configs = {}
+        
+        for platform in platforms:
+            env_var = f"PUBLISH_TO_{platform.upper()}"
+            raw_value = os.getenv(env_var, "true")
+            
+            config = self._parse_single_platform_config(platform, raw_value)
+            configs[platform] = config
+            
+        return configs
+    
+    def _parse_single_platform_config(self, platform: str, raw_value: str) -> Dict[str, any]:
+        """
+        Parse a single platform configuration string
+        
+        Args:
+            platform: Platform name (e.g., "twitter")
+            raw_value: Raw environment variable value
+            
+        Returns:
+            Dict with "enabled" and "posting_time" keys
+        """
+        # Handle empty or whitespace-only values
+        if not raw_value or not raw_value.strip():
+            return {"enabled": False, "posting_time": None}
+        
+        # Clean the value
+        raw_value = raw_value.strip()
+        
+        # Check if it's a comma-separated format
+        if "," in raw_value:
+            parts = [part.strip() for part in raw_value.split(",", 1)]
+            
+            # Must have exactly 2 parts for valid comma-separated format
+            if len(parts) == 2:
+                enabled_str, posting_time = parts
+                
+                # Parse enabled status
+                enabled = enabled_str.lower() == "true"
+                
+                # If disabled, ignore posting time
+                if not enabled:
+                    return {"enabled": False, "posting_time": None}
+                
+                # Validate posting time format
+                if self._validate_time_format(posting_time):
+                    return {"enabled": True, "posting_time": posting_time}
+                else:
+                    # Invalid time format - fallback to global setting with warning
+                    print(f"⚠️  Invalid time format for {platform.upper()}: '{posting_time}' - falling back to global POSTIZ_POSTING_TIME")
+                    return {"enabled": True, "posting_time": None}  # None means use global
+            else:
+                # Malformed comma-separated format
+                print(f"⚠️  Malformed configuration for {platform.upper()}: '{raw_value}' - falling back to global POSTIZ_POSTING_TIME")
+                return {"enabled": True, "posting_time": None}
+        else:
+            # Backward compatibility - simple boolean format
+            enabled = raw_value.lower() == "true"
+            return {"enabled": enabled, "posting_time": None}  # None means use global
+    
+    def _validate_time_format(self, time_str: str) -> bool:
+        """
+        Validate posting time format
+        
+        Args:
+            time_str: Time string to validate
+            
+        Returns:
+            True if valid, False if invalid
+        """
+        if not time_str or not time_str.strip():
+            return False
+            
+        time_str = time_str.lower().strip()
+        
+        # Check for "now" format
+        if time_str == "now":
+            return True
+        
+        # Check for "now + N minutes/hours" format
+        pattern = r"^now\s*\+\s*\d+\s*(minutes?|hours?|mins?|hrs?)$"
+        return bool(re.match(pattern, time_str))
+    
     def _validate_config(self):
         """Validate required configuration"""
         if not self.api_key:
@@ -82,6 +179,24 @@ class PostizConfig:
             if enabled and self.channel_ids.get(platform):
                 enabled_channels[platform] = self.channel_ids[platform]
         return enabled_channels
+    
+    def get_platform_posting_time(self, platform: str) -> str:
+        """
+        Get posting time for a specific platform
+        
+        Args:
+            platform: Platform name (e.g., "twitter", "instagram")
+            
+        Returns:
+            Platform-specific posting time or global fallback
+        """
+        if platform not in self.platform_configs:
+            return self.posting_time
+        
+        platform_config = self.platform_configs[platform]
+        
+        # Return platform-specific time if configured, otherwise global fallback
+        return platform_config["posting_time"] or self.posting_time
     
     def is_valid(self) -> bool:
         """Check if configuration is valid"""
@@ -126,6 +241,12 @@ class PostizConfig:
         """
         enabled_channels = self.get_enabled_channels()
         
+        # Build platform-specific posting time summary
+        platform_posting_times = {}
+        for platform in self.platform_configs:
+            if self.enabled_platforms.get(platform, False):
+                platform_posting_times[platform] = self.get_platform_posting_time(platform)
+        
         return {
             "api_key_present": bool(self.api_key),
             "api_key_preview": f"{self.api_key[:8]}..." if self.api_key else None,
@@ -133,13 +254,21 @@ class PostizConfig:
             "enabled_platforms": [platform for platform, enabled in self.enabled_platforms.items() if enabled],
             "configured_channels": list(enabled_channels.keys()),
             "channel_count": len(enabled_channels),
-            "posting_time_config": self.posting_time,
+            "global_posting_time": self.posting_time,
+            "platform_posting_times": platform_posting_times,
+            "platforms_using_global_fallback": [
+                platform for platform, config in self.platform_configs.items() 
+                if self.enabled_platforms.get(platform, False) and not config["posting_time"]
+            ],
             "is_valid": self.is_valid()
         }
     
-    def parse_posting_time(self) -> Dict[str, any]:
+    def parse_posting_time(self, platform: Optional[str] = None) -> Dict[str, any]:
         """
         Parse posting time configuration and calculate posting type and delay
+        
+        Args:
+            platform: Specific platform name to get posting time for. If None, uses global time.
         
         Supported formats:
         - "now" -> immediate posting
@@ -150,7 +279,26 @@ class PostizConfig:
         Returns:
             Dict with posting type and calculated datetime
         """
-        config_time = self.posting_time.lower().strip()
+        # Get the appropriate posting time (platform-specific or global)
+        if platform:
+            config_time = self.get_platform_posting_time(platform)
+        else:
+            config_time = self.posting_time
+            
+        return self._parse_time_string(config_time, platform)
+    
+    def _parse_time_string(self, config_time: str, platform: Optional[str] = None) -> Dict[str, any]:
+        """
+        Parse a time string and return posting configuration
+        
+        Args:
+            config_time: Time string to parse
+            platform: Platform name for error messages
+        
+        Returns:
+            Dict with posting type and calculated datetime
+        """
+        config_time = config_time.lower().strip()
         
         if config_time == "now":
             return {
@@ -185,7 +333,10 @@ class PostizConfig:
             }
         
         # If format is invalid, default to "now"
-        print(f"⚠️  Invalid POSTIZ_POSTING_TIME format: '{self.posting_time}' - defaulting to 'now'")
+        if platform:
+            print(f"⚠️  Invalid posting time format for {platform.upper()}: '{config_time}' - defaulting to 'now'")
+        else:
+            print(f"⚠️  Invalid POSTIZ_POSTING_TIME format: '{config_time}' - defaulting to 'now'")
         print(f"   Supported formats: 'now', 'now + 5 minutes', 'now + 2 hours'")
         
         return {
@@ -195,27 +346,104 @@ class PostizConfig:
             "description": "Immediate posting (invalid format fallback)"
         }
     
-    def get_posting_type_for_postiz(self) -> str:
+    def get_posting_type_for_postiz(self, platform: Optional[str] = None) -> str:
         """
         Get the posting type string for Postiz API
+        
+        Args:
+            platform: Specific platform to get posting type for
         
         Returns:
             "now" for immediate posting or "date" for scheduled posting
         """
-        parsed_time = self.parse_posting_time()
+        parsed_time = self.parse_posting_time(platform)
         return parsed_time["type"]
     
-    def get_scheduled_datetime_iso(self) -> Optional[str]:
+    def get_scheduled_datetime_iso(self, platform: Optional[str] = None) -> Optional[str]:
         """
         Get scheduled datetime in ISO format for Postiz API
+        
+        Args:
+            platform: Specific platform to get scheduled time for
         
         Returns:
             ISO datetime string for scheduled posts, None for immediate posts
         """
-        parsed_time = self.parse_posting_time()
+        parsed_time = self.parse_posting_time(platform)
         if parsed_time["scheduled_time"]:
             return parsed_time["scheduled_time"].isoformat()
         return None
+    
+    def get_platform_scheduling_info(self, platform: str) -> Dict[str, any]:
+        """
+        Get comprehensive scheduling information for a specific platform
+        
+        Args:
+            platform: Platform name (e.g., "twitter", "instagram")
+        
+        Returns:
+            Dict with scheduling details for the platform
+        """
+        if not self.enabled_platforms.get(platform, False):
+            return {
+                "enabled": False,
+                "posting_time": None,
+                "parsed_time": None,
+                "posting_type": None,
+                "scheduled_iso": None
+            }
+        
+        posting_time = self.get_platform_posting_time(platform)
+        parsed_time = self.parse_posting_time(platform)
+        
+        return {
+            "enabled": True,
+            "posting_time": posting_time,
+            "parsed_time": parsed_time,
+            "posting_type": parsed_time["type"],
+            "scheduled_iso": self.get_scheduled_datetime_iso(platform)
+        }
+    
+    def platforms_have_different_times(self) -> bool:
+        """
+        Check if enabled platforms have different posting times
+        
+        Returns:
+            True if platforms have different posting times, False if all use the same time
+        """
+        enabled_platforms = [platform for platform, enabled in self.enabled_platforms.items() if enabled]
+        
+        if len(enabled_platforms) <= 1:
+            return False
+        
+        # Get posting times for all enabled platforms
+        posting_times = set()
+        for platform in enabled_platforms:
+            posting_time = self.get_platform_posting_time(platform)
+            posting_times.add(posting_time)
+        
+        # If all platforms have the same posting time, return False
+        return len(posting_times) > 1
+    
+    def group_platforms_by_posting_time(self) -> Dict[str, List[str]]:
+        """
+        Group enabled platforms by their posting times
+        
+        Returns:
+            Dict mapping posting times to lists of platform names
+        """
+        groups = {}
+        
+        for platform, enabled in self.enabled_platforms.items():
+            if enabled:
+                posting_time = self.get_platform_posting_time(platform)
+                
+                if posting_time not in groups:
+                    groups[posting_time] = []
+                
+                groups[posting_time].append(platform)
+        
+        return groups
     
     def validate_posting_time_config(self) -> bool:
         """
