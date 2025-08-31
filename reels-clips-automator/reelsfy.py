@@ -2142,21 +2142,21 @@ def generate_subtitle(input_file, video_id, output_dir):
         print(f"Using subtitle file: {temp_srt_file}")
         # Build filter complex starting with subtitles
         filter_parts = [
-            f"subtitles='{temp_srt_file}':force_style='Alignment=2,MarginV=40,MarginL=55,MarginR=55,Fontname=Noto Sans,Fontsize=14,PrimaryColour=&H00ffffff,SecondaryColour=&H000000ff,OutlineColour=&H00000000,BackColour=&H80000000,Outline=1.5,Shadow=1.5,BorderStyle=1'[v1]"
+            f"subtitles='{temp_srt_file}':force_style='Alignment=2,MarginV=40,MarginL=55,MarginR=55,Fontname=Noto Sans,Fontsize=11,PrimaryColour=&H00ffffff,SecondaryColour=&H000000ff,OutlineColour=&H00000000,BackColour=&H80000000,Outline=1.5,Shadow=1.5,BorderStyle=1'[v1]"
         ]
         last_filter = "v1"
 
     # Add date overlay (top-left)
     if date_text:
         filter_parts.append(
-            f"[{last_filter}]drawtext=text='{date_text}':fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontsize=24:fontcolor=white:x=30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v2]"
+            f"[{last_filter}]drawtext=text='{date_text}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v2]"
         )
         last_filter = "v2"
 
     # Add channel name overlay (bottom-right, above subtitles)
     if channel_name:
         filter_parts.append(
-            f"[{last_filter}]drawtext=text='{channel_name}':fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontsize=20:fontcolor=white:x=W-tw-30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v3]"
+            f"[{last_filter}]drawtext=text='{channel_name}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=W-tw-30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v3]"
         )
         last_filter = "v3"
 
