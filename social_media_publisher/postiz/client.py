@@ -519,6 +519,11 @@ class PostizClient:
                 **base_settings,
                 # Twitter typically only needs basic settings
             }
+        elif platform == "bsky":
+            # Bluesky minimal settings
+            return {
+                "post_type": "post"
+            }
         else:
             # Unknown/generic platform - use minimal safe settings
             return base_settings
@@ -595,6 +600,10 @@ class PostizClient:
             # Add fallback content for unmapped channels
             platform_content["default"] = content
         
+        # Generate a simple jobId for compatibility
+        import time
+        simple_job_id = f"job_{int(time.time())}"
+        
         # Build platform posts for each channel with platform-specific settings
         posts = []
         for channel_id in channel_ids:
@@ -649,17 +658,28 @@ class PostizClient:
             if platform in ["youtube", "twitter"] or platform is None:
                 settings["title"] = clean_title[:100]  # Max 100 chars
             
+            # Standard post structure
+            value_item = {
+                "content": post_content,
+                "image": [{
+                    "id": file_info["id"],
+                    "path": file_info["path"]
+                }]
+            }
+            
             post_data = {
                 "integration": {"id": channel_id},
-                "value": [{
-                    "content": post_content,
-                    "image": [{
-                        "id": file_info["id"],
-                        "path": file_info["path"]
-                    }]
-                }],
+                "value": [value_item],
                 "settings": settings
             }
+            
+            # Debug: Log the request payload for Bluesky 
+            if platform == "bsky":
+                print(f"🦋 Bluesky API payload (CLEAN):")
+                print(f"   Channel ID: {channel_id}")
+                print(f"   Settings: {settings}")
+                print(f"   Post content length: {len(post_content)} chars")
+                print(f"   Note: jobId issue is internal to Postiz, not API-related")
             
             # Debug: Log the request payload for Instagram to identify differences
             if platform == "instagram":
@@ -686,11 +706,11 @@ class PostizClient:
         print(f"   Input posting_type: '{posting_type}'")
         print(f"   Final api_posting_type: '{api_posting_type}'")
         
-        # Build payload with all required fields
+        # Build payload with standard required fields
         payload = {
             "type": api_posting_type,
-            "shortLink": False,  # Required boolean field
-            "tags": [],  # Required array field
+            "shortLink": False,
+            "tags": [],
             "posts": posts
         }
         

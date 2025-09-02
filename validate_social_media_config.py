@@ -94,7 +94,7 @@ def check_env_file():
     required_fields = [
         "POSTIZ_API_KEY",
         "POSTIZ_TWITTER_CHANNEL_ID",
-        "POSTIZ_INSTAGRAM_CHANNEL_ID", 
+        "POSTIZ_INSTAGRAM_CHANNEL_ID",
         "POSTIZ_YOUTUBE_CHANNEL_ID",
         "POSTIZ_TIKTOK_CHANNEL_ID",
         "POSTIZ_NOSTR_CHANNEL_ID",
