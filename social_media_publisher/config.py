@@ -27,6 +27,8 @@ class PostizConfig:
             "instagram": os.getenv("POSTIZ_INSTAGRAM_CHANNEL_ID"),
             "youtube": os.getenv("POSTIZ_YOUTUBE_CHANNEL_ID"),
             "tiktok": os.getenv("POSTIZ_TIKTOK_CHANNEL_ID"),
+            "nostr": os.getenv("POSTIZ_NOSTR_CHANNEL_ID"),
+            "bsky": os.getenv("POSTIZ_BSKY_CHANNEL_ID"),
         }
         
         # Platform enable/disable flags and posting times

@@ -96,7 +96,10 @@ def check_env_file():
         "POSTIZ_TWITTER_CHANNEL_ID",
         "POSTIZ_INSTAGRAM_CHANNEL_ID", 
         "POSTIZ_YOUTUBE_CHANNEL_ID",
-        "POSTIZ_TIKTOK_CHANNEL_ID"
+        "POSTIZ_TIKTOK_CHANNEL_ID",
+        "POSTIZ_NOSTR_CHANNEL_ID",
+        "POSTIZ_BSKY_CHANNEL_ID",
+
     ]
     
     present_fields = []
