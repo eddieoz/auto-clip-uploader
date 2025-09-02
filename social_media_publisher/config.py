@@ -74,7 +74,7 @@ class PostizConfig:
         Returns:
             Dict[platform_name, {"enabled": bool, "posting_time": str}]
         """
-        platforms = ["twitter", "instagram", "youtube", "tiktok"]
+        platforms = ["twitter", "instagram", "youtube", "tiktok", "nostr", "bsky"]
         configs = {}
         
         for platform in platforms:

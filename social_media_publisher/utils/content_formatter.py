@@ -28,7 +28,9 @@ class SocialMediaFormatter:
         "youtube": PlatformLimits(max_length=5000, hashtag_limit=15),
         "tiktok": PlatformLimits(max_length=2200, hashtag_limit=20),
         "linkedin": PlatformLimits(max_length=3000, hashtag_limit=10),
-        "facebook": PlatformLimits(max_length=63206, hashtag_limit=20)
+        "facebook": PlatformLimits(max_length=63206, hashtag_limit=20),
+        "nostr": PlatformLimits(max_length=2000, hashtag_limit=10),  # Nostr has no character limit, using generous 2000
+        "bsky": PlatformLimits(max_length=300, hashtag_limit=5)      # Bluesky has a 300 character limit
     }
     
     def __init__(self, metadata: VideoMetadata):
@@ -65,6 +67,10 @@ class SocialMediaFormatter:
             return self._format_youtube(limits, segment_zero)
         elif platform == "tiktok":
             return self._format_tiktok(limits, segment_zero)
+        elif platform == "nostr":
+            return self._format_nostr(limits, segment_zero)
+        elif platform == "bsky":
+            return self._format_bsky(limits, segment_zero)
         else:
             return self._format_generic(limits, segment_zero)
     
@@ -133,10 +139,14 @@ class SocialMediaFormatter:
         remaining_space = limits.max_length - len(content) - 10
         
         for tag in instagram_hashtags:
-            if tag not in content and len(content + " " + tag) < remaining_space:
+            if tag not in content and len(content + " " + tag) <= limits.max_length:
                 content += f" {tag}"
         
-        return content[:limits.max_length]
+        # Ensure we never exceed the limit
+        if len(content) > limits.max_length:
+            content = content[:limits.max_length]
+        
+        return content
     
     def _format_youtube(self, limits: PlatformLimits, segment_zero) -> str:
         """Format content for YouTube Shorts"""
@@ -167,10 +177,18 @@ class SocialMediaFormatter:
         all_hashtags = hashtags + [tag for tag in youtube_hashtags if tag not in hashtags]
         all_hashtags = all_hashtags[:limits.hashtag_limit]
         
-        if all_hashtags:
-            content += f"\n\n{' '.join(all_hashtags)}"
+        # Calculate exact hashtag length
+        hashtag_text = f"\n\n{' '.join(all_hashtags)}" if all_hashtags else ""
         
-        return content[:limits.max_length]
+        # Ensure total length doesn't exceed limit
+        if len(content) + len(hashtag_text) > limits.max_length:
+            max_content_length = limits.max_length - len(hashtag_text)
+            content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
+        
+        # Add hashtags
+        content += hashtag_text
+        
+        return content
     
     def _format_tiktok(self, limits: PlatformLimits, segment_zero) -> str:
         """Format content for TikTok"""
@@ -205,10 +223,83 @@ class SocialMediaFormatter:
             if tag not in final_hashtags and len(final_hashtags) < limits.hashtag_limit:
                 final_hashtags.append(tag)
         
-        if final_hashtags:
-            content += f"\n\n{' '.join(final_hashtags)}"
+        # Calculate exact hashtag length
+        hashtag_text = f"\n\n{' '.join(final_hashtags)}" if final_hashtags else ""
         
-        return content[:limits.max_length]
+        # Ensure total length doesn't exceed limit
+        if len(content) + len(hashtag_text) > limits.max_length:
+            max_content_length = limits.max_length - len(hashtag_text)
+            content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
+        
+        # Add hashtags
+        content += hashtag_text
+        
+        return content
+    
+    def _format_nostr(self, limits: PlatformLimits, segment_zero) -> str:
+        """Format content for Nostr"""
+        components = []
+        
+        title = segment_zero.title if segment_zero else self.metadata.title
+        if title and title != f"Segment {segment_zero.index if segment_zero else 0}":
+            components.append(title)
+        
+        if segment_zero and segment_zero.description:
+            components.append(segment_zero.description)
+        elif self.metadata.description:
+            components.append(self.metadata.description)
+        
+        content = "\n\n".join(components)
+        
+        # Add hashtags first to calculate exact length
+        hashtags = self._select_hashtags(limits.hashtag_limit)
+        hashtag_text = f"\n\n{' '.join(hashtags)}" if hashtags else ""
+        
+        # For Nostr, we have a generous limit but still need to respect it
+        if len(content) + len(hashtag_text) > limits.max_length:
+            max_content_length = limits.max_length - len(hashtag_text)
+            content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
+        
+        # Add hashtags
+        content += hashtag_text
+        
+        return content
+    
+    def _format_bsky(self, limits: PlatformLimits, segment_zero) -> str:
+        """Format content for Bluesky"""
+        components = []
+        
+        title = segment_zero.title if segment_zero else self.metadata.title
+        if title and title != f"Segment {segment_zero.index if segment_zero else 0}":
+            components.append(title)
+        
+        if segment_zero and segment_zero.description:
+            components.append(segment_zero.description)
+        elif self.metadata.description:
+            components.append(self.metadata.description)
+        
+        # Combine and truncate for Bluesky's 300 character limit
+        content = " - ".join(components)
+        
+        # Add hashtags first to calculate exact length
+        hashtags = self._select_hashtags(limits.hashtag_limit)
+        hashtag_text = f"\n\n{' '.join(hashtags)}" if hashtags else ""
+        hashtag_length = len(hashtag_text)
+        
+        # Reserve exact space for hashtags
+        max_content_length = limits.max_length - hashtag_length
+        
+        if len(content) > max_content_length:
+            content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
+            # Double check we didn't exceed after adding "..."
+            if len(content) + hashtag_length > limits.max_length:
+                excess = (len(content) + hashtag_length) - limits.max_length
+                content = content[:-excess]
+        
+        # Add hashtags
+        content += hashtag_text
+        
+        return content
     
     def _format_generic(self, limits: PlatformLimits, segment_zero) -> str:
         """Generic format for other platforms"""
