@@ -524,6 +524,12 @@ class PostizClient:
             return {
                 "post_type": "post"
             }
+        elif platform == "mastodon":
+            # Mastodon settings
+            return {
+                **base_settings,
+                # Mastodon typically uses minimal settings like Twitter
+            }
         else:
             # Unknown/generic platform - use minimal safe settings
             return base_settings

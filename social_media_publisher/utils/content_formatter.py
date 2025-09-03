@@ -30,7 +30,8 @@ class SocialMediaFormatter:
         "linkedin": PlatformLimits(max_length=3000, hashtag_limit=10),
         "facebook": PlatformLimits(max_length=63206, hashtag_limit=20),
         "nostr": PlatformLimits(max_length=2000, hashtag_limit=10),  # Nostr has no character limit, using generous 2000
-        "bsky": PlatformLimits(max_length=300, hashtag_limit=5)      # Bluesky has a 300 character limit
+        "bsky": PlatformLimits(max_length=300, hashtag_limit=5),     # Bluesky has a 300 character limit
+        "mastodon": PlatformLimits(max_length=500, hashtag_limit=10) # Mastodon standard limit is 500 characters
     }
     
     def __init__(self, metadata: VideoMetadata):
@@ -71,6 +72,8 @@ class SocialMediaFormatter:
             return self._format_nostr(limits, segment_zero)
         elif platform == "bsky":
             return self._format_bsky(limits, segment_zero)
+        elif platform == "mastodon":
+            return self._format_mastodon(limits, segment_zero)
         else:
             return self._format_generic(limits, segment_zero)
     
@@ -298,6 +301,48 @@ class SocialMediaFormatter:
         
         # Add hashtags
         content += hashtag_text
+        
+        return content
+    
+    def _format_mastodon(self, limits: PlatformLimits, segment_zero) -> str:
+        """Format content for Mastodon"""
+        components = []
+        
+        title = segment_zero.title if segment_zero else self.metadata.title
+        if title and title != f"Segment {segment_zero.index if segment_zero else 0}":
+            components.append(title)
+        
+        if segment_zero and segment_zero.description:
+            components.append(segment_zero.description)
+        elif self.metadata.description:
+            components.append(self.metadata.description)
+        
+        # Combine with line breaks for better readability on Mastodon
+        content = "\n\n".join(components)
+        
+        # Add hashtags first to calculate exact length
+        hashtags = self._select_hashtags(limits.hashtag_limit)
+        hashtag_text = f"\n\n{' '.join(hashtags)}" if hashtags else ""
+        
+        # Mastodon has a 500 character limit - ensure we respect it
+        if len(content) + len(hashtag_text) > limits.max_length:
+            max_content_length = limits.max_length - len(hashtag_text) - 3  # Reserve 3 chars for "..."
+            content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
+        
+        # Add hashtags
+        content += hashtag_text
+        
+        # Final safety check to ensure we never exceed the limit
+        if len(content) > limits.max_length:
+            # Emergency truncation - remove hashtags if necessary
+            if hashtags:
+                content_without_hashtags = content.replace(hashtag_text, "").strip()
+                if len(content_without_hashtags) <= limits.max_length:
+                    content = content_without_hashtags
+                else:
+                    content = content_without_hashtags[:limits.max_length-3] + "..."
+            else:
+                content = content[:limits.max_length-3] + "..."
         
         return content
     

@@ -29,6 +29,7 @@ class PostizConfig:
             "tiktok": os.getenv("POSTIZ_TIKTOK_CHANNEL_ID"),
             "nostr": os.getenv("POSTIZ_NOSTR_CHANNEL_ID"),
             "bsky": os.getenv("POSTIZ_BSKY_CHANNEL_ID"),
+            "mastodon": os.getenv("POSTIZ_MASTODON_CHANNEL_ID"),
         }
         
         # Platform enable/disable flags and posting times
@@ -74,7 +75,7 @@ class PostizConfig:
         Returns:
             Dict[platform_name, {"enabled": bool, "posting_time": str}]
         """
-        platforms = ["twitter", "instagram", "youtube", "tiktok", "nostr", "bsky"]
+        platforms = ["twitter", "instagram", "youtube", "tiktok", "nostr", "bsky", "mastodon"]
         configs = {}
         
         for platform in platforms:
