@@ -725,7 +725,11 @@ def generate_short(
                     if zoom_in_enabled:
                         # Calculate progress within current 5-second interval (0.0 to 1.0)
                         interval_frame = frame_count % switch_interval
-                        zoom_progress = interval_frame / switch_interval if switch_interval > 0 else 0
+                        linear_progress = interval_frame / switch_interval if switch_interval > 0 else 0
+                        
+                        # Apply ease-in-out cubic easing for smooth zoom motion
+                        # Formula: t * t * (3.0 - 2.0 * t) creates smooth acceleration/deceleration
+                        zoom_progress = linear_progress * linear_progress * (3.0 - 2.0 * linear_progress)
                         
                         # Start from base ratio and gradually zoom in (reduce ratio) over 5 seconds
                         # Zoom in by reducing crop ratio by up to 30% over the interval
