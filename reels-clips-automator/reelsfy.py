@@ -540,8 +540,8 @@ def generate_short(
         
         # Constants for dynamic tracking behavior
         TRACKING_STATIC_PROBABILITY = 0.3  # 30% chance for static tracking
-        ZOOM_CLOSEUP_PROBABILITY = 0.5  # 50% chance for close-up shots
-        ZOOM_IN_PROBABILITY = 0.4  # 40% chance for smooth zoom-in effect
+        ZOOM_CLOSEUP_PROBABILITY = 0.6  # 60% chance for close-up shots
+        ZOOM_IN_PROBABILITY = 0.2  # 20% chance for smooth zoom-in effect
 
         # Load pre-trained face detector from OpenCV
         face_cascade = cv2.CascadeClassifier(
