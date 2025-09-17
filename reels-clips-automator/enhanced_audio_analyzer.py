@@ -505,11 +505,11 @@ if __name__ == "__main__":
         
         try:
             # Test with a sample audio file if available
-            test_audio = "/tmp/test_audio.wav"
-            
+            test_audio = "tmp/test_audio.wav"
+
             # Create simple test audio
             import subprocess
-            cmd = "ffmpeg -y -f lavfi -i sine=frequency=440:duration=10 -ac 1 -ar 22050 /tmp/test_audio.wav"
+            cmd = "ffmpeg -y -f lavfi -i sine=frequency=440:duration=10 -ac 1 -ar 22050 tmp/test_audio.wav"
             subprocess.call(cmd, shell=True, stderr=subprocess.DEVNULL)
             
             if os.path.exists(test_audio):

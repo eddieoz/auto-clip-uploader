@@ -29,6 +29,25 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["GGML_CUDA_NO_PINNED"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
+# STT Model Configuration
+def get_stt_model_config():
+    """
+    Get STT model configuration from environment variables with validation and fallback.
+
+    Returns:
+        str: Valid STT model name ('whisper' or 'faster-whisper')
+    """
+    stt_model = os.getenv('STT_MODEL', 'whisper').lower().strip()
+    valid_models = ['whisper', 'faster-whisper']
+
+    if stt_model in valid_models:
+        print(f"Using STT model: {stt_model}")
+        return stt_model
+    else:
+        print(f"Warning: Invalid STT_MODEL '{stt_model}'. Valid options are: {', '.join(valid_models)}")
+        print("Falling back to default: whisper")
+        return 'whisper'
+
 scale = 4
 target_face_size = 345
 
@@ -1527,8 +1546,17 @@ def parse_srt(srt_content):
 
 
 def generate_transcript(input_file):
+    """
+    Generate transcript using the new transcription service.
+    Supports both Whisper and Faster Whisper with automatic fallback.
+    """
+    import logging
+    from transcription_service import get_transcriber
+
+    logger = logging.getLogger(__name__)
+
     # Extract audio for transcription
-    temp_dir = tempfile.gettempdir()
+    temp_dir = "tmp/"
     audio_path = os.path.join(
         temp_dir, f"{os.path.basename(input_file).split('.')[0]}.wav"
     )
@@ -1538,21 +1566,53 @@ def generate_transcript(input_file):
     audio_cmd = f"ffmpeg -y -i tmp/{input_file} -vn -acodec pcm_s16le -ac 1 -ar 16000 {audio_path}"
     subprocess.call(audio_cmd, shell=True)
 
-    # Load Whisper model and transcribe
-    print("Loading Whisper model...")
-    # model = whisper.load_model("medium")
-    model = whisper.load_model(os.getenv('WHISPER_MODEL', 'small'))
-    print("Transcribing audio...")
-    result = model.transcribe(audio_path)
-    print("Transcription done")
+    try:
+        # Get transcriber through the service factory
+        print("Initializing transcription service...")
+        transcriber = get_transcriber()
+        print(f"Using {transcriber.name} for transcription...")
 
-    # Return both the segments and the full transcript
-    return {
-        "segments": result["segments"],
-        "full_transcript": " ".join(
-            segment["text"].strip() for segment in result["segments"]
-        ),
-    }
+        # Transcribe using the service
+        print("Transcribing audio...")
+        result = transcriber.transcribe(audio_path)
+        print("Transcription done")
+
+        # Clean up temporary audio file
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass  # File might not exist or already removed
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Transcription failed: {str(e)}")
+        print(f"Error during transcription: {str(e)}")
+
+        # Fallback to legacy Whisper implementation
+        print("Falling back to legacy Whisper implementation...")
+        try:
+            import whisper
+            model = whisper.load_model(os.getenv('WHISPER_MODEL', 'small'))
+            result = model.transcribe(audio_path)
+
+            # Clean up temporary audio file
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+            # Return in expected format
+            return {
+                "segments": result["segments"],
+                "full_transcript": " ".join(
+                    segment["text"].strip() for segment in result["segments"]
+                ),
+            }
+        except Exception as fallback_error:
+            logger.error(f"Fallback transcription also failed: {str(fallback_error)}")
+            print(f"Fallback transcription failed: {str(fallback_error)}")
+            raise RuntimeError("All transcription methods failed") from fallback_error
 
 
 def save_metadata(metadata, output_dir):
