@@ -1571,11 +1571,25 @@ def generate_transcript(input_file):
         print("Initializing transcription service...")
         transcriber = get_transcriber()
         print(f"Using {transcriber.name} for transcription...")
+        print(f"Audio file: {audio_path}")
+
+        # Check if audio file exists
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        file_size = os.path.getsize(audio_path) / (1024 * 1024)  # MB
+        print(f"Audio file size: {file_size:.2f} MB")
 
         # Transcribe using the service
         print("Transcribing audio...")
+        import time
+        start_time = time.time()
         result = transcriber.transcribe(audio_path)
-        print("Transcription done")
+        end_time = time.time()
+
+        processing_time = end_time - start_time
+        print(f"Transcription completed in {processing_time:.2f} seconds")
+        print(f"Generated {len(result)} segments")
 
         # Clean up temporary audio file
         try:
@@ -1583,7 +1597,8 @@ def generate_transcript(input_file):
         except OSError:
             pass  # File might not exist or already removed
 
-        return result
+        # Convert to legacy format for compatibility
+        return {"segments": result}
 
     except Exception as e:
         logger.error(f"Transcription failed: {str(e)}")
@@ -1594,7 +1609,15 @@ def generate_transcript(input_file):
         try:
             import whisper
             model = whisper.load_model(os.getenv('WHISPER_MODEL', 'small'))
-            result = model.transcribe(audio_path)
+
+            # Use configured language or auto-detect
+            transcription_language = os.getenv('TRANSCRIPTION_LANGUAGE', None)
+            if transcription_language:
+                print(f"Fallback: Using configured language: {transcription_language}")
+                result = model.transcribe(audio_path, language=transcription_language)
+            else:
+                print("Fallback: Using automatic language detection")
+                result = model.transcribe(audio_path)
 
             # Clean up temporary audio file
             try:
@@ -2116,66 +2139,126 @@ def generate_subtitle(input_file, video_id, output_dir):
     current_time = datetime.now()
     date_text = current_time.strftime("%d/%m/%Y")
 
-    # Use Whisper to transcribe the final cropped video segment
-    # This ensures subtitles are perfectly synced to the segment timing
+    # Use the configured STT model to transcribe the final cropped video segment
+    # This ensures subtitles are perfectly synced to the segment timing and uses the same model as the main transcription
 
-    def transcribe_with_whisper(video_path):
-        """Transcribe video using Whisper and return SRT content"""
+    def transcribe_with_configured_model(video_path):
+        """Transcribe video using the configured STT model and return SRT content"""
         try:
-            # Try different model sizes based on available memory
-            models_to_try = ["small", "medium", "base"]
+            # Extract audio from video for transcription
+            audio_path = f"tmp/subtitle_audio_{os.path.basename(video_path)}.wav"
+            print(f"Extracting audio for subtitle transcription: {audio_path}")
+            audio_cmd = f"ffmpeg -y -i {video_path} -vn -acodec pcm_s16le -ac 1 -ar 16000 {audio_path}"
+            subprocess.call(audio_cmd, shell=True)
 
-            for model_name in models_to_try:
-                try:
-                    print(f"Loading Whisper {model_name} model...")
-                    model = whisper.load_model(os.getenv('WHISPER_MODEL', model_name))
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                print(f"Failed to extract audio from {video_path}")
+                return None
 
-                    print(f"Transcribing video with {model_name} model...")
-                    result = model.transcribe(video_path, word_timestamps=True)
+            # Use the same transcription service as the main transcript generation
+            from transcription_service import get_transcriber
 
-                    # Generate SRT content
-                    srt_content = ""
-                    for i, segment in enumerate(result["segments"]):
-                        start_time = segment["start"]
-                        end_time = segment["end"]
-                        text = segment["text"].strip()
+            print("Getting configured transcriber for subtitle generation...")
+            transcriber = get_transcriber()
+            print(f"Using {transcriber.name} for subtitle transcription...")
 
-                        # Convert seconds to SRT time format
-                        start_h, start_remainder = divmod(start_time, 3600)
-                        start_m, start_s = divmod(start_remainder, 60)
-                        start_ms = int((start_s - int(start_s)) * 1000)
+            # Transcribe using the configured service
+            result = transcriber.transcribe(audio_path)
 
-                        end_h, end_remainder = divmod(end_time, 3600)
-                        end_m, end_s = divmod(end_remainder, 60)
-                        end_ms = int((end_s - int(end_s)) * 1000)
+            # Clean up temporary audio file
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
-                        srt_content += f"{i+1}\n"
-                        srt_content += f"{int(start_h):02d}:{int(start_m):02d}:{int(start_s):02d},{start_ms:03d} --> {int(end_h):02d}:{int(end_m):02d}:{int(end_s):02d},{end_ms:03d}\n"
-                        srt_content += f"{text}\n\n"
+            # Generate SRT content from transcriber result
+            srt_content = ""
+            for i, segment in enumerate(result):
+                start_time = segment["start"]
+                end_time = segment["end"]
+                text = segment["text"].strip()
 
-                    print(f"Successfully transcribed with {model_name} model")
-                    return srt_content
+                # Convert seconds to SRT time format
+                start_h, start_remainder = divmod(start_time, 3600)
+                start_m, start_s = divmod(start_remainder, 60)
+                start_ms = int((start_s - int(start_s)) * 1000)
 
-                except Exception as e:
-                    print(f"Failed with {model_name} model: {str(e)}")
-                    if "CUDA out of memory" in str(e):
-                        print(
-                            f"GPU memory issue with {model_name}, trying smaller model..."
-                        )
-                        continue
-                    else:
-                        break
+                end_h, end_remainder = divmod(end_time, 3600)
+                end_m, end_s = divmod(end_remainder, 60)
+                end_ms = int((end_s - int(end_s)) * 1000)
 
-            print("All Whisper models failed")
-            return None
+                srt_content += f"{i+1}\n"
+                srt_content += f"{int(start_h):02d}:{int(start_m):02d}:{int(start_s):02d},{start_ms:03d} --> {int(end_h):02d}:{int(end_m):02d}:{int(end_s):02d},{end_ms:03d}\n"
+                srt_content += f"{text}\n\n"
+
+            print(f"Successfully transcribed with {transcriber.name}")
+            return srt_content
 
         except Exception as e:
-            print(f"Error in Whisper transcription: {str(e)}")
-            return None
+            print(f"Error in subtitle transcription with configured model: {str(e)}")
+            print("Falling back to legacy Whisper implementation...")
 
-    # Generate subtitles using Whisper directly
+            # Fallback to legacy Whisper implementation
+            try:
+                import whisper
+                models_to_try = ["small", "medium", "base"]
+
+                for model_name in models_to_try:
+                    try:
+                        print(f"Loading Whisper {model_name} model...")
+                        model = whisper.load_model(os.getenv('WHISPER_MODEL', model_name))
+
+                        print(f"Transcribing video with {model_name} model...")
+
+                        # Use configured language or auto-detect
+                        transcription_language = os.getenv('TRANSCRIPTION_LANGUAGE', None)
+                        if transcription_language:
+                            print(f"Using configured language: {transcription_language}")
+                            result = model.transcribe(video_path, word_timestamps=True, language=transcription_language)
+                        else:
+                            print("Using automatic language detection")
+                            result = model.transcribe(video_path, word_timestamps=True)
+
+                        # Generate SRT content
+                        srt_content = ""
+                        for i, segment in enumerate(result["segments"]):
+                            start_time = segment["start"]
+                            end_time = segment["end"]
+                            text = segment["text"].strip()
+
+                            # Convert seconds to SRT time format
+                            start_h, start_remainder = divmod(start_time, 3600)
+                            start_m, start_s = divmod(start_remainder, 60)
+                            start_ms = int((start_s - int(start_s)) * 1000)
+
+                            end_h, end_remainder = divmod(end_time, 3600)
+                            end_m, end_s = divmod(end_remainder, 60)
+                            end_ms = int((end_s - int(end_s)) * 1000)
+
+                            srt_content += f"{i+1}\n"
+                            srt_content += f"{int(start_h):02d}:{int(start_m):02d}:{int(start_s):02d},{start_ms:03d} --> {int(end_h):02d}:{int(end_m):02d}:{int(end_s):02d},{end_ms:03d}\n"
+                            srt_content += f"{text}\n\n"
+
+                        print(f"Successfully transcribed with fallback {model_name} model")
+                        return srt_content
+
+                    except Exception as fallback_e:
+                        print(f"Failed with {model_name} model: {str(fallback_e)}")
+                        if "CUDA out of memory" in str(fallback_e):
+                            print(f"GPU memory issue with {model_name}, trying smaller model...")
+                            continue
+                        else:
+                            break
+
+                print("All fallback Whisper models failed")
+                return None
+            except Exception as fallback_error:
+                print(f"Error in fallback Whisper transcription: {str(fallback_error)}")
+                return None
+
+    # Generate subtitles using the configured STT model
     print(f"Transcribing video: tmp/{input_file}")
-    srt_content = transcribe_with_whisper(f"tmp/{input_file}")
+    srt_content = transcribe_with_configured_model(f"tmp/{input_file}")
 
     # Create temporary SRT file
     input_base = os.path.basename(input_file).split(".")[0]

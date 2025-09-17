@@ -13,6 +13,8 @@ class WhisperTranscriber(BaseTranscriber):
     def __init__(self):
         self._model = None
         self._model_size = os.getenv('WHISPER_MODEL', 'small')
+        # Language configuration - None means auto-detect, or specify language code (e.g., 'pt', 'en', 'es')
+        self._language = os.getenv('TRANSCRIPTION_LANGUAGE', None)
 
     def transcribe(self, audio_path: str) -> List[Dict[str, Any]]:
         """
@@ -35,7 +37,14 @@ class WhisperTranscriber(BaseTranscriber):
                 self._model = whisper.load_model(self._model_size)
 
             logger.info(f"Transcribing audio: {audio_path}")
-            result = self._model.transcribe(audio_path)
+
+            # Use configured language or auto-detect
+            if self._language:
+                logger.info(f"Using configured language: {self._language}")
+                result = self._model.transcribe(audio_path, language=self._language)
+            else:
+                logger.info("Using automatic language detection")
+                result = self._model.transcribe(audio_path)
 
             # Convert Whisper segments to standard format
             segments = []
