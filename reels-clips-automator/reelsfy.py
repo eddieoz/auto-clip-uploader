@@ -395,7 +395,7 @@ def generate_segments(response):
             end_time += 30 - (end_time - start_time)
 
         output_file = f"{sanitize_filename(title)}{str(i).zfill(3)}.mp4"
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -vf scale='1920:1080' -c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
+        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -vf scale='1920:1080' -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
         subprocess.call(command, shell=True)
 
 
@@ -643,21 +643,10 @@ def generate_short(
                     )
 
                     if len(faces) > 0:
-                        # Initialize trackers and variable to hold face positions
-                        trackers = cv2.legacy.MultiTracker_create()
+                        # Store face positions for this frame
                         face_positions.clear()
-
                         for x, y, w, h in faces:
                             face_positions.append((x, y, w, h))
-                            tracker = cv2.legacy.TrackerKCF_create()
-                            tracker.init(frame, (x, y, w, h))
-                            trackers.add(tracker, frame, (x, y, w, h))
-
-                        # Update trackers and get updated positions
-                        try:
-                            success, boxes = trackers.update(frame)
-                        except Exception as e:
-                            print(f"Error update trackers: {e}")
 
                     # Randomly select tracking and zoom modes for this 5-second interval
                     if random.random() < TRACKING_STATIC_PROBABILITY:
@@ -678,30 +667,35 @@ def generate_short(
                     print(f"Interval {frame_count // switch_interval}: tracking_mode={tracking_mode}, zoom_mode={zoom_mode}, zoom_in={zoom_in_enabled}")
 
                     # Intelligently select best talking face using TalkingFaceDetector
-                    # Convert boxes to list of tuples for detector
-                    face_list = [(int(box[0]), int(box[1]), int(box[2]), int(box[3])) for box in boxes]
+                    # Convert faces to list of tuples for detector
+                    if len(face_positions) > 0:
+                        face_list = list(face_positions)
 
-                    best_face_idx = talking_detector.get_best_talking_face(
-                        frame=frame,
-                        faces=face_list,
-                        previous_frame=prev_frame,
-                        current_face_index=current_face_index if current_face_index < len(face_list) else None
-                    )
-
-                    if best_face_idx is not None:
-                        current_face_index = best_face_idx
-                        x, y, w, h = [int(v) for v in boxes[current_face_index]]
-
-                        # Get scores for logging
-                        scores = talking_detector.get_face_scores()
-                        print(
-                            f"Frame: {frame_count}, Selected Face {current_face_index}/{len(face_positions)} "
-                            f"(talking={scores['movement']:.2f}, quality={scores['quality']:.2f}, combined={scores['combined']:.2f}) "
-                            f"height={h} width={w}"
+                        best_face_idx = talking_detector.get_best_talking_face(
+                            frame=frame,
+                            faces=face_list,
+                            previous_frame=prev_frame,
+                            current_face_index=current_face_index if current_face_index < len(face_list) else None
                         )
+
+                        if best_face_idx is not None:
+                            current_face_index = best_face_idx
+                            x, y, w, h = face_positions[current_face_index]
+
+                            # Get scores for logging
+                            scores = talking_detector.get_face_scores()
+                            print(
+                                f"Frame: {frame_count}, Selected Face {current_face_index}/{len(face_positions)} "
+                                f"(talking={scores['movement']:.2f}, quality={scores['quality']:.2f}, combined={scores['combined']:.2f}) "
+                                f"height={h} width={w}"
+                            )
+                        else:
+                            # No suitable face found, clear face_positions to trigger center crop fallback
+                            print(f"Frame: {frame_count}, No suitable talking face found (all below threshold), using center crop")
+                            face_positions.clear()
                     else:
-                        # No suitable face found, clear face_positions to trigger center crop fallback
-                        print(f"Frame: {frame_count}, No suitable talking face found (all below threshold), using center crop")
+                        # No faces detected, clear positions to use center crop fallback
+                        print(f"Frame: {frame_count}, No faces detected, using center crop fallback")
                         face_positions.clear()
 
                 # Update face positions for frame-by-frame tracking (not in 5-second intervals)
@@ -968,7 +962,7 @@ def generate_short(
         subprocess.call(command, shell=True)
 
         # Merge audio and processed video with better quality
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
+        command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
         subprocess.call(command, shell=True)
 
         # Save performance report if profiling is enabled
@@ -2377,7 +2371,7 @@ def generate_subtitle(input_file, video_id, output_dir):
             f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
             f'-filter_complex "{filter_complex}" '  # Added space
             f'-map "[{last_filter}]" -map 0:a '
-            f'-c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 '
+            f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
             f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
             f'-c:a copy "{output_path}"'  # Added quotes around output path
         )

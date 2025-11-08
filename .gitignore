@@ -107,6 +107,7 @@ test*
 input/*
 input_tmp/
 output/*
+outputs/*
 logs/
 *.log
 reels-clips-automator/utils/RealESRGAN
