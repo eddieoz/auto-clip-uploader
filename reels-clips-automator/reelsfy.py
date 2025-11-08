@@ -19,6 +19,8 @@ import tempfile
 import ffmpeg
 from enhanced_audio_analyzer import EnhancedAudioAnalyzer
 from topic_analyzer import TopicAnalyzer
+from talking_face_detector import TalkingFaceDetector
+from performance_profiler import PerformanceProfiler
 
 # Define workspace directory
 WORKSPACE_DIR = os.getcwd()  # Use current working directory instead of script location
@@ -539,6 +541,8 @@ def generate_short(
     enhance=False,
     thumb=False,
     thumb_dir="",
+    debug_faces=False,
+    performance_profile=False,
 ):
     try:
         # Sanitize input and output file names
@@ -565,6 +569,18 @@ def generate_short(
         # Load pre-trained face detector from OpenCV
         face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+        # Initialize performance profiler if enabled
+        profiler = PerformanceProfiler() if performance_profile else None
+
+        # Initialize talking face detector
+        talking_detector = TalkingFaceDetector(
+            movement_weight=0.6,
+            quality_weight=0.4,
+            min_score_threshold=0.3,
+            hysteresis_threshold=0.2,
+            performance_profiler=profiler
         )
 
         # Open video file
@@ -606,6 +622,9 @@ def generate_short(
         prev_face_center = None
         smoothing_factor = 0.7  # 0.7 = 70% previous position, 30% new position
         movement_threshold = 5  # Ignore movements smaller than 5 pixels
+
+        # Previous frame buffer for talking face detection
+        prev_frame = None
 
         while cap.isOpened():
             # Read frame from video
@@ -658,13 +677,32 @@ def generate_short(
                     
                     print(f"Interval {frame_count // switch_interval}: tracking_mode={tracking_mode}, zoom_mode={zoom_mode}, zoom_in={zoom_in_enabled}")
 
-                    # Switch faces if it's time to do so
-                    current_face_index = (current_face_index + 1) % len(face_positions)
-                    x, y, w, h = [int(v) for v in boxes[current_face_index]]
+                    # Intelligently select best talking face using TalkingFaceDetector
+                    # Convert boxes to list of tuples for detector
+                    face_list = [(int(box[0]), int(box[1]), int(box[2]), int(box[3])) for box in boxes]
 
-                    print(
-                        f"Frame: {frame_count}, Current Face index {current_face_index} height {h} width {w} total faces {len(face_positions)}"
+                    best_face_idx = talking_detector.get_best_talking_face(
+                        frame=frame,
+                        faces=face_list,
+                        previous_frame=prev_frame,
+                        current_face_index=current_face_index if current_face_index < len(face_list) else None
                     )
+
+                    if best_face_idx is not None:
+                        current_face_index = best_face_idx
+                        x, y, w, h = [int(v) for v in boxes[current_face_index]]
+
+                        # Get scores for logging
+                        scores = talking_detector.get_face_scores()
+                        print(
+                            f"Frame: {frame_count}, Selected Face {current_face_index}/{len(face_positions)} "
+                            f"(talking={scores['movement']:.2f}, quality={scores['quality']:.2f}, combined={scores['combined']:.2f}) "
+                            f"height={h} width={w}"
+                        )
+                    else:
+                        # No suitable face found, clear face_positions to trigger center crop fallback
+                        print(f"Frame: {frame_count}, No suitable talking face found (all below threshold), using center crop")
+                        face_positions.clear()
 
                 # Update face positions for frame-by-frame tracking (not in 5-second intervals)
                 elif frame_tracking_enabled and len(face_positions) > 0 and trackers is not None:
@@ -910,6 +948,9 @@ def generate_short(
                     )
                     out.write(resized)
 
+                # Store current frame for next iteration's movement detection
+                prev_frame = frame.copy()
+
                 frame_count += 1
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -929,6 +970,12 @@ def generate_short(
         # Merge audio and processed video with better quality
         command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
         subprocess.call(command, shell=True)
+
+        # Save performance report if profiling is enabled
+        if profiler is not None:
+            report_path = os.path.join(thumb_dir if thumb_dir else ".", "performance_report.json")
+            profiler.save_report(report_path)
+            profiler.print_summary()
 
         if thumb and smile_found:
             generate_thumbnail(smile_frame, title, thumb_dir)
@@ -1660,7 +1707,7 @@ Description:
 
 def direct_process_file(
     input_file,
-    output_dir, upscale=False, enhance=False, thumb=False
+    output_dir, upscale=False, enhance=False, thumb=False, debug_faces=False, performance_profile=False
 ):
     """Process a file directly without viral segment detection"""
     print(f"\n==== Direct File Processing ====")
@@ -1681,7 +1728,7 @@ def direct_process_file(
     # Process the file
     print(f"Generating reel from {filename}...")
     result = generate_short(
-        filename, output_file, video_name, upscale, enhance, thumb, output_dir
+        filename, output_file, video_name, upscale, enhance, thumb, output_dir, debug_faces, performance_profile
     )
 
     if result:
@@ -1744,6 +1791,20 @@ def __main__():
         "--output-dir",
         required=False,
         help="Custom output directory for reels and thumbnails",
+    )
+    parser.add_argument(
+        "--debug-faces",
+        action="store_true",
+        default=False,
+        required=False,
+        help="Enable debug visualization for face detection and scoring",
+    )
+    parser.add_argument(
+        "--performance-profile",
+        action="store_true",
+        default=False,
+        required=False,
+        help="Enable performance profiling and save detailed timing report",
     )
     args = parser.parse_args()
     print(args)
@@ -2079,6 +2140,8 @@ def __main__():
                 args.enhance,
                 args.thumb,
                 output_dir,
+                args.debug_faces,
+                args.performance_profile,
             )
             print(f"Adding subtitles to video for segment {i+1}...")
             final_output_name = sanitize_filename(f"final-{os.path.splitext(output_file)[0]}") + os.path.splitext(output_file)[1]
