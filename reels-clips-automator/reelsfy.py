@@ -19,6 +19,8 @@ import tempfile
 import ffmpeg
 from enhanced_audio_analyzer import EnhancedAudioAnalyzer
 from topic_analyzer import TopicAnalyzer
+from talking_face_detector import TalkingFaceDetector
+from performance_profiler import PerformanceProfiler
 
 # Define workspace directory
 WORKSPACE_DIR = os.getcwd()  # Use current working directory instead of script location
@@ -28,6 +30,25 @@ REELS_BACKGROUNDS_DIR = os.path.join(WORKSPACE_DIR, "workspace", "backgrounds", 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["GGML_CUDA_NO_PINNED"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+# STT Model Configuration
+def get_stt_model_config():
+    """
+    Get STT model configuration from environment variables with validation and fallback.
+
+    Returns:
+        str: Valid STT model name ('whisper' or 'faster-whisper')
+    """
+    stt_model = os.getenv('STT_MODEL', 'whisper').lower().strip()
+    valid_models = ['whisper', 'faster-whisper']
+
+    if stt_model in valid_models:
+        print(f"Using STT model: {stt_model}")
+        return stt_model
+    else:
+        print(f"Warning: Invalid STT_MODEL '{stt_model}'. Valid options are: {', '.join(valid_models)}")
+        print("Falling back to default: whisper")
+        return 'whisper'
 
 scale = 4
 target_face_size = 345
@@ -374,7 +395,7 @@ def generate_segments(response):
             end_time += 30 - (end_time - start_time)
 
         output_file = f"{sanitize_filename(title)}{str(i).zfill(3)}.mp4"
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -vf scale='1920:1080' -c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
+        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -vf scale='1920:1080' -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
         subprocess.call(command, shell=True)
 
 
@@ -520,6 +541,8 @@ def generate_short(
     enhance=False,
     thumb=False,
     thumb_dir="",
+    debug_faces=False,
+    performance_profile=False,
 ):
     try:
         # Sanitize input and output file names
@@ -546,6 +569,18 @@ def generate_short(
         # Load pre-trained face detector from OpenCV
         face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+        # Initialize performance profiler if enabled
+        profiler = PerformanceProfiler() if performance_profile else None
+
+        # Initialize talking face detector
+        talking_detector = TalkingFaceDetector(
+            movement_weight=0.6,
+            quality_weight=0.4,
+            min_score_threshold=0.3,
+            hysteresis_threshold=0.2,
+            performance_profiler=profiler
         )
 
         # Open video file
@@ -588,6 +623,9 @@ def generate_short(
         smoothing_factor = 0.7  # 0.7 = 70% previous position, 30% new position
         movement_threshold = 5  # Ignore movements smaller than 5 pixels
 
+        # Previous frame buffer for talking face detection
+        prev_frame = None
+
         while cap.isOpened():
             # Read frame from video
             ret, frame = cap.read()
@@ -605,21 +643,10 @@ def generate_short(
                     )
 
                     if len(faces) > 0:
-                        # Initialize trackers and variable to hold face positions
-                        trackers = cv2.legacy.MultiTracker_create()
+                        # Store face positions for this frame
                         face_positions.clear()
-
                         for x, y, w, h in faces:
                             face_positions.append((x, y, w, h))
-                            tracker = cv2.legacy.TrackerKCF_create()
-                            tracker.init(frame, (x, y, w, h))
-                            trackers.add(tracker, frame, (x, y, w, h))
-
-                        # Update trackers and get updated positions
-                        try:
-                            success, boxes = trackers.update(frame)
-                        except Exception as e:
-                            print(f"Error update trackers: {e}")
 
                     # Randomly select tracking and zoom modes for this 5-second interval
                     if random.random() < TRACKING_STATIC_PROBABILITY:
@@ -639,13 +666,37 @@ def generate_short(
                     
                     print(f"Interval {frame_count // switch_interval}: tracking_mode={tracking_mode}, zoom_mode={zoom_mode}, zoom_in={zoom_in_enabled}")
 
-                    # Switch faces if it's time to do so
-                    current_face_index = (current_face_index + 1) % len(face_positions)
-                    x, y, w, h = [int(v) for v in boxes[current_face_index]]
+                    # Intelligently select best talking face using TalkingFaceDetector
+                    # Convert faces to list of tuples for detector
+                    if len(face_positions) > 0:
+                        face_list = list(face_positions)
 
-                    print(
-                        f"Frame: {frame_count}, Current Face index {current_face_index} height {h} width {w} total faces {len(face_positions)}"
-                    )
+                        best_face_idx = talking_detector.get_best_talking_face(
+                            frame=frame,
+                            faces=face_list,
+                            previous_frame=prev_frame,
+                            current_face_index=current_face_index if current_face_index < len(face_list) else None
+                        )
+
+                        if best_face_idx is not None:
+                            current_face_index = best_face_idx
+                            x, y, w, h = face_positions[current_face_index]
+
+                            # Get scores for logging
+                            scores = talking_detector.get_face_scores()
+                            print(
+                                f"Frame: {frame_count}, Selected Face {current_face_index}/{len(face_positions)} "
+                                f"(talking={scores['movement']:.2f}, quality={scores['quality']:.2f}, combined={scores['combined']:.2f}) "
+                                f"height={h} width={w}"
+                            )
+                        else:
+                            # No suitable face found, clear face_positions to trigger center crop fallback
+                            print(f"Frame: {frame_count}, No suitable talking face found (all below threshold), using center crop")
+                            face_positions.clear()
+                    else:
+                        # No faces detected, clear positions to use center crop fallback
+                        print(f"Frame: {frame_count}, No faces detected, using center crop fallback")
+                        face_positions.clear()
 
                 # Update face positions for frame-by-frame tracking (not in 5-second intervals)
                 elif frame_tracking_enabled and len(face_positions) > 0 and trackers is not None:
@@ -891,6 +942,9 @@ def generate_short(
                     )
                     out.write(resized)
 
+                # Store current frame for next iteration's movement detection
+                prev_frame = frame.copy()
+
                 frame_count += 1
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -908,8 +962,14 @@ def generate_short(
         subprocess.call(command, shell=True)
 
         # Merge audio and processed video with better quality
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
+        command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
         subprocess.call(command, shell=True)
+
+        # Save performance report if profiling is enabled
+        if profiler is not None:
+            report_path = os.path.join(thumb_dir if thumb_dir else ".", "performance_report.json")
+            profiler.save_report(report_path)
+            profiler.print_summary()
 
         if thumb and smile_found:
             generate_thumbnail(smile_frame, title, thumb_dir)
@@ -1527,8 +1587,17 @@ def parse_srt(srt_content):
 
 
 def generate_transcript(input_file):
+    """
+    Generate transcript using the new transcription service.
+    Supports both Whisper and Faster Whisper with automatic fallback.
+    """
+    import logging
+    from transcription_service import get_transcriber
+
+    logger = logging.getLogger(__name__)
+
     # Extract audio for transcription
-    temp_dir = tempfile.gettempdir()
+    temp_dir = "tmp/"
     audio_path = os.path.join(
         temp_dir, f"{os.path.basename(input_file).split('.')[0]}.wav"
     )
@@ -1538,21 +1607,76 @@ def generate_transcript(input_file):
     audio_cmd = f"ffmpeg -y -i tmp/{input_file} -vn -acodec pcm_s16le -ac 1 -ar 16000 {audio_path}"
     subprocess.call(audio_cmd, shell=True)
 
-    # Load Whisper model and transcribe
-    print("Loading Whisper model...")
-    # model = whisper.load_model("medium")
-    model = whisper.load_model(os.getenv('WHISPER_MODEL', 'small'))
-    print("Transcribing audio...")
-    result = model.transcribe(audio_path)
-    print("Transcription done")
+    try:
+        # Get transcriber through the service factory
+        print("Initializing transcription service...")
+        transcriber = get_transcriber()
+        print(f"Using {transcriber.name} for transcription...")
+        print(f"Audio file: {audio_path}")
 
-    # Return both the segments and the full transcript
-    return {
-        "segments": result["segments"],
-        "full_transcript": " ".join(
-            segment["text"].strip() for segment in result["segments"]
-        ),
-    }
+        # Check if audio file exists
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        file_size = os.path.getsize(audio_path) / (1024 * 1024)  # MB
+        print(f"Audio file size: {file_size:.2f} MB")
+
+        # Transcribe using the service
+        print("Transcribing audio...")
+        import time
+        start_time = time.time()
+        result = transcriber.transcribe(audio_path)
+        end_time = time.time()
+
+        processing_time = end_time - start_time
+        print(f"Transcription completed in {processing_time:.2f} seconds")
+        print(f"Generated {len(result)} segments")
+
+        # Clean up temporary audio file
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass  # File might not exist or already removed
+
+        # Convert to legacy format for compatibility
+        return {"segments": result}
+
+    except Exception as e:
+        logger.error(f"Transcription failed: {str(e)}")
+        print(f"Error during transcription: {str(e)}")
+
+        # Fallback to legacy Whisper implementation
+        print("Falling back to legacy Whisper implementation...")
+        try:
+            import whisper
+            model = whisper.load_model(os.getenv('WHISPER_MODEL', 'small'))
+
+            # Use configured language or auto-detect
+            transcription_language = os.getenv('TRANSCRIPTION_LANGUAGE', None)
+            if transcription_language:
+                print(f"Fallback: Using configured language: {transcription_language}")
+                result = model.transcribe(audio_path, language=transcription_language)
+            else:
+                print("Fallback: Using automatic language detection")
+                result = model.transcribe(audio_path)
+
+            # Clean up temporary audio file
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+            # Return in expected format
+            return {
+                "segments": result["segments"],
+                "full_transcript": " ".join(
+                    segment["text"].strip() for segment in result["segments"]
+                ),
+            }
+        except Exception as fallback_error:
+            logger.error(f"Fallback transcription also failed: {str(fallback_error)}")
+            print(f"Fallback transcription failed: {str(fallback_error)}")
+            raise RuntimeError("All transcription methods failed") from fallback_error
 
 
 def save_metadata(metadata, output_dir):
@@ -1577,7 +1701,7 @@ Description:
 
 def direct_process_file(
     input_file,
-    output_dir, upscale=False, enhance=False, thumb=False
+    output_dir, upscale=False, enhance=False, thumb=False, debug_faces=False, performance_profile=False
 ):
     """Process a file directly without viral segment detection"""
     print(f"\n==== Direct File Processing ====")
@@ -1598,7 +1722,7 @@ def direct_process_file(
     # Process the file
     print(f"Generating reel from {filename}...")
     result = generate_short(
-        filename, output_file, video_name, upscale, enhance, thumb, output_dir
+        filename, output_file, video_name, upscale, enhance, thumb, output_dir, debug_faces, performance_profile
     )
 
     if result:
@@ -1661,6 +1785,20 @@ def __main__():
         "--output-dir",
         required=False,
         help="Custom output directory for reels and thumbnails",
+    )
+    parser.add_argument(
+        "--debug-faces",
+        action="store_true",
+        default=False,
+        required=False,
+        help="Enable debug visualization for face detection and scoring",
+    )
+    parser.add_argument(
+        "--performance-profile",
+        action="store_true",
+        default=False,
+        required=False,
+        help="Enable performance profiling and save detailed timing report",
     )
     args = parser.parse_args()
     print(args)
@@ -1996,6 +2134,8 @@ def __main__():
                 args.enhance,
                 args.thumb,
                 output_dir,
+                args.debug_faces,
+                args.performance_profile,
             )
             print(f"Adding subtitles to video for segment {i+1}...")
             final_output_name = sanitize_filename(f"final-{os.path.splitext(output_file)[0]}") + os.path.splitext(output_file)[1]
@@ -2056,66 +2196,126 @@ def generate_subtitle(input_file, video_id, output_dir):
     current_time = datetime.now()
     date_text = current_time.strftime("%d/%m/%Y")
 
-    # Use Whisper to transcribe the final cropped video segment
-    # This ensures subtitles are perfectly synced to the segment timing
+    # Use the configured STT model to transcribe the final cropped video segment
+    # This ensures subtitles are perfectly synced to the segment timing and uses the same model as the main transcription
 
-    def transcribe_with_whisper(video_path):
-        """Transcribe video using Whisper and return SRT content"""
+    def transcribe_with_configured_model(video_path):
+        """Transcribe video using the configured STT model and return SRT content"""
         try:
-            # Try different model sizes based on available memory
-            models_to_try = ["small", "medium", "base"]
+            # Extract audio from video for transcription
+            audio_path = f"tmp/subtitle_audio_{os.path.basename(video_path)}.wav"
+            print(f"Extracting audio for subtitle transcription: {audio_path}")
+            audio_cmd = f"ffmpeg -y -i {video_path} -vn -acodec pcm_s16le -ac 1 -ar 16000 {audio_path}"
+            subprocess.call(audio_cmd, shell=True)
 
-            for model_name in models_to_try:
-                try:
-                    print(f"Loading Whisper {model_name} model...")
-                    model = whisper.load_model(os.getenv('WHISPER_MODEL', model_name))
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                print(f"Failed to extract audio from {video_path}")
+                return None
 
-                    print(f"Transcribing video with {model_name} model...")
-                    result = model.transcribe(video_path, word_timestamps=True)
+            # Use the same transcription service as the main transcript generation
+            from transcription_service import get_transcriber
 
-                    # Generate SRT content
-                    srt_content = ""
-                    for i, segment in enumerate(result["segments"]):
-                        start_time = segment["start"]
-                        end_time = segment["end"]
-                        text = segment["text"].strip()
+            print("Getting configured transcriber for subtitle generation...")
+            transcriber = get_transcriber()
+            print(f"Using {transcriber.name} for subtitle transcription...")
 
-                        # Convert seconds to SRT time format
-                        start_h, start_remainder = divmod(start_time, 3600)
-                        start_m, start_s = divmod(start_remainder, 60)
-                        start_ms = int((start_s - int(start_s)) * 1000)
+            # Transcribe using the configured service
+            result = transcriber.transcribe(audio_path)
 
-                        end_h, end_remainder = divmod(end_time, 3600)
-                        end_m, end_s = divmod(end_remainder, 60)
-                        end_ms = int((end_s - int(end_s)) * 1000)
+            # Clean up temporary audio file
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
-                        srt_content += f"{i+1}\n"
-                        srt_content += f"{int(start_h):02d}:{int(start_m):02d}:{int(start_s):02d},{start_ms:03d} --> {int(end_h):02d}:{int(end_m):02d}:{int(end_s):02d},{end_ms:03d}\n"
-                        srt_content += f"{text}\n\n"
+            # Generate SRT content from transcriber result
+            srt_content = ""
+            for i, segment in enumerate(result):
+                start_time = segment["start"]
+                end_time = segment["end"]
+                text = segment["text"].strip()
 
-                    print(f"Successfully transcribed with {model_name} model")
-                    return srt_content
+                # Convert seconds to SRT time format
+                start_h, start_remainder = divmod(start_time, 3600)
+                start_m, start_s = divmod(start_remainder, 60)
+                start_ms = int((start_s - int(start_s)) * 1000)
 
-                except Exception as e:
-                    print(f"Failed with {model_name} model: {str(e)}")
-                    if "CUDA out of memory" in str(e):
-                        print(
-                            f"GPU memory issue with {model_name}, trying smaller model..."
-                        )
-                        continue
-                    else:
-                        break
+                end_h, end_remainder = divmod(end_time, 3600)
+                end_m, end_s = divmod(end_remainder, 60)
+                end_ms = int((end_s - int(end_s)) * 1000)
 
-            print("All Whisper models failed")
-            return None
+                srt_content += f"{i+1}\n"
+                srt_content += f"{int(start_h):02d}:{int(start_m):02d}:{int(start_s):02d},{start_ms:03d} --> {int(end_h):02d}:{int(end_m):02d}:{int(end_s):02d},{end_ms:03d}\n"
+                srt_content += f"{text}\n\n"
+
+            print(f"Successfully transcribed with {transcriber.name}")
+            return srt_content
 
         except Exception as e:
-            print(f"Error in Whisper transcription: {str(e)}")
-            return None
+            print(f"Error in subtitle transcription with configured model: {str(e)}")
+            print("Falling back to legacy Whisper implementation...")
 
-    # Generate subtitles using Whisper directly
+            # Fallback to legacy Whisper implementation
+            try:
+                import whisper
+                models_to_try = ["small", "medium", "base"]
+
+                for model_name in models_to_try:
+                    try:
+                        print(f"Loading Whisper {model_name} model...")
+                        model = whisper.load_model(os.getenv('WHISPER_MODEL', model_name))
+
+                        print(f"Transcribing video with {model_name} model...")
+
+                        # Use configured language or auto-detect
+                        transcription_language = os.getenv('TRANSCRIPTION_LANGUAGE', None)
+                        if transcription_language:
+                            print(f"Using configured language: {transcription_language}")
+                            result = model.transcribe(video_path, word_timestamps=True, language=transcription_language)
+                        else:
+                            print("Using automatic language detection")
+                            result = model.transcribe(video_path, word_timestamps=True)
+
+                        # Generate SRT content
+                        srt_content = ""
+                        for i, segment in enumerate(result["segments"]):
+                            start_time = segment["start"]
+                            end_time = segment["end"]
+                            text = segment["text"].strip()
+
+                            # Convert seconds to SRT time format
+                            start_h, start_remainder = divmod(start_time, 3600)
+                            start_m, start_s = divmod(start_remainder, 60)
+                            start_ms = int((start_s - int(start_s)) * 1000)
+
+                            end_h, end_remainder = divmod(end_time, 3600)
+                            end_m, end_s = divmod(end_remainder, 60)
+                            end_ms = int((end_s - int(end_s)) * 1000)
+
+                            srt_content += f"{i+1}\n"
+                            srt_content += f"{int(start_h):02d}:{int(start_m):02d}:{int(start_s):02d},{start_ms:03d} --> {int(end_h):02d}:{int(end_m):02d}:{int(end_s):02d},{end_ms:03d}\n"
+                            srt_content += f"{text}\n\n"
+
+                        print(f"Successfully transcribed with fallback {model_name} model")
+                        return srt_content
+
+                    except Exception as fallback_e:
+                        print(f"Failed with {model_name} model: {str(fallback_e)}")
+                        if "CUDA out of memory" in str(fallback_e):
+                            print(f"GPU memory issue with {model_name}, trying smaller model...")
+                            continue
+                        else:
+                            break
+
+                print("All fallback Whisper models failed")
+                return None
+            except Exception as fallback_error:
+                print(f"Error in fallback Whisper transcription: {str(fallback_error)}")
+                return None
+
+    # Generate subtitles using the configured STT model
     print(f"Transcribing video: tmp/{input_file}")
-    srt_content = transcribe_with_whisper(f"tmp/{input_file}")
+    srt_content = transcribe_with_configured_model(f"tmp/{input_file}")
 
     # Create temporary SRT file
     input_base = os.path.basename(input_file).split(".")[0]
@@ -2171,7 +2371,7 @@ def generate_subtitle(input_file, video_id, output_dir):
             f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
             f'-filter_complex "{filter_complex}" '  # Added space
             f'-map "[{last_filter}]" -map 0:a '
-            f'-c:v h264_nvenc -preset slow -profile:v high -rc:v vbr_hq -qp 18 '
+            f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
             f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
             f'-c:a copy "{output_path}"'  # Added quotes around output path
         )

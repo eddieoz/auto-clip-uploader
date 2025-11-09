@@ -107,6 +107,7 @@ test*
 input/*
 input_tmp/
 output/*
+outputs/*
 logs/
 *.log
 reels-clips-automator/utils/RealESRGAN
@@ -115,3 +116,5 @@ core
 reels-clips-automator/utils/RealESRGAN
 start.sh 
 clean.sh
+reels-clips-automator/performance_test_report.json
+tmp/e2e_validation_report.json
