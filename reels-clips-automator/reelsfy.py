@@ -574,12 +574,18 @@ def generate_short(
         # Initialize performance profiler if enabled
         profiler = PerformanceProfiler() if performance_profile else None
 
-        # Initialize talking face detector
+        # Initialize talking face detector with updated parameters
+        # FIX: Increased movement weight (0.7) and added min_movement_threshold (0.15)
+        # to prevent selection of static faces like YouTube thumbnails
         talking_detector = TalkingFaceDetector(
-            movement_weight=0.6,
-            quality_weight=0.4,
+            movement_weight=0.7,
+            quality_weight=0.3,
             min_score_threshold=0.3,
             hysteresis_threshold=0.2,
+            min_movement_threshold=0.09,
+            static_penalty_threshold=0.1,
+            static_frame_count=30,
+            verbose=True,  # Set to True for debugging face selection
             performance_profiler=profiler
         )
 
@@ -671,12 +677,38 @@ def generate_short(
                     if len(face_positions) > 0:
                         face_list = list(face_positions)
 
-                        best_face_idx = talking_detector.get_best_talking_face(
-                            frame=frame,
-                            faces=face_list,
-                            previous_frame=prev_frame,
-                            current_face_index=current_face_index if current_face_index < len(face_list) else None
-                        )
+                        # FIX: Use look-ahead window for better face selection
+                        # Read next N frames to determine which face is actually talking
+                        # This prevents static faces (thumbnails) from being selected
+                        lookahead_frames = []
+                        saved_position = cap.get(cv2.CAP_PROP_POS_FRAMES)
+
+                        # Read ahead up to static_frame_count frames
+                        for _ in range(talking_detector.static_frame_count):
+                            ret_ahead, frame_ahead = cap.read()
+                            if ret_ahead:
+                                lookahead_frames.append(frame_ahead)
+                            else:
+                                break
+
+                        # Restore video position
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, saved_position)
+
+                        # Use look-ahead if we got enough frames, otherwise fall back to single-frame
+                        if len(lookahead_frames) >= 2:
+                            best_face_idx = talking_detector.get_best_talking_face_with_lookahead(
+                                frames=lookahead_frames,
+                                faces=face_list,
+                                current_face_index=current_face_index if current_face_index < len(face_list) else None
+                            )
+                        else:
+                            # Fallback to single-frame evaluation (end of video or read error)
+                            best_face_idx = talking_detector.get_best_talking_face(
+                                frame=frame,
+                                faces=face_list,
+                                previous_frame=prev_frame,
+                                current_face_index=current_face_index if current_face_index < len(face_list) else None
+                            )
 
                         if best_face_idx is not None:
                             current_face_index = best_face_idx
@@ -847,9 +879,11 @@ def generate_short(
                     if zoom_in_enabled:
                         interval_frame = frame_count % switch_interval
                         zoom_progress = interval_frame / switch_interval if switch_interval > 0 else 0
-                        print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}, zoom_in_progress={zoom_progress:.2f}")
+                        if debug_faces:
+                            print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}, zoom_in_progress={zoom_progress:.2f}")
                     else:
-                        print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}")
+                        if debug_faces:
+                            print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}")
 
                 # Calculate the top-left corner of the 9:16 rectangle (only if we have face positions)
                 if len(face_positions) > 0:
@@ -877,7 +911,8 @@ def generate_short(
                                         crop_img, outscale=scale
                                     )
                                 else:
-                                    print("⚠️  Upscaling requested but upsampler not available, skipping...")
+                                    if debug_faces:
+                                        print("⚠️  Upscaling requested but upsampler not available, skipping...")
                             if enhance:
                                 # Enhanced face
                                 active_face_enhancer = initialize_face_enhancer()
@@ -889,7 +924,8 @@ def generate_short(
                                         paste_back=True,
                                     )
                                 else:
-                                    print("⚠️  Face enhancement requested but enhancer not available, skipping...")
+                                    if debug_faces:
+                                        print("⚠️  Face enhancement requested but enhancer not available, skipping...")
 
                     # Ensure proper aspect ratio preservation during resize
                     crop_h, crop_w = crop_img.shape[:2]
@@ -903,19 +939,22 @@ def generate_short(
                         )
                     else:
                         # Aspect ratios don't match, need to pad or crop to prevent stretching
-                        print(f"🔧 Aspect ratio correction: crop={crop_aspect_ratio:.3f} -> target={target_aspect_ratio:.3f}")
+                        if debug_faces:
+                            print(f"🔧 Aspect ratio correction: crop={crop_aspect_ratio:.3f} -> target={target_aspect_ratio:.3f}")
                         if crop_aspect_ratio > target_aspect_ratio:
                             # Crop is wider than 9:16, crop width to match
                             new_width = int(crop_h * target_aspect_ratio)
                             x_offset = (crop_w - new_width) // 2
                             crop_img = crop_img[:, x_offset:x_offset + new_width]
-                            print(f"   Cropped width: {crop_w} -> {new_width}")
+                            if debug_faces:
+                                print(f"   Cropped width: {crop_w} -> {new_width}")
                         else:
                             # Crop is taller than 9:16, crop height to match  
                             new_height = int(crop_w / target_aspect_ratio)
                             y_offset = (crop_h - new_height) // 2
                             crop_img = crop_img[y_offset:y_offset + new_height, :]
-                            print(f"   Cropped height: {crop_h} -> {new_height}")
+                            if debug_faces:
+                                print(f"   Cropped height: {crop_h} -> {new_height}")
                         
                         # Now resize the properly cropped image
                         resized = cv2.resize(
