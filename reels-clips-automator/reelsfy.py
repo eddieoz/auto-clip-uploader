@@ -584,7 +584,7 @@ def generate_short(
             hysteresis_threshold=0.2,
             min_movement_threshold=0.09,
             static_penalty_threshold=0.1,
-            static_frame_count=30,
+            static_frame_count=20,
             verbose=True,  # Set to True for debugging face selection
             performance_profiler=profiler
         )
@@ -722,9 +722,17 @@ def generate_short(
                                 f"height={h} width={w}"
                             )
                         else:
-                            # No suitable face found, clear face_positions to trigger center crop fallback
-                            print(f"Frame: {frame_count}, No suitable talking face found (all below threshold), using center crop")
-                            face_positions.clear()
+                            # FIX: No suitable face found in look-ahead window
+                            # This could be temporary silence - keep previous face if we have one
+                            if current_face_index is not None and current_face_index < len(face_positions):
+                                # Keep tracking the previous face during temporary silence
+                                print(f"Frame: {frame_count}, No talking face in look-ahead window (temporary silence), "
+                                      f"keeping previous face {current_face_index}")
+                                # Don't clear face_positions - continue tracking current face
+                            else:
+                                # No previous face to fall back to - use center crop
+                                print(f"Frame: {frame_count}, No suitable talking face found (all below threshold), using center crop")
+                                face_positions.clear()
                     else:
                         # No faces detected, clear positions to use center crop fallback
                         print(f"Frame: {frame_count}, No faces detected, using center crop fallback")
