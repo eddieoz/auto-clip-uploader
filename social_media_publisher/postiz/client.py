@@ -517,7 +517,7 @@ class PostizClient:
             # Twitter/X has minimal requirements
             return {
                 **base_settings,
-                # Twitter typically only needs basic settings
+                "who_can_reply_post": "everyone",  # Required by Postiz
             }
         elif platform == "bsky":
             # Bluesky minimal settings
@@ -536,7 +536,8 @@ class PostizClient:
     
     def create_post(self, file_info: Dict[str, str], content, channel_ids: List[str], 
                    posting_type: str = "now", scheduled_datetime: Optional[str] = None, 
-                   metadata=None, platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
+                   metadata=None, platform_mapping: Optional[Dict[str, str]] = None,
+                   schedule_mapping: Optional[Dict[str, dict]] = None) -> Dict[str, any]:
         """
         Create multi-platform post with uploaded video (mock-aware)
         
@@ -547,6 +548,7 @@ class PostizClient:
             posting_type: "now" for immediate posting or "date" for scheduled posting
             scheduled_datetime: ISO datetime string for scheduled posts
             platform_mapping: Optional dict mapping channel_id -> platform_name for platform-specific settings
+            schedule_mapping: Optional dict mapping channel_id -> {type, date, platform} for per-channel scheduling
             
         Returns:
             Dict with post creation results including URLs and IDs
@@ -557,7 +559,7 @@ class PostizClient:
         if self.mock_mode:
             return self._mock_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime)
         
-        return self._real_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping)
+        return self._real_create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping, schedule_mapping)
     
     def _mock_create_post(self, file_info: Dict[str, str], content, channel_ids: List[str], 
                          posting_type: str, scheduled_datetime: Optional[str]) -> Dict[str, any]:
@@ -589,10 +591,13 @@ class PostizClient:
         }
     
     def _real_create_post(self, file_info: Dict[str, str], content, channel_ids: List[str], 
-                         posting_type: str, scheduled_datetime: Optional[str], metadata=None, 
-                         platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
+                          posting_type: str, scheduled_datetime: Optional[str], metadata=None, 
+                          platform_mapping: Optional[Dict[str, str]] = None,
+                          schedule_mapping: Optional[Dict[str, dict]] = None) -> Dict[str, any]:
         """Real post creation implementation"""
-        if posting_type == "now":
+        if schedule_mapping:
+            print(f"Creating multi-platform post with unified batch for {len(channel_ids)} channels")
+        elif posting_type == "now":
             print(f"Creating immediate multi-platform post for {len(channel_ids)} channels")
         else:
             print(f"Scheduling multi-platform post for {len(channel_ids)} channels at {scheduled_datetime}")
@@ -679,6 +684,23 @@ class PostizClient:
                 "settings": settings
             }
             
+            # === PER-CHANNEL SCHEDULING LOGIC ===
+            if schedule_mapping and channel_id in schedule_mapping:
+                schedule = schedule_mapping[channel_id]
+                chan_type = schedule.get("type", "now")
+                chan_date = schedule.get("date")
+                
+                # Unify everything to "schedule" type for batch compatibility
+                # Treat "now" as "schedule" at current time
+                post_data["type"] = "schedule"
+                
+                if chan_type == "date" and chan_date:
+                    post_data["date"] = chan_date
+                else:
+                     # For "now", use current time
+                     from datetime import datetime
+                     post_data["date"] = datetime.now().isoformat()
+            
             # Debug: Log the request payload for Bluesky 
             if platform == "bsky":
                 print(f"🦋 Bluesky API payload (CLEAN):")
@@ -704,25 +726,44 @@ class PostizClient:
                 
             posts.append(post_data)
         
-        # Fix posting type - API expects "schedule" not "date"
-        api_posting_type = "schedule" if posting_type == "date" else posting_type
+        # Determine top-level posting type
+        # If we have mixed schedules, we should probably default to "schedule" 
+        # but rely on per-post overrides.
+        final_posting_type = api_posting_type = "schedule" if posting_type == "date" else posting_type
         
+        # If using schedule_mapping, we default top-level to "schedule" (safe bet for batch)
+        if schedule_mapping:
+             final_posting_type = "schedule"
+             
         # Debug: Log the posting type transformation
         print(f"🕒 Posting type transformation:")
         print(f"   Input posting_type: '{posting_type}'")
-        print(f"   Final api_posting_type: '{api_posting_type}'")
+        print(f"   Final api_posting_type: '{final_posting_type}'")
         
         # Build payload with standard required fields
         payload = {
-            "type": api_posting_type,
+            "type": final_posting_type,
             "shortLink": False,
             "tags": [],
             "posts": posts
         }
         
         # Add date field - required by Postiz API for all posts
-        if posting_type == "date" and scheduled_datetime:
-            payload["date"] = scheduled_datetime
+        # If we use schedule_mapping, we still provide a fallback date at top level
+        # usually required by validation logic
+        if (posting_type == "date" and scheduled_datetime) or schedule_mapping:
+            # Use provided scheduled time or current time for fallback
+            # If schedule_mapping is used, we use the date of the first scheduled item or now
+            if scheduled_datetime:
+                payload["date"] = scheduled_datetime
+            elif schedule_mapping:
+                # Find first scheduled date
+                first_date = next((s.get("date") for s in schedule_mapping.values() if s.get("type") == "date"), None)
+                if first_date:
+                    payload["date"] = first_date
+                else:
+                    from datetime import datetime
+                    payload["date"] = datetime.now().isoformat()
         else:
             # For immediate posts, use current datetime
             from datetime import datetime
@@ -771,7 +812,8 @@ class PostizClient:
     
     def create_post_with_fallback(self, file_info: Dict[str, str], content, channel_ids: List[str],
                                  posting_type: str = "now", scheduled_datetime: Optional[str] = None, 
-                                 metadata=None, platform_mapping: Optional[Dict[str, str]] = None) -> Dict[str, any]:
+                                 metadata=None, platform_mapping: Optional[Dict[str, str]] = None,
+                                 schedule_mapping: Optional[Dict[str, dict]] = None) -> Dict[str, any]:
         """
         Create multi-platform post with individual platform fallback handling
         
@@ -782,6 +824,7 @@ class PostizClient:
             posting_type: "now" for immediate posting or "date" for scheduled posting
             scheduled_datetime: ISO datetime string for scheduled posts
             platform_mapping: Optional dict mapping channel_id -> platform_name for platform-specific settings
+            schedule_mapping: Optional dict mapping channel_id -> {type, date, platform} for per-channel scheduling
             
         Returns:
             Dict with results including successful and failed platforms
@@ -791,7 +834,7 @@ class PostizClient:
         
         # Try bulk creation first
         try:
-            result = self.create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping)
+            result = self.create_post(file_info, content, channel_ids, posting_type, scheduled_datetime, metadata, platform_mapping, schedule_mapping)
             return {
                 "success": True,
                 "bulk_creation": True,
@@ -805,6 +848,11 @@ class PostizClient:
         except PostizAPIError as e:
             print(f"⚠️  Bulk post creation failed: {e}")
             print("🔄 Attempting individual platform posting...")
+            
+            # Add delay before starting fallback to recover from potential rate limit hits 
+            # or simply to respect the interval after the failed bulk request
+            import time
+            time.sleep(2)
         
         # Fallback: Try each platform individually with rate limiting
         import time
@@ -815,7 +863,7 @@ class PostizClient:
                     print(f"⏳ Waiting 2 seconds before next platform...")
                     time.sleep(2)
                 
-                single_result = self.create_post(file_info, content, [channel_id], posting_type, scheduled_datetime, metadata, platform_mapping)
+                single_result = self.create_post(file_info, content, [channel_id], posting_type, scheduled_datetime, metadata, platform_mapping, schedule_mapping)
                 successful_posts.append({
                     "channel_id": channel_id,
                     "result": single_result

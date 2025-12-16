@@ -36,36 +36,51 @@ class TalkingFaceDetector:
     - Minimum score threshold filtering
 
     Attributes:
-        movement_weight: Weight for movement score (default: 0.6)
-        quality_weight: Weight for quality score (default: 0.4)
+        movement_weight: Weight for movement score (default: 0.7)
+        quality_weight: Weight for quality score (default: 0.3)
         min_score_threshold: Minimum combined score to accept face (default: 0.3)
         hysteresis_threshold: Score improvement needed to switch faces (default: 0.2)
+        min_movement_threshold: Minimum movement required to consider face (default: 0.15)
+        static_penalty_threshold: Movement below this triggers static penalty (default: 0.1)
+        static_frame_count: Frames of static movement before penalty (default: 10)
         cache_ttl: Cache time-to-live in seconds (default: 1.0)
     """
 
     def __init__(self,
-                 movement_weight=0.6,
-                 quality_weight=0.4,
+                 movement_weight=0.7,
+                 quality_weight=0.3,
                  min_score_threshold=0.3,
                  hysteresis_threshold=0.2,
+                 min_movement_threshold=0.15,
+                 static_penalty_threshold=0.1,
+                 static_frame_count=10,
                  cache_ttl=1.0,
+                 verbose=False,
                  performance_profiler=None):
         """
         Initialize the TalkingFaceDetector.
 
         Args:
-            movement_weight: Weight for mouth movement score (default: 0.6)
-            quality_weight: Weight for face quality score (default: 0.4)
+            movement_weight: Weight for mouth movement score (default: 0.7)
+            quality_weight: Weight for face quality score (default: 0.3)
             min_score_threshold: Minimum score to accept a face (default: 0.3)
             hysteresis_threshold: Score improvement needed to switch (default: 0.2)
+            min_movement_threshold: Minimum movement to consider face (default: 0.15)
+            static_penalty_threshold: Movement below this triggers penalty (default: 0.1)
+            static_frame_count: Frames of static movement before penalty (default: 10)
             cache_ttl: Cache validity duration in seconds (default: 1.0)
+            verbose: Enable debug logging (default: False)
             performance_profiler: Optional performance profiler for metrics
         """
         self.movement_weight = movement_weight
         self.quality_weight = quality_weight
         self.min_score_threshold = min_score_threshold
         self.hysteresis_threshold = hysteresis_threshold
+        self.min_movement_threshold = min_movement_threshold
+        self.static_penalty_threshold = static_penalty_threshold
+        self.static_frame_count = static_frame_count
         self.cache_ttl = cache_ttl
+        self.verbose = verbose
         self.profiler = performance_profiler
 
         # Validate weights sum to 1.0
@@ -82,12 +97,18 @@ class TalkingFaceDetector:
         # Face history (last 30 evaluations)
         self.face_history = deque(maxlen=30)
 
+        # Static face tracking: face_index -> consecutive static frame count
+        self.static_face_counters = {}
+
         # Cache for face evaluations
         self.cache = {}
         self.cache_timestamps = {}
 
         # Store last evaluation scores for debugging
         self.last_scores = {}
+
+        # Store last rejection reasons for debugging
+        self.last_rejection_reason = {}
 
     def get_best_talking_face(self, frame, faces, previous_frame=None, current_face_index=None):
         """
@@ -151,6 +172,36 @@ class TalkingFaceDetector:
                             quality_score * self.quality_weight
                         )
 
+                    # FIX: Apply minimum movement threshold to reject static faces
+                    # This prevents high-quality static images (thumbnails, posters) from being selected
+                    # NOTE: Only applies when we have previous_frame (can evaluate movement)
+                    # For frame 0 scenarios, use get_best_talking_face_with_lookahead() instead
+                    rejection_reason = None
+                    if previous_frame is not None and movement_score < self.min_movement_threshold:
+                        rejection_reason = f"movement too low ({movement_score:.3f} < {self.min_movement_threshold})"
+                        combined_score = 0.0  # Force rejection
+
+                    # FIX: Apply static face penalty for consistently static faces
+                    # Track consecutive frames with very low movement
+                    if previous_frame is not None:
+                        if movement_score < self.static_penalty_threshold:
+                            # Increment static counter for this face
+                            self.static_face_counters[i] = self.static_face_counters.get(i, 0) + 1
+
+                            # Apply penalty if face has been static for too many frames
+                            if self.static_face_counters[i] >= self.static_frame_count:
+                                penalty_multiplier = 0.5
+                                combined_score *= penalty_multiplier
+                                if rejection_reason is None:
+                                    rejection_reason = f"consistently static for {self.static_face_counters[i]} frames (penalty applied)"
+                        else:
+                            # Reset counter if face shows movement
+                            self.static_face_counters[i] = 0
+
+                    # Store rejection reason for debugging
+                    if rejection_reason:
+                        self.last_rejection_reason[i] = rejection_reason
+
                     # Cache the result
                     self._cache_score(cache_key, (combined_score, movement_score, quality_score))
 
@@ -166,10 +217,24 @@ class TalkingFaceDetector:
                 print(f"Warning: Error evaluating face {i}: {str(e)}")
                 continue
 
+        # Debug logging: Show evaluation results for all faces
+        if self.verbose and len(face_scores) > 0:
+            print(f"\n[TalkingFaceDetector] Evaluated {len(face_scores)} faces:")
+            for face in face_scores:
+                idx = face['index']
+                rejection = self.last_rejection_reason.get(idx, "")
+                status = f"REJECTED ({rejection})" if rejection else "OK"
+                print(f"  Face {idx}: combined={face['combined']:.3f} "
+                      f"(movement={face['movement']:.3f}, quality={face['quality']:.3f}) - {status}")
+
         # Filter faces below threshold
         suitable_faces = [f for f in face_scores if f['combined'] >= self.min_score_threshold]
 
         if not suitable_faces:
+            if self.verbose:
+                rejected_count = len([f for f in face_scores if f['combined'] < self.min_score_threshold])
+                print(f"[TalkingFaceDetector] No suitable faces found. "
+                      f"{rejected_count} face(s) below threshold {self.min_score_threshold}")
             return None
 
         # Sort by combined score (descending)
@@ -191,7 +256,22 @@ class TalkingFaceDetector:
 
                 if score_improvement < self.hysteresis_threshold:
                     # Keep current face (hysteresis prevents switching)
+                    if self.verbose:
+                        print(f"[TalkingFaceDetector] Hysteresis: Keeping current face {current_face_index} "
+                              f"(improvement {score_improvement:.3f} < threshold {self.hysteresis_threshold})")
                     best_face = current_face_score
+                else:
+                    if self.verbose and best_face['index'] != current_face_index:
+                        print(f"[TalkingFaceDetector] Switching from face {current_face_index} to face {best_face['index']} "
+                              f"(improvement {score_improvement:.3f} >= threshold {self.hysteresis_threshold})")
+            else:
+                if self.verbose:
+                    print(f"[TalkingFaceDetector] Current face {current_face_index} no longer detected")
+
+        if self.verbose:
+            print(f"[TalkingFaceDetector] Selected face {best_face['index']}: "
+                  f"combined={best_face['combined']:.3f} "
+                  f"(movement={best_face['movement']:.3f}, quality={best_face['quality']:.3f})")
 
         # Store scores for debugging
         self.last_scores = {
@@ -207,6 +287,180 @@ class TalkingFaceDetector:
             'score': best_face['combined'],
             'movement': best_face['movement'],
             'quality': best_face['quality']
+        })
+
+        return best_face['index']
+
+    def get_best_talking_face_with_lookahead(self, frames, faces, current_face_index=None):
+        """
+        Select the best talking face by analyzing multiple frames ahead.
+
+        This method provides more robust face selection by looking at movement
+        across multiple frames instead of just a single frame comparison.
+        Particularly useful at the start of a video or when switching faces.
+
+        Args:
+            frames (list): List of frames to analyze (uses self.static_frame_count frames)
+            faces (list): List of face bounding boxes [(x, y, w, h), ...]
+            current_face_index (int): Currently tracked face index (for hysteresis)
+
+        Returns:
+            int: Index of best face, or None if no suitable face found
+
+        Example:
+            >>> detector = TalkingFaceDetector()
+            >>> # Read next 10 frames from video
+            >>> lookahead_frames = [cap.read()[1] for _ in range(10)]
+            >>> best_idx = detector.get_best_talking_face_with_lookahead(
+            ...     lookahead_frames, faces, current_face_index=0
+            ... )
+        """
+        if not frames or len(frames) == 0:
+            if self.verbose:
+                print("[TalkingFaceDetector] No lookahead frames provided")
+            return None
+
+        if not faces or len(faces) == 0:
+            if self.verbose:
+                print("[TalkingFaceDetector] No faces to evaluate")
+            return None
+
+        # Limit frames to static_frame_count
+        lookahead_frames = frames[:self.static_frame_count]
+
+        if self.verbose:
+            print(f"\n[TalkingFaceDetector] Look-ahead evaluation with {len(lookahead_frames)} frames")
+
+        # Aggregate scores for each face across all frames
+        face_aggregate_scores = []
+
+        for face_idx, face_bbox in enumerate(faces):
+            movement_scores = []
+            quality_scores = []
+
+            # Evaluate this face across all lookahead frames
+            for frame_idx in range(len(lookahead_frames) - 1):
+                prev_frame = lookahead_frames[frame_idx]
+                curr_frame = lookahead_frames[frame_idx + 1]
+
+                try:
+                    # Calculate quality score (only once, using first frame)
+                    if frame_idx == 0:
+                        quality_score = self.face_scorer.score_face_quality(curr_frame, face_bbox)
+                        quality_scores.append(quality_score)
+
+                    # Calculate movement score between consecutive frames
+                    if quality_score >= 0.3:  # Only if quality is reasonable
+                        movement_score = self.mouth_detector.detect_mouth_movement(
+                            prev_frame, curr_frame, face_bbox
+                        )
+                        movement_scores.append(movement_score)
+
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  Warning: Error evaluating face {face_idx} at frame {frame_idx}: {e}")
+                    continue
+
+            # Aggregate scores
+            if not movement_scores:
+                avg_movement = 0.0
+                max_movement = 0.0
+            else:
+                avg_movement = np.mean(movement_scores)
+                max_movement = np.max(movement_scores)
+
+            if not quality_scores:
+                avg_quality = 0.0
+            else:
+                avg_quality = quality_scores[0]  # Quality is constant across frames
+
+            # Use average movement for combined score
+            # This represents typical talking activity across the window
+            combined_score = (
+                avg_movement * self.movement_weight +
+                avg_quality * self.quality_weight
+            )
+
+            # Apply minimum movement threshold
+            rejection_reason = None
+            if avg_movement < self.min_movement_threshold:
+                rejection_reason = f"avg movement too low ({avg_movement:.3f} < {self.min_movement_threshold})"
+                combined_score = 0.0
+
+            face_aggregate_scores.append({
+                'index': face_idx,
+                'combined': combined_score,
+                'avg_movement': avg_movement,
+                'max_movement': max_movement,
+                'quality': avg_quality,
+                'bbox': face_bbox,
+                'rejection_reason': rejection_reason
+            })
+
+            if self.verbose:
+                status = f"REJECTED ({rejection_reason})" if rejection_reason else "OK"
+                print(f"  Face {face_idx}: combined={combined_score:.3f} "
+                      f"(avg_movement={avg_movement:.3f}, max_movement={max_movement:.3f}, "
+                      f"quality={avg_quality:.3f}) - {status}")
+
+        # Filter faces below threshold
+        suitable_faces = [f for f in face_aggregate_scores if f['combined'] >= self.min_score_threshold]
+
+        if not suitable_faces:
+            if self.verbose:
+                rejected_count = len([f for f in face_aggregate_scores if f['combined'] < self.min_score_threshold])
+                print(f"[TalkingFaceDetector] No suitable faces found in lookahead. "
+                      f"{rejected_count} face(s) below threshold {self.min_score_threshold}")
+            return None
+
+        # Sort by combined score (descending)
+        suitable_faces.sort(key=lambda x: x['combined'], reverse=True)
+
+        best_face = suitable_faces[0]
+
+        # Apply hysteresis if we have a current face
+        if current_face_index is not None and current_face_index < len(faces):
+            current_face_score = next(
+                (f for f in face_aggregate_scores if f['index'] == current_face_index),
+                None
+            )
+
+            if current_face_score is not None:
+                score_improvement = best_face['combined'] - current_face_score['combined']
+
+                if score_improvement < self.hysteresis_threshold:
+                    if self.verbose:
+                        print(f"[TalkingFaceDetector] Hysteresis: Keeping current face {current_face_index} "
+                              f"(improvement {score_improvement:.3f} < threshold {self.hysteresis_threshold})")
+                    best_face = current_face_score
+                else:
+                    if self.verbose and best_face['index'] != current_face_index:
+                        print(f"[TalkingFaceDetector] Switching from face {current_face_index} to face {best_face['index']} "
+                              f"(improvement {score_improvement:.3f} >= threshold {self.hysteresis_threshold})")
+            else:
+                if self.verbose:
+                    print(f"[TalkingFaceDetector] Current face {current_face_index} no longer detected")
+
+        if self.verbose:
+            print(f"[TalkingFaceDetector] Selected face {best_face['index']} via lookahead: "
+                  f"combined={best_face['combined']:.3f} "
+                  f"(avg_movement={best_face['avg_movement']:.3f}, quality={best_face['quality']:.3f})")
+
+        # Store scores for debugging
+        self.last_scores = {
+            'movement': best_face['avg_movement'],
+            'quality': best_face['quality'],
+            'combined': best_face['combined']
+        }
+
+        # Add to history
+        self.face_history.append({
+            'timestamp': time.time(),
+            'face_index': best_face['index'],
+            'score': best_face['combined'],
+            'movement': best_face['avg_movement'],
+            'quality': best_face['quality'],
+            'method': 'lookahead'
         })
 
         return best_face['index']
