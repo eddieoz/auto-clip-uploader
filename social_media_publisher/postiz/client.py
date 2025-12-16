@@ -690,26 +690,17 @@ class PostizClient:
                 chan_type = schedule.get("type", "now")
                 chan_date = schedule.get("date")
                 
-                # Check for schedule override in post data
-                # If individual schedule differs from global, we must specify it here
+                # Unify everything to "schedule" type for batch compatibility
+                # Treat "now" as "schedule" at current time
+                post_data["type"] = "schedule"
+                
                 if chan_type == "date" and chan_date:
-                    # Based on Postiz API batch structure, we can hopefully put 'date' in the post item
-                    # or in settings? We will try adding it to the root of the post item
-                    # NOTE: This assumes Postiz backend supports per-post overrides
                     post_data["date"] = chan_date
-                    post_data["type"] = "schedule"  # API uses "schedule", config uses "date"
                 else:
-                     # Explicitly set to schedule: now implies immediate for this post?
-                     # Postiz usually takes "type": "now" at top level.
-                     # If we mix scheduled and immediate, we should probably set top level to "schedule"
-                     # and set dates for everything? 
-                     # Or "now" for immediate ones.
-                     # Let's try explicit "type": "now"
-                     post_data["type"] = "now"
-                     # For immediate posts, we might need a date too?
+                     # For "now", use current time
                      from datetime import datetime
                      post_data["date"] = datetime.now().isoformat()
-
+            
             # Debug: Log the request payload for Bluesky 
             if platform == "bsky":
                 print(f"🦋 Bluesky API payload (CLEAN):")
@@ -857,6 +848,11 @@ class PostizClient:
         except PostizAPIError as e:
             print(f"⚠️  Bulk post creation failed: {e}")
             print("🔄 Attempting individual platform posting...")
+            
+            # Add delay before starting fallback to recover from potential rate limit hits 
+            # or simply to respect the interval after the failed bulk request
+            import time
+            time.sleep(2)
         
         # Fallback: Try each platform individually with rate limiting
         import time
