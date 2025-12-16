@@ -111,7 +111,7 @@ class PostizPublisher:
                 return {"error": "upload_failed", "message": str(e)}
             
             # Step 4: Create multi-platform post with platform-specific scheduling
-            self.logger.info("Step 4: Creating multi-platform post with platform-specific scheduling")
+            self.logger.info("Step 4: Creating multi-platform post with unified scheduling")
             enabled_channels = self.config.get_enabled_channels()
             
             # Create platform mapping for platform-specific settings (channel_id -> platform_name)
@@ -119,19 +119,30 @@ class PostizPublisher:
             
             self.logger.info(f"Target platforms: {list(enabled_channels.keys())}")
             self.logger.info(f"Channel IDs: {list(enabled_channels.values())}")
-            self.logger.info(f"Platform mapping: {platform_mapping}")
             
-            # Check if platforms have different posting times
-            if self.config.platforms_have_different_times():
-                self.logger.info("🕒 Platforms have different posting times - using individual scheduling")
-                post_results = self._handle_individual_platform_scheduling(
-                    file_info, platform_content, enabled_channels, platform_mapping, metadata
-                )
-            else:
-                self.logger.info("🕒 All platforms have same posting time - using bulk posting")
-                post_results = self._handle_bulk_platform_scheduling(
-                    file_info, platform_content, enabled_channels, platform_mapping, metadata
-                )
+            # Create schedule mapping for per-channel scheduling
+            self.logger.info("📅 Generating schedule mapping for all channels...")
+            schedule_mapping = {}
+            for platform, channel_id in enabled_channels.items():
+                posting_type = self.config.get_posting_type_for_postiz(platform)
+                scheduled_datetime = self.config.get_scheduled_datetime_iso(platform)
+                
+                schedule_mapping[channel_id] = {
+                    "type": posting_type,
+                    "date": scheduled_datetime,
+                    "platform": platform
+                }
+                
+                # Log scheduling info
+                if posting_type == "date":
+                    self.logger.info(f"   {platform} ({channel_id}): Scheduled for {scheduled_datetime}")
+                else:
+                    self.logger.info(f"   {platform} ({channel_id}): Immediate posting")
+
+            # Always use bulk scheduling with the schedule mapping
+            post_results = self._handle_bulk_platform_scheduling(
+                file_info, platform_content, enabled_channels, platform_mapping, metadata, schedule_mapping
+            )
             
             if post_results["success"]:
                 success_count = post_results.get("success_count", len(enabled_channels))
@@ -141,8 +152,6 @@ class PostizPublisher:
                 
                 if post_results.get("bulk_creation", False):
                     self.logger.info("   Used bulk creation for all platforms")
-                elif post_results.get("individual_creation", False):
-                    self.logger.info("   Used individual platform scheduling")
                 else:
                     self.logger.info("   Used individual platform fallback")
                 
@@ -185,9 +194,9 @@ class PostizPublisher:
             self._log_error(str(e))
             return {"error": str(e)}
     
-    def _handle_bulk_platform_scheduling(self, file_info, platform_content, enabled_channels, platform_mapping, metadata) -> Dict[str, any]:
+    def _handle_bulk_platform_scheduling(self, file_info, platform_content, enabled_channels, platform_mapping, metadata, schedule_mapping) -> Dict[str, any]:
         """
-        Handle bulk platform scheduling when all platforms have the same posting time
+        Handle bulk platform scheduling using unified schedule mapping
         
         Args:
             file_info: File information from upload
@@ -195,162 +204,30 @@ class PostizPublisher:
             enabled_channels: Dict of enabled platforms and their channel IDs
             platform_mapping: Channel ID to platform mapping
             metadata: Video metadata
+            schedule_mapping: Dict mapping channel_id -> {type, date, platform}
             
         Returns:
             Dict with posting results
         """
         channel_ids = list(enabled_channels.values())
         
-        # Since all platforms have the same time, use any platform to get the posting configuration
+        # Use a default global configuration for the main request wrapper (fallback)
+        # The client will use the schedule_mapping for per-post details
         first_platform = list(enabled_channels.keys())[0]
-        posting_time_info = self.config.parse_posting_time(first_platform)
         posting_type = self.config.get_posting_type_for_postiz(first_platform)
         scheduled_datetime = self.config.get_scheduled_datetime_iso(first_platform)
-        
-        # Debug: Log posting time processing
-        self.logger.info(f"🕒 Using {first_platform} posting configuration for all platforms")
-        self.logger.info(f"🕒 Posting time: '{self.config.get_platform_posting_time(first_platform)}'")
-        self.logger.info(f"🕒 Parsed posting type: '{posting_type}'")
-        self.logger.info(f"Posting schedule: {posting_time_info['description']}")
-        if posting_type == "date":
-            self.logger.info(f"Scheduled for: {scheduled_datetime}")
         
         try:
             post_results = self.client.create_post_with_fallback(
                 file_info, platform_content, channel_ids, posting_type, scheduled_datetime,
                 metadata=metadata,
-                platform_mapping=platform_mapping
+                platform_mapping=platform_mapping,
+                schedule_mapping=schedule_mapping
             )
             return post_results
         except Exception as e:
             self.logger.error(f"Bulk posting failed: {str(e)}")
             return {"success": False, "error": str(e)}
-    
-    def _handle_individual_platform_scheduling(self, file_info, platform_content, enabled_channels, platform_mapping, metadata) -> Dict[str, any]:
-        """
-        Handle individual platform scheduling when platforms have different posting times
-        
-        Args:
-            file_info: File information from upload
-            platform_content: Platform-specific content
-            enabled_channels: Dict of enabled platforms and their channel IDs
-            platform_mapping: Channel ID to platform mapping
-            metadata: Video metadata
-            
-        Returns:
-            Dict with posting results
-        """
-        successful_posts = []
-        failed_platforms = []
-        
-        # Group platforms by their posting times for efficient scheduling
-        time_groups = self.config.group_platforms_by_posting_time()
-        
-        self.logger.info(f"🕒 Platform scheduling groups:")
-        for posting_time, platforms in time_groups.items():
-            self.logger.info(f"   {posting_time}: {platforms}")
-        
-        # Process each time group
-        for posting_time, platforms in time_groups.items():
-            try:
-                # Get posting configuration for this time
-                first_platform = platforms[0]  # Use first platform in group for configuration
-                posting_time_info = self.config.parse_posting_time(first_platform)
-                posting_type = self.config.get_posting_type_for_postiz(first_platform)
-                scheduled_datetime = self.config.get_scheduled_datetime_iso(first_platform)
-                
-                # Get channel IDs for this time group
-                group_channel_ids = [enabled_channels[platform] for platform in platforms if platform in enabled_channels]
-                group_platform_mapping = {enabled_channels[platform]: platform for platform in platforms if platform in enabled_channels}
-                
-                self.logger.info(f"📅 Scheduling {len(platforms)} platforms for: {posting_time}")
-                self.logger.info(f"   Platforms: {platforms}")
-                self.logger.info(f"   Posting type: '{posting_type}'")
-                self.logger.info(f"   Description: {posting_time_info['description']}")
-                if posting_type == "date":
-                    self.logger.info(f"   Scheduled for: {scheduled_datetime}")
-                
-                # Create post for this time group
-                try:
-                    group_results = self.client.create_post_with_fallback(
-                        file_info, platform_content, group_channel_ids, posting_type, scheduled_datetime,
-                        metadata=metadata,
-                        platform_mapping=group_platform_mapping
-                    )
-                    
-                    if group_results["success"]:
-                        # Add successful platforms
-                        if "successful_posts" in group_results:
-                            successful_posts.extend(group_results["successful_posts"])
-                        else:
-                            # Fallback: assume all platforms in group succeeded
-                            for platform in platforms:
-                                if platform in enabled_channels:
-                                    successful_posts.append({
-                                        "channel_id": enabled_channels[platform],
-                                        "platform": platform,
-                                        "posting_time": posting_time
-                                    })
-                        
-                        # Add any failed platforms from this group
-                        if group_results.get("failed_platforms"):
-                            failed_platforms.extend(group_results["failed_platforms"])
-                        
-                        self.logger.info(f"✅ Successfully scheduled {len(platforms)} platforms for {posting_time}")
-                    else:
-                        # Entire group failed
-                        for platform in platforms:
-                            if platform in enabled_channels:
-                                failed_platforms.append({
-                                    "channel_id": enabled_channels[platform],
-                                    "platform": platform,
-                                    "error": group_results.get("error", "Unknown error")
-                                })
-                        self.logger.error(f"❌ Failed to schedule platforms for {posting_time}: {group_results.get('error', 'Unknown error')}")
-                    
-                except Exception as e:
-                    # Group failed with exception
-                    for platform in platforms:
-                        if platform in enabled_channels:
-                            failed_platforms.append({
-                                "channel_id": enabled_channels[platform],
-                                "platform": platform,
-                                "error": str(e)
-                            })
-                    self.logger.error(f"❌ Exception while scheduling platforms for {posting_time}: {str(e)}")
-                
-                # Add delay between time groups to respect rate limits
-                if len(time_groups) > 1:
-                    import time
-                    self.logger.info("⏳ Waiting 2 seconds before next time group...")
-                    time.sleep(2)
-                
-            except Exception as e:
-                self.logger.error(f"❌ Failed to process time group {posting_time}: {str(e)}")
-                # Mark all platforms in this group as failed
-                for platform in platforms:
-                    if platform in enabled_channels:
-                        failed_platforms.append({
-                            "channel_id": enabled_channels[platform],
-                            "platform": platform,
-                            "error": f"Time group processing failed: {str(e)}"
-                        })
-        
-        # Compile results
-        total_platforms = len(enabled_channels)
-        success_count = len(successful_posts)
-        failure_count = len(failed_platforms)
-        
-        return {
-            "success": success_count > 0,
-            "individual_creation": True,
-            "successful_posts": successful_posts,
-            "failed_platforms": failed_platforms,
-            "total_channels": total_platforms,
-            "success_count": success_count,
-            "failure_count": failure_count,
-            "time_groups": len(time_groups)
-        }
     
     def _prepare_content(self) -> tuple[Path, str, object]:
         """
