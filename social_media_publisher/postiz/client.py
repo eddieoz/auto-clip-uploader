@@ -517,7 +517,7 @@ class PostizClient:
             # Twitter/X has minimal requirements
             return {
                 **base_settings,
-                # Twitter typically only needs basic settings
+                "who_can_reply_post": "everyone",  # Required by Postiz
             }
         elif platform == "bsky":
             # Bluesky minimal settings
