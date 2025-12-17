@@ -751,19 +751,31 @@ class PostizClient:
         # Add date field - required by Postiz API for all posts
         # If we use schedule_mapping, we still provide a fallback date at top level
         # usually required by validation logic
-        if (posting_type == "date" and scheduled_datetime) or schedule_mapping:
-            # Use provided scheduled time or current time for fallback
-            # If schedule_mapping is used, we use the date of the first scheduled item or now
-            if scheduled_datetime:
-                payload["date"] = scheduled_datetime
-            elif schedule_mapping:
-                # Find first scheduled date
-                first_date = next((s.get("date") for s in schedule_mapping.values() if s.get("type") == "date"), None)
-                if first_date:
-                    payload["date"] = first_date
+        if schedule_mapping:
+            # When using schedule_mapping, calculate the appropriate global date
+            # This should be the earliest time among all posts to ensure no post is delayed
+            # by the container's scheduled time
+            
+            # Check if any post is "now"
+            has_now = any(s.get("type") == "now" for s in schedule_mapping.values())
+            
+            if has_now:
+                # If any post is immediate, the container must be immediate
+                from datetime import datetime
+                payload["date"] = datetime.now().isoformat()
+            else:
+                # If all are scheduled, use the earliest scheduled time
+                scheduled_dates = [s.get("date") for s in schedule_mapping.values() if s.get("type") == "date" and s.get("date")]
+                if scheduled_dates:
+                    payload["date"] = min(scheduled_dates)
                 else:
+                    # Fallback if no dates found
                     from datetime import datetime
                     payload["date"] = datetime.now().isoformat()
+                    
+        elif posting_type == "date" and scheduled_datetime:
+            # Use provided scheduled time for single-schedule posts
+            payload["date"] = scheduled_datetime
         else:
             # For immediate posts, use current datetime
             from datetime import datetime
