@@ -17,3 +17,4 @@ ffmpeg>=1.4
 openai-whisper
 faster-whisper==1.0.3
 ctranslate2==4.4.0
+yt-dlp==2025.10.14
