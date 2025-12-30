@@ -183,6 +183,9 @@ class NewVideoHandler(FileSystemEventHandler):
                             print(f"⚠️  Failed to fetch title: {yt_result.stderr}")
                     except Exception as e:
                         print(f"⚠️  Error processing source link: {e}")
+                    
+                    # Also pass the source link to reelsfy for metadata
+                    command.extend(["--source-link", self.source_link])
                 
                 print("Starting reelsfy processing...")
                 result = subprocess.run(

@@ -1209,6 +1209,7 @@ def generate_viral(
     output_dir=None,
     min_duration=35.0,
     max_duration=59.0,
+    source_link=None,
 ):
     # GEMINI WAS HERE
 
@@ -1578,6 +1579,10 @@ Return ONLY the JSON object, without any markdown formatting or code block marke
             }
 
     # Merge metadata and viral segments
+    # Merge metadata and viral segments
+    if source_link:
+        metadata_json["source_link"] = source_link
+        
     merged_json = {"metadata": metadata_json, "segments": viral_json["segments"]}
 
     return {"content": json.dumps(merged_json, indent=2)}
@@ -1736,6 +1741,7 @@ def save_metadata(metadata, output_dir):
 Description:
 {metadata['description']}
 
+Source: {metadata.get('source_link', 'N/A')}
 """
         # Save to file
         metadata_file = os.path.join(output_dir, "description.txt")
@@ -1851,6 +1857,11 @@ def __main__():
         "--video-title",
         required=False,
         help="Specific video title/identifier to use in overlay (e.g. '[Show][Ep 1]')",
+    )
+    parser.add_argument(
+        "--source-link",
+        required=False,
+        help="Original video source link to be included in metadata",
     )
     args = parser.parse_args()
     print(args)
@@ -2066,6 +2077,7 @@ def __main__():
                 f"{output_dir}",
                 min_duration=args.min_duration,
                 max_duration=args.max_duration,
+                source_link=args.source_link,
             )
             content = viral_segments["content"]
             print(
