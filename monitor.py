@@ -11,6 +11,7 @@ from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 from dotenv import load_dotenv
 import argparse
+import re
 
 class NewVideoHandler(FileSystemEventHandler):
     def __init__(self, source_link=None):
@@ -139,8 +140,53 @@ class NewVideoHandler(FileSystemEventHandler):
                 reelsfy_path = reelsfy_dir / "reelsfy.py"
                 
                 print("Starting reelsfy processing...")
+                # Prepare base command
+                command = ["python", str(reelsfy_path), "-f", str(video_path), "--output-dir", "../"+str(video_output_dir)]
+                
+                # Add video title if source link is present
+                if self.source_link:
+                    try:
+                        print(f"🔗 Fetching title from: {self.source_link}")
+                        # Use yt-dlp to get the title
+                        # conda run -n reels-clips-automator yt-dlp --get-title <link>
+                        yt_command = ["yt-dlp", "--get-title", self.source_link]
+                        
+                        # Check if we are in a conda environment and need to use the same python
+                        # But simpler is to assume yt-dlp is in the path or use subprocess directly
+                        yt_result = subprocess.run(
+                            yt_command,
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+                        
+                        if yt_result.returncode == 0:
+                            full_title = yt_result.stdout.strip()
+                            print(f"   Original Title: {full_title}")
+                            
+                            # Extract pattern: [ Show ][ ep #Number ]
+                            # Regex: ^(\[\s*.+?\s*\])\s*(\[\s*ep\s*#?\d+\s*\])
+                            match = re.search(r"^(\[\s*.+?\s*\])\s*(\[\s*ep\s*#?\d+\s*\])", full_title, re.IGNORECASE)
+                            
+                            if match:
+                                video_title = f"{match.group(1)}{match.group(2)}"
+                                print(f"   Formatted Title: {video_title}")
+                            else:
+                                # If pattern not found, use a shortened version or the full title? 
+                                # Using full title might be too long for overlay.
+                                # Let's try to be smart or just use it as is if it's short enough.
+                                video_title = full_title
+                                print(f"   Using full title as fallback")
+                                
+                            command.extend(["--video-title", video_title])
+                        else:
+                            print(f"⚠️  Failed to fetch title: {yt_result.stderr}")
+                    except Exception as e:
+                        print(f"⚠️  Error processing source link: {e}")
+                
+                print("Starting reelsfy processing...")
                 result = subprocess.run(
-                    ["python", str(reelsfy_path), "-f", str(video_path), "--output-dir", "../"+str(video_output_dir)], 
+                    command, 
                     cwd=str(reelsfy_dir),
                     capture_output=True,
                     text=True,

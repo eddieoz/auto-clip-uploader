@@ -1847,6 +1847,11 @@ def __main__():
         required=False,
         help="Enable performance profiling and save detailed timing report",
     )
+    parser.add_argument(
+        "--video-title",
+        required=False,
+        help="Specific video title/identifier to use in overlay (e.g. '[Show][Ep 1]')",
+    )
     args = parser.parse_args()
     print(args)
 
@@ -2190,6 +2195,7 @@ def __main__():
                 final_output_name,
                 video_id,
                 output_dir,
+                video_title=args.video_title
             )
             print(f"Segment {i+1} processing complete")
         except Exception as e:
@@ -2222,7 +2228,7 @@ def __main__():
 # __main__()
 
 
-def generate_subtitle(input_file, video_id, output_dir):
+def generate_subtitle(input_file, video_id, output_dir, video_title=None):
     """Generate subtitle for a video using Whisper and FFmpeg"""
     # Get channel name from root .env file
     root_env_path = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), ".env")
@@ -2404,8 +2410,16 @@ def generate_subtitle(input_file, video_id, output_dir):
         )
         last_filter = "v2"
 
-    # Add channel name overlay (bottom-right, above subtitles)
-    if channel_name:
+    # Add channel name or video title overlay (bottom-right, above subtitles)
+    if video_title:
+        # Use provided video title
+        print(f"Using video title for overlay: {video_title}")
+        filter_parts.append(
+            f"[{last_filter}]drawtext=text='{video_title}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=W-tw-30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v3]"
+        )
+        last_filter = "v3"
+    elif channel_name:
+        # Fallback to channel name
         filter_parts.append(
             f"[{last_filter}]drawtext=text='{channel_name}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=W-tw-30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v3]"
         )
