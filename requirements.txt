@@ -1,5 +1,5 @@
 librosa>=0.10.1
-numpy>=1.24.0
+numpy==1.24.4
 openai>=1.0.0
 python-dotenv>=1.0.0
 pytube>=15.0.0

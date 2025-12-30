@@ -9,3 +9,4 @@ ffmpeg-python==0.2.0
 whisper==1.1.10
 faster-whisper==1.0.3
 ctranslate2==4.4.0
+yt-dlp==2025.10.14
