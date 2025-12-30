@@ -10,14 +10,16 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 from dotenv import load_dotenv
+import argparse
 
 class NewVideoHandler(FileSystemEventHandler):
-    def __init__(self):
+    def __init__(self, source_link=None):
         self.processing_files = set()  # Track files currently being processed
         self.lock = threading.Lock()
         self.video_queue = queue.Queue()  # FIFO queue for video files
         self.queue_worker_thread = None
         self.stop_worker = threading.Event()
+        self.source_link = source_link
         
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v")):
@@ -228,7 +230,7 @@ class NewVideoHandler(FileSystemEventHandler):
             
             # Import and initialize publisher
             from social_media_publisher import PostizPublisher
-            publisher = PostizPublisher(str(video_output_dir))
+            publisher = PostizPublisher(str(video_output_dir), source_link=self.source_link)
             
             # Start async publishing (non-blocking)
             publisher.publish_async()
@@ -274,6 +276,15 @@ def main():
     observer_type = "PollingObserver (CIFS detected)" if use_polling else "Observer (native filesystem)"
     
     print("🎬 Video File Monitor Starting...")
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Monitor folder for new video files to process and publish.')
+    parser.add_argument('--link', help='Optional URL of the original video/source to include in description')
+    args = parser.parse_args()
+    
+    if args.link:
+        print(f"🔗 Source link enabled: {args.link}")
+    
     print(f"👀 Monitoring: {video_folder_path.absolute()}")
     print(f"📁 Output to: {output_folder.absolute()}")
     print(f"🔍 Observer type: {observer_type}")
@@ -283,7 +294,7 @@ def main():
     video_folder_path.mkdir(parents=True, exist_ok=True)
     output_folder.mkdir(exist_ok=True)
 
-    event_handler = NewVideoHandler()
+    event_handler = NewVideoHandler(source_link=args.link)
     
     # Start the queue worker
     event_handler.start_queue_worker()

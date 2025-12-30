@@ -18,16 +18,18 @@ class PostizPublisher:
     to publish videos to multiple social media platforms via Postiz API
     """
     
-    def __init__(self, output_directory: str):
+    def __init__(self, output_directory: str, source_link: Optional[str] = None):
         """
         Initialize publisher with video output directory
         
         Args:
             output_directory: Path to the video output directory containing
                             final_video.mp4, content.txt, etc.
+            source_link: Optional URL of the original video/source
         """
         self.output_dir = Path(output_directory)
         self.video_name = self.output_dir.name
+        self.source_link = source_link
         
         # Initialize configuration and logging
         try:
@@ -253,6 +255,11 @@ class PostizPublisher:
         
         extractor = ContentExtractor(self.output_dir)
         metadata = extractor.extract_metadata()
+        
+        # Add source link to metadata if available
+        if self.source_link:
+            metadata.source_link = self.source_link
+            self.logger.info(f"Added source link to metadata: {self.source_link}")
         
         # Log extracted metadata
         self.logger.info(f"Extracted metadata:")

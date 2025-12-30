@@ -38,6 +38,7 @@ class VideoMetadata:
     segments: List[VideoSegment]
     hashtags: List[str]
     duration: Optional[float] = None
+    source_link: Optional[str] = None
     
     def get_segment_zero(self) -> Optional[VideoSegment]:
         """Get segment 0 (first segment) as specified in requirements"""

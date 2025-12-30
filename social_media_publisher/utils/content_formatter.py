@@ -96,13 +96,17 @@ class SocialMediaFormatter:
         # Combine and truncate
         content = " - ".join(components)
         
-        # Reserve space for hashtags
+        # Reserve space for hashtags and link
         hashtag_space = self._calculate_hashtag_space(limits.hashtag_limit)
-        max_content_length = limits.max_length - hashtag_space - 5  # Buffer for spacing
+        link_text = f"\n\nSource: {self.metadata.source_link}" if self.metadata.source_link else ""
+        max_content_length = limits.max_length - hashtag_space - len(link_text) - 5  # Buffer for spacing
         
         if len(content) > max_content_length:
             content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
         
+        # Add link
+        content += link_text
+
         # Add hashtags
         hashtags = self._select_hashtags(limits.hashtag_limit)
         if hashtags:
@@ -127,6 +131,10 @@ class SocialMediaFormatter:
         
         # Add call to action
         components.append("💫 Siga para mais conteúdos como esse!")
+        
+        # Add source link
+        if self.metadata.source_link:
+            components.append(f"Source: {self.metadata.source_link}")
         
         content = "\n\n".join(components)
         
@@ -169,6 +177,10 @@ class SocialMediaFormatter:
         components.append("👍 LIKE & SUBSCRIBE for more content!")
         components.append("🔔 Turn on notifications!")
         
+        # Add source link
+        if self.metadata.source_link:
+            components.append(f"Source: {self.metadata.source_link}")
+        
         content = "\n\n".join(components)
         
         # Add hashtags
@@ -208,6 +220,10 @@ class SocialMediaFormatter:
         elif self.metadata.description:
             components.append(self.metadata.description)
         
+        # Add source link
+        if self.metadata.source_link:
+            components.append(f"Source: {self.metadata.source_link}")
+            
         content = "\n\n".join(components)
         
         # Add TikTok-specific hashtags
@@ -252,6 +268,10 @@ class SocialMediaFormatter:
         elif self.metadata.description:
             components.append(self.metadata.description)
         
+        # Add source link
+        if self.metadata.source_link:
+            components.append(f"Source: {self.metadata.source_link}")
+
         content = "\n\n".join(components)
         
         # Add hashtags first to calculate exact length
@@ -281,6 +301,10 @@ class SocialMediaFormatter:
         elif self.metadata.description:
             components.append(self.metadata.description)
         
+        # Add source link
+        if self.metadata.source_link:
+            components.append(f"Source: {self.metadata.source_link}")
+
         # Combine and truncate for Bluesky's 300 character limit
         content = " - ".join(components)
         
@@ -316,6 +340,10 @@ class SocialMediaFormatter:
             components.append(segment_zero.description)
         elif self.metadata.description:
             components.append(self.metadata.description)
+            
+        # Add source link
+        if self.metadata.source_link:
+            components.append(f"Source: {self.metadata.source_link}")
         
         # Combine with line breaks for better readability on Mastodon
         content = "\n\n".join(components)
@@ -361,12 +389,18 @@ class SocialMediaFormatter:
         
         content = " - ".join(components)
         
-        # Reserve space for hashtags and truncate if needed
+        content = " - ".join(components)
+        
+        # Reserve space for hashtags and link
         hashtag_space = self._calculate_hashtag_space(limits.hashtag_limit)
-        max_content_length = limits.max_length - hashtag_space - 5
+        link_text = f"\n\nSource: {self.metadata.source_link}" if self.metadata.source_link else ""
+        max_content_length = limits.max_length - hashtag_space - len(link_text) - 5
         
         if len(content) > max_content_length:
             content = content[:max_content_length].rsplit(' ', 1)[0] + "..."
+        
+        # Add link
+        content += link_text
         
         # Add hashtags
         hashtags = self._select_hashtags(limits.hashtag_limit)
