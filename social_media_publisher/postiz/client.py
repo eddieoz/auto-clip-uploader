@@ -627,6 +627,11 @@ class PostizClient:
             # Get platform-specific settings
             settings = self._get_platform_settings(platform)
             
+            # Add jobId to settings (required for Nostr and Bluesky)
+            # Use UUID to ensure uniqueness across posts
+            import uuid
+            settings["jobId"] = str(uuid.uuid4())
+            
             # Add platform-specific settings
             # Import PLATFORM_LIMITS to respect platform-specific character limits
             from ..utils.content_formatter import SocialMediaFormatter
