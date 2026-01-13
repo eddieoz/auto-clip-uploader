@@ -695,16 +695,22 @@ class PostizClient:
                 chan_type = schedule.get("type", "now")
                 chan_date = schedule.get("date")
                 
-                # Unify everything to "schedule" type for batch compatibility
-                # Treat "now" as "schedule" at current time
-                post_data["type"] = "schedule"
-                
-                if chan_type == "date" and chan_date:
+                # Use proper API type based on configuration
+                if chan_type == "now":
+                    # For immediate posting, use "now" type as per Postiz API docs
+                    post_data["type"] = "now"
+                    # Date is optional for "now" type but we include it for consistency
+                    from datetime import datetime, timezone
+                    post_data["date"] = datetime.now(timezone.utc).isoformat()
+                elif chan_type == "date" and chan_date:
+                    # For scheduled posting, use "schedule" type
+                    post_data["type"] = "schedule"
                     post_data["date"] = chan_date
                 else:
-                     # For "now", use current time
-                     from datetime import datetime
-                     post_data["date"] = datetime.now().isoformat()
+                    # Fallback to "now" for unknown types
+                    post_data["type"] = "now"
+                    from datetime import datetime, timezone
+                    post_data["date"] = datetime.now(timezone.utc).isoformat()
             
             # Debug: Log the request payload for Bluesky 
             if platform == "bsky":
@@ -736,9 +742,14 @@ class PostizClient:
         # but rely on per-post overrides.
         final_posting_type = api_posting_type = "schedule" if posting_type == "date" else posting_type
         
-        # If using schedule_mapping, we default top-level to "schedule" (safe bet for batch)
+        # If using schedule_mapping, determine top-level type based on individual posts
         if schedule_mapping:
-             final_posting_type = "schedule"
+            # Check if ALL posts are "now"
+            all_now = all(s.get("type") == "now" for s in schedule_mapping.values())
+            if all_now:
+                final_posting_type = "now"
+            else:
+                final_posting_type = "schedule"
              
         # Debug: Log the posting type transformation
         print(f"🕒 Posting type transformation:")
@@ -766,8 +777,8 @@ class PostizClient:
             
             if has_now:
                 # If any post is immediate, the container must be immediate
-                from datetime import datetime
-                payload["date"] = datetime.now().isoformat()
+                from datetime import datetime, timezone
+                payload["date"] = datetime.now(timezone.utc).isoformat()
             else:
                 # If all are scheduled, use the earliest scheduled time
                 scheduled_dates = [s.get("date") for s in schedule_mapping.values() if s.get("type") == "date" and s.get("date")]
@@ -775,16 +786,16 @@ class PostizClient:
                     payload["date"] = min(scheduled_dates)
                 else:
                     # Fallback if no dates found
-                    from datetime import datetime
-                    payload["date"] = datetime.now().isoformat()
+                    from datetime import datetime, timezone
+                    payload["date"] = datetime.now(timezone.utc).isoformat()
                     
         elif posting_type == "date" and scheduled_datetime:
             # Use provided scheduled time for single-schedule posts
             payload["date"] = scheduled_datetime
         else:
-            # For immediate posts, use current datetime
-            from datetime import datetime
-            payload["date"] = datetime.now().isoformat()
+            # For immediate posts, use current datetime with timezone
+            from datetime import datetime, timezone
+            payload["date"] = datetime.now(timezone.utc).isoformat()
         
         try:
             print(f"Sending post creation request with payload: {len(posts)} posts")
