@@ -488,15 +488,16 @@ class PostizClient:
             # TikTok has many specific requirements
             return {
                 **base_settings,
-                "privacy_level": "PUBLIC_TO_EVERYONE",  # TikTok specific values
-                "duet": True,         # TikTok: allow duets
-                "comment": True,      # TikTok: allow comments
-                "stitch": True,       # TikTok: allow stitching
+                "privacy_level": "SELF_ONLY",  # TikTok specific values (PUBLIC_TO_EVERYONE for public posts, SELF_ONLY for private)
+                "content_posting_method": "UPLOAD", # TikTok: "DIRECT_POST" or "UPLOAD"
                 "autoAddMusic": "no", # TikTok: "yes" or "no"
-                "brand_content_toggle": False,     # TikTok: branded content
+                "comment": True,      # TikTok: allow comments
+                "duet": True,         # TikTok: allow duets
+                "stitch": True,       # TikTok: allow stitching
+                "video_made_with_ai": False,       # TikTok: AI content disclosure
+                "disclose": False,                 # TikTok: disclosure settings
                 "brand_organic_toggle": False,     # TikTok: organic content
-                "disclosure_enabled": False,       # TikTok: disclosure settings
-                "content_posting_method": "UPLOAD" # TikTok: "DIRECT_POST" or "UPLOAD"
+                "brand_content_toggle": False      # TikTok: branded content
             }
         elif platform == "instagram":
             # Instagram uses minimal settings - avoid TikTok-specific parameters
