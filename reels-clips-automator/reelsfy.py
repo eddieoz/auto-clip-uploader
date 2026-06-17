@@ -395,7 +395,7 @@ def generate_segments(response):
             end_time += 30 - (end_time - start_time)
 
         output_file = f"{sanitize_filename(title)}{str(i).zfill(3)}.mp4"
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -vf scale='1920:1080' -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
+        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
         subprocess.call(command, shell=True)
 
 
@@ -833,51 +833,26 @@ def generate_short(
                     # Calculate crop dimensions ensuring proper 9:16 aspect ratio
                     # and preventing content stretching
                     
-                    # Method 1: Calculate based on height (current approach)
-                    target_height_from_height = int(frame_height * final_crop_ratio)
-                    target_width_from_height = int(target_height_from_height * VERTICAL_RATIO)
+                    # Calculate the maximum possible 9:16 box that fits in the frame
+                    max_possible_width = frame_width
+                    max_possible_height = int(frame_width / VERTICAL_RATIO)
                     
-                    # Method 2: Calculate based on width to ensure it fits
-                    target_width_from_width = int(frame_width * final_crop_ratio) 
-                    target_height_from_width = int(target_width_from_width / VERTICAL_RATIO)
+                    if max_possible_height > frame_height:
+                        max_possible_height = frame_height
+                        max_possible_width = int(frame_height * VERTICAL_RATIO)
+                        
+                    # Now apply the crop ratio
+                    target_height = int(max_possible_height * final_crop_ratio)
                     
-                    # Choose the method that results in a crop region that fits within frame bounds
-                    if (target_width_from_height <= frame_width and 
-                        target_height_from_height <= frame_height):
-                        # Height-based calculation fits
-                        target_width = target_width_from_height
-                        target_height = target_height_from_height
-                    elif (target_width_from_width <= frame_width and 
-                          target_height_from_width <= frame_height):
-                        # Width-based calculation fits
-                        target_width = target_width_from_width
-                        target_height = target_height_from_width
-                    else:
-                        # Neither fits perfectly, use the smaller one that maintains aspect ratio
-                        if target_width_from_height <= frame_width:
-                            target_width = target_width_from_height
-                            target_height = target_height_from_height
-                        else:
-                            target_width = target_width_from_width
-                            target_height = target_height_from_width
+                    # Ensure minimum dimensions
+                    target_height = max(target_height, int(100 / VERTICAL_RATIO))
                     
-                    # Ensure minimum dimensions and proper bounds
-                    target_width = max(min(target_width, frame_width), 100)
-                    target_height = max(min(target_height, frame_height), int(100 / VERTICAL_RATIO))
+                    # Calculate width to exactly match VERTICAL_RATIO
+                    target_width = int(target_height * VERTICAL_RATIO)
                     
-                    # Validation for crop region dimensions
-                    calculated_aspect_ratio = target_width / target_height if target_height > 0 else VERTICAL_RATIO
-                    if abs(calculated_aspect_ratio - VERTICAL_RATIO) > 0.01:
-                        print(f"⚠️  Aspect ratio mismatch: calculated={calculated_aspect_ratio:.3f}, expected={VERTICAL_RATIO:.3f}")
-                        # Fix aspect ratio by adjusting width to match height
-                        target_width = int(target_height * VERTICAL_RATIO)
-                        target_width = max(min(target_width, frame_width), 100)
-                    
-                    # Final validation
-                    if target_width <= 0 or target_height <= 0:
-                        print(f"⚠️  Invalid crop dimensions: {target_width}x{target_height}, using fallback")
-                        target_width = min(frame_width, int(frame_height * VERTICAL_RATIO))
-                        target_height = min(frame_height, int(frame_width / VERTICAL_RATIO))
+                    # Safety bounds check
+                    target_width = min(target_width, frame_width)
+                    target_height = min(target_height, frame_height)
 
                     # Debug output for cropping parameters with aspect ratio tracking
                     crop_ratio = target_height / frame_height if frame_height > 0 else 0
@@ -895,13 +870,25 @@ def generate_short(
 
                 # Calculate the top-left corner of the 9:16 rectangle (only if we have face positions)
                 if len(face_positions) > 0:
-                    x_916 = face_center[0] - w_916 // 2
-                    y_916 = face_center[1] - h_916 // 2
+                    # Ideal top-left corner to center the face
+                    crop_x = face_center[0] - target_width // 2
+                    crop_y = face_center[1] - target_height // 2
 
-                    crop_x = max(
-                        0, x_916 + (w_916 - target_width) // 2
-                    )  # Adjust the crop region to center the face
-                    crop_y = max(0, y_916 + (h_916 - target_height) // 2)
+                    # Shift the crop window if it goes out of bounds
+                    if crop_x < 0:
+                        crop_x = 0
+                    elif crop_x + target_width > frame_width:
+                        crop_x = frame_width - target_width
+                        
+                    if crop_y < 0:
+                        crop_y = 0
+                    elif crop_y + target_height > frame_height:
+                        crop_y = frame_height - target_height
+                        
+                    # Final safety check in case target dimensions are larger than frame
+                    crop_x = max(0, crop_x)
+                    crop_y = max(0, crop_y)
+                    
                     crop_x2 = min(crop_x + target_width, frame_width)
                     crop_y2 = min(crop_y + target_height, frame_height)
 
@@ -976,11 +963,19 @@ def generate_short(
 
                     out.write(resized)
                 else:
-                    # If no faces detected, center crop the frame
-                    crop_height = int(frame_height * CROP_RATIO_BIG)
-                    crop_width = int(crop_height * VERTICAL_RATIO)
-                    crop_x = (frame_width - crop_width) // 2
-                    crop_y = (frame_height - crop_height) // 2
+                    # If no faces detected, use the largest possible centered crop
+                    max_possible_width = frame_width
+                    max_possible_height = int(frame_width / VERTICAL_RATIO)
+                    
+                    if max_possible_height > frame_height:
+                        max_possible_height = frame_height
+                        max_possible_width = int(frame_height * VERTICAL_RATIO)
+                        
+                    crop_height = int(max_possible_height * CROP_RATIO_BIG)
+                    crop_width = int(max_possible_width * CROP_RATIO_BIG)
+                    
+                    crop_x = max(0, (frame_width - crop_width) // 2)
+                    crop_y = max(0, (frame_height - crop_height) // 2)
                     crop_img = frame[
                         crop_y : crop_y + crop_height, crop_x : crop_x + crop_width
                     ]
@@ -2411,7 +2406,7 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None):
         print(f"Using subtitle file: {temp_srt_file}")
         # Build filter complex starting with subtitles
         filter_parts = [
-            f"subtitles='{temp_srt_file}':force_style='Alignment=2,MarginV=40,MarginL=55,MarginR=55,Fontname=Noto Sans,Fontsize=11,PrimaryColour=&H00ffffff,SecondaryColour=&H000000ff,OutlineColour=&H00000000,BackColour=&H80000000,Outline=1.5,Shadow=1.5,BorderStyle=1'[v1]"
+            f"subtitles='{temp_srt_file}':force_style='Alignment=2,MarginV=130,MarginL=55,MarginR=55,Fontname=Noto Sans,Fontsize=6,PrimaryColour=&H00ffffff,SecondaryColour=&H000000ff,OutlineColour=&H00000000,BackColour=&H80000000,Outline=1.5,Shadow=1.5,BorderStyle=1'[v1]"
         ]
         last_filter = "v1"
 
