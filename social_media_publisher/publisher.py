@@ -35,20 +35,27 @@ class _BatchRateLimiter:
         """Block until `permits` slots are available in the current batch window."""
         with self._cond:
             while True:
-                # Reset window when the cooldown since the first post of the batch elapses.
-                if time.monotonic() - self._window_start >= self._cooldown and self._count > 0:
+                # If cooldown elapsed since the batch started, reset for a fresh batch.
+                # _window_start marks when the CURRENT batch began (first post's time).
+                if self._count > 0 and time.monotonic() - self._window_start >= self._cooldown:
                     self._count = 0
-                    self._window_start = time.monotonic()
+                    # Don't set _window_start here; it gets set when the first post
+                    # of the new batch is acquired below (count 0 -> 1).
                     self._cond.notify_all()
                 if self._count + permits <= self._limit:
+                    # Start the batch window on the first post of a fresh batch.
+                    if self._count == 0:
+                        self._window_start = time.monotonic()
                     self._count += permits
                     return
+                # Batch is full and cooldown hasn't elapsed — wait the remaining time.
                 wait = self._cooldown - (time.monotonic() - self._window_start)
                 if wait > 0:
                     print(f"⏳ Rate limit: batch full ({self._count}/{self._limit}), "
                           f"cooling down {wait:.0f}s before next batch...")
                     self._cond.wait(timeout=wait)
                 else:
+                    # Cooldown should have elapsed; loop to trigger the reset above.
                     self._cond.wait(timeout=1.0)
 
 
