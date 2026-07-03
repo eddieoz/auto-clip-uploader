@@ -6,10 +6,53 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .config import PostizConfig
 from .utils.logger import PublishingLogger
+
+
+# ponytail: module-level rate limiter. One gate, all publisher threads pass through.
+# Counts successful channel posts against POSTIZ_MAX_POSTS_PER_BATCH; when the batch
+# fills, callers block on the condition until POSTIZ_COOLDOWN_MINUTES elapses and the
+# counter resets. Single global lock is sufficient for this monitor's throughput.
+class _BatchRateLimiter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._count = 0
+        self._limit = 6
+        self._cooldown = 3600.0  # seconds
+        self._window_start = time.monotonic()
+
+    def configure(self, limit: int, cooldown_seconds: float):
+        # Reconfigure is allowed mid-run; safe under the lock.
+        with self._lock:
+            self._limit = max(1, limit)
+            self._cooldown = max(0.0, cooldown_seconds)
+
+    def acquire(self, permits: int):
+        """Block until `permits` slots are available in the current batch window."""
+        with self._cond:
+            while True:
+                # Reset window when the cooldown since the first post of the batch elapses.
+                if time.monotonic() - self._window_start >= self._cooldown and self._count > 0:
+                    self._count = 0
+                    self._window_start = time.monotonic()
+                    self._cond.notify_all()
+                if self._count + permits <= self._limit:
+                    self._count += permits
+                    return
+                wait = self._cooldown - (time.monotonic() - self._window_start)
+                if wait > 0:
+                    print(f"⏳ Rate limit: batch full ({self._count}/{self._limit}), "
+                          f"cooling down {wait:.0f}s before next batch...")
+                    self._cond.wait(timeout=wait)
+                else:
+                    self._cond.wait(timeout=1.0)
+
+
+_rate_limiter = _BatchRateLimiter()
 
 
 class PostizPublisher:
@@ -56,6 +99,15 @@ class PostizPublisher:
             if self.config.mock_mode:
                 self.logger.info("🎭 MOCK MODE ENABLED - No real API calls will be made")
             
+            # Configure the shared batch rate limiter from env (idempotent across instances)
+            _rate_limiter.configure(
+                self.config.max_posts_per_batch,
+                self.config.cooldown_minutes * 60.0,
+            )
+            self.logger.info(
+                f"Rate limiting: max {self.config.max_posts_per_batch} posts per batch, "
+                f"{self.config.cooldown_minutes}-minute cooldown"
+            )
         except Exception as e:
             print(f"❌ Failed to initialize PostizPublisher: {e}")
             raise
@@ -142,6 +194,13 @@ class PostizPublisher:
                     self.logger.info(f"   {platform} ({channel_id}): Immediate posting")
 
             # Always use bulk scheduling with the schedule mapping
+            # Acquire rate-limit permits for every channel in this post before the API call.
+            channel_count_for_post = len(enabled_channels)
+            self.logger.info(
+                f"🔒 Acquiring rate-limit permits for {channel_count_for_post} post(s)..."
+            )
+            _rate_limiter.acquire(channel_count_for_post)
+            self.logger.info(f"🔒 Permits acquired — posting now")
             post_results = self._handle_bulk_platform_scheduling(
                 file_info, platform_content, enabled_channels, platform_mapping, metadata, schedule_mapping
             )

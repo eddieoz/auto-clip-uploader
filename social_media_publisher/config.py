@@ -46,6 +46,10 @@ class PostizConfig:
         # Mock mode for testing/development
         self.mock_mode = os.getenv("POSTIZ_MOCK_MODE", "false").lower() == "true"
         
+        # Rate limiting: max posts per batch and cooldown between batches
+        self.max_posts_per_batch = int(os.getenv("POSTIZ_MAX_POSTS_PER_BATCH", "6"))
+        self.cooldown_minutes = int(os.getenv("POSTIZ_COOLDOWN_MINUTES", "60"))
+        
         # Validate configuration
         self._validate_config()
     
