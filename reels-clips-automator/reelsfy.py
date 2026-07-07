@@ -2318,7 +2318,7 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None):
             # Fallback to legacy Whisper implementation
             try:
                 import whisper
-                models_to_try = ["small", "medium", "base"]
+                models_to_try = ["medium", "small", "base"]
 
                 for model_name in models_to_try:
                     try:
