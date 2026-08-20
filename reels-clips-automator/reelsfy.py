@@ -126,6 +126,8 @@ if not load_dotenv(env_path):
 # Set OpenAI API key
 config = dotenv_values(env_path)
 api_key = config.get("OPENAI_API_KEY")
+ai_endpoint = (config.get("AI_ENDPOINT") or os.getenv("AI_ENDPOINT") or "").strip("'\"")
+openai_base_url = ai_endpoint or None
 
 if not api_key:
     print(f"Warning: OPENAI_API_KEY not found in environment variables")
@@ -139,16 +141,18 @@ if not api_key:
 # Remove any quotes from the API key if present
 api_key = api_key.strip("'")
 openai.api_key = api_key
+# Per-client base_url is set explicitly below via openai_base_url (None => default endpoint)
 
 
-def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
+def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True, output_dir=None):
     """
     Clean up temporary files after successful processing.
-    
+
     Args:
         tmp_dir (str): Path to temporary directory
         preserve_outputs (bool): Whether to preserve output files (move them instead of delete)
-    
+        output_dir (str): Directory to move output files to (defaults to "outputs/")
+
     Returns:
         bool: True if cleanup successful, False otherwise
     """
@@ -156,22 +160,27 @@ def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
         if not os.path.exists(tmp_dir):
             print(f"✅ Cleanup: tmp directory '{tmp_dir}' doesn't exist")
             return True
-            
+
         print(f"🧹 Starting cleanup of temporary directory: {tmp_dir}")
-        
+
         # Get all files in tmp directory
         tmp_files = glob.glob(os.path.join(tmp_dir, "*"))
-        
+
         if not tmp_files:
             print(f"✅ Cleanup: tmp directory is already empty")
             return True
-        
+
+        # Use provided output_dir or default to "outputs/"
+        outputs_dir = output_dir if output_dir else "outputs/"
+        if not os.path.exists(outputs_dir):
+            os.makedirs(outputs_dir, exist_ok=True)
+
         files_cleaned = 0
         files_preserved = 0
-        
+
         for file_path in tmp_files:
             filename = os.path.basename(file_path)
-            
+
             try:
                 # Check if this is an output file we might want to preserve
                 is_output_file = (
@@ -179,13 +188,8 @@ def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
                     filename.endswith(".mp4") and "cropped" in filename or
                     filename.endswith(".srt") and "final" in filename
                 )
-                
+
                 if preserve_outputs and is_output_file:
-                    # Check if outputs directory exists
-                    outputs_dir = "outputs/"
-                    if not os.path.exists(outputs_dir):
-                        os.makedirs(outputs_dir, exist_ok=True)
-                    
                     # Move output file to outputs directory
                     output_path = os.path.join(outputs_dir, filename)
                     
@@ -223,19 +227,20 @@ def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
         return False
 
 
-def cleanup_on_success(video_id, preserve_outputs=True):
+def cleanup_on_success(video_id, preserve_outputs=True, output_dir=None):
     """
     Perform cleanup operations after successful video processing.
-    
+
     Args:
         video_id (str): The processed video identifier
         preserve_outputs (bool): Whether to preserve output files
+        output_dir (str): Directory to move output files to
     """
     print(f"\n🎉 Processing completed successfully for: {video_id}")
     print("=" * 50)
-    
+
     # Clean up tmp directory
-    cleanup_success = cleanup_tmp_directory(preserve_outputs=preserve_outputs)
+    cleanup_success = cleanup_tmp_directory(preserve_outputs=preserve_outputs, output_dir=output_dir)
     
     if cleanup_success:
         print("✅ All cleanup operations completed successfully")
@@ -1051,7 +1056,7 @@ Please replace the placeholder values with the actual results from your analysis
     ]
 
     try:
-        client = openai.OpenAI(api_key=api_key)
+        client = openai.OpenAI(api_key=api_key, base_url=openai_base_url)
         response = client.chat.completions.create(
             model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
         )
@@ -1541,7 +1546,7 @@ Return ONLY the JSON object, without any markdown formatting or code block marke
         {"role": "user", "content": prompt},
     ]
 
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key, base_url=openai_base_url)
     response = client.chat.completions.create(
         model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
     )
@@ -2214,7 +2219,7 @@ def __main__():
 
     # Clean up temporary files after successful processing
     try:
-        cleanup_on_success(video_id, preserve_outputs=True)
+        cleanup_on_success(video_id, preserve_outputs=True, output_dir=output_dir)
     except Exception as e:
         print(f"⚠️  Warning: Cleanup failed: {str(e)}")
         print("   Manual cleanup of tmp/ directory may be needed")
