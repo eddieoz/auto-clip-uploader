@@ -45,11 +45,15 @@ class PostizConfig:
         
         # Mock mode for testing/development
         self.mock_mode = os.getenv("POSTIZ_MOCK_MODE", "false").lower() == "true"
-        
-        # Rate limiting: max posts per batch and cooldown between batches
-        self.max_posts_per_batch = int(os.getenv("POSTIZ_MAX_POSTS_PER_BATCH", "6"))
-        self.cooldown_minutes = int(os.getenv("POSTIZ_COOLDOWN_MINUTES", "60"))
-        
+
+        # Publishing cadence: videos are edited then drip-published from a queue,
+        # one at a time, spaced by this many minutes. 0 = publish immediately (serial).
+        self.publish_interval_minutes = int(os.getenv("PUBLISH_INTERVAL_MINUTES", "0"))
+        # Max retry attempts for a failed publish before the entry is marked failed.
+        self.max_publish_retries = int(os.getenv("PUBLISH_MAX_RETRIES", "3"))
+        # Seconds between dashboard prints in monitor.py. 0 disables the periodic dashboard.
+        self.dashboard_interval_seconds = int(os.getenv("DASHBOARD_INTERVAL_SECONDS", "60"))
+
         # Validate configuration
         self._validate_config()
     
@@ -221,7 +225,14 @@ class PostizConfig:
                 "status": "error",
                 "message": "No API key configured"
             }
-        
+
+        # Mock mode must not touch the network at all.
+        if self.mock_mode:
+            return {
+                "status": "success",
+                "message": "Mock mode - skipping real API validation"
+            }
+
         try:
             from .postiz.client import PostizClient
             

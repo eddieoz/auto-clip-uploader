@@ -14,13 +14,35 @@ import argparse
 import re
 
 class NewVideoHandler(FileSystemEventHandler):
-    def __init__(self, source_link=None):
+    def __init__(self, source_link=None, publish_interval_minutes=0, max_publish_retries=3,
+                 dashboard_interval_seconds=0):
         self.processing_files = set()  # Track files currently being processed
         self.lock = threading.Lock()
         self.video_queue = queue.Queue()  # FIFO queue for video files
         self.queue_worker_thread = None
         self.stop_worker = threading.Event()
         self.source_link = source_link
+
+        # Editing-side bookkeeping for the dashboard.
+        self.edited_total = 0
+
+        # Disk-backed publish queue + drip scheduler. Editing appends to the queue;
+        # a background thread publishes one video at a time on the configured interval.
+        from social_media_publisher.publish_queue import PublishQueue, PublishScheduler
+        queue_path = Path(__file__).parent / "publish_queue.json"
+        self.publish_queue = PublishQueue(str(queue_path))
+        self.publish_scheduler = PublishScheduler(
+            self.publish_queue,
+            interval_minutes=publish_interval_minutes,
+            max_retries=max_publish_retries,
+            on_publish=self._on_publish_callback,
+        )
+        self.publish_interval_minutes = publish_interval_minutes
+
+        # Periodic dashboard ticker.
+        self.dashboard_interval_seconds = dashboard_interval_seconds
+        self.dashboard_thread = None
+        self.stop_dashboard = threading.Event()
         
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v")):
@@ -45,6 +67,64 @@ class NewVideoHandler(FileSystemEventHandler):
             self.stop_worker.set()
             self.queue_worker_thread.join(timeout=5)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Queue worker thread stopped")
+
+    # ---- publish scheduler + dashboard lifecycle ------------------------
+
+    def start_publish_scheduler(self):
+        """Start the publish scheduler (and optional dashboard ticker)."""
+        self.publish_scheduler.start()
+        mode = (f"{self.publish_interval_minutes} min interval"
+                if self.publish_interval_minutes > 0 else "immediate")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Publish scheduler started ({mode})")
+        if self.dashboard_interval_seconds > 0:
+            self.stop_dashboard.clear()
+            self.dashboard_thread = threading.Thread(target=self._dashboard_loop, daemon=True)
+            self.dashboard_thread.start()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard ticker started "
+                  f"(every {self.dashboard_interval_seconds}s)")
+
+    def stop_publish_scheduler(self):
+        """Stop the publish scheduler and dashboard ticker."""
+        if self.dashboard_thread and self.dashboard_thread.is_alive():
+            self.stop_dashboard.set()
+            self.dashboard_thread.join(timeout=3)
+        self.publish_scheduler.stop(timeout=5)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Publish scheduler stopped")
+
+    def _dashboard_loop(self):
+        """Print the dashboard on an interval until stopped."""
+        while not self.stop_dashboard.wait(self.dashboard_interval_seconds):
+            print("\n" + self.render_dashboard() + "\n", flush=True)
+
+    def editing_stats(self):
+        """Snapshot of editing-side progress for the dashboard."""
+        return {
+            "pending": self.video_queue.qsize(),
+            "in_progress": len(self.processing_files),
+            "edited_total": self.edited_total,
+        }
+
+    def render_dashboard(self):
+        """Render a one-block status summary of editing + publishing."""
+        e = self.editing_stats()
+        p = self.publish_queue.stats()
+        ts = datetime.now().strftime('%H:%M:%S')
+        return (
+            f"╭─ 📊 Auto-Clip Uploader Status — {ts} ─────╮\n"
+            f"│ ✂️  Editing    pending: {e['pending']:<3} in-progress: {e['in_progress']:<3} done: {e['edited_total']}\n"
+            f"│ 📤 Publishing pending: {p.get('pending', 0):<3} publishing: {p.get('publishing', 0):<3} "
+            f"✅ published: {p.get('published', 0):<3} ❌ failed: {p.get('failed', 0)}\n"
+            f"│ 📋 Queue total: {p.get('total', 0)}\n"
+            f"╰───────────────────────────────────────────────╯"
+        )
+
+    def _on_publish_callback(self, entry, result):
+        """One-line feedback after each publish attempt."""
+        if result.get("success"):
+            print(f"📤 Published: {entry.video_name}")
+        else:
+            print(f"⚠️  Publish of {entry.video_name} did not report success: "
+                  f"{result.get('error', 'unknown')}")
     
     def _queue_worker(self):
         """Worker thread that processes videos from the queue in FIFO order"""
@@ -147,9 +227,12 @@ class NewVideoHandler(FileSystemEventHandler):
                 if self.source_link:
                     try:
                         print(f"🔗 Fetching title from: {self.source_link}")
-                        # Use yt-dlp to get the title
-                        # conda run -n reels-clips-automator yt-dlp --get-title <link>
-                        yt_command = ["yt-dlp", "--get-title", self.source_link]
+                        # Prefer the yt-dlp sitting next to this interpreter (the conda
+                        # env's up-to-date one) over a possibly stale one on PATH.
+                        import sys as _sys
+                        _env_ytdlp = os.path.join(os.path.dirname(_sys.executable), "yt-dlp")
+                        yt_dlp_bin = _env_ytdlp if os.path.exists(_env_ytdlp) else "yt-dlp"
+                        yt_command = [yt_dlp_bin, "--get-title", self.source_link]
                         
                         # Check if we are in a conda environment and need to use the same python
                         # But simpler is to assume yt-dlp is in the path or use subprocess directly
@@ -161,7 +244,16 @@ class NewVideoHandler(FileSystemEventHandler):
                         )
                         
                         if yt_result.returncode == 0:
-                            full_title = yt_result.stdout.strip()
+                            # GreenBoost hooks print [gb_*] telemetry into the stdout of
+                            # every Python process (yt-dlp included); strip those lines
+                            # and keep the last remaining line, which is the title.
+                            title_lines = [
+                                l for l in yt_result.stdout.splitlines()
+                                if l.strip() and not l.lstrip().startswith("[gb_")
+                            ]
+                            full_title = title_lines[-1].strip() if title_lines else ""
+                            if not full_title:
+                                raise ValueError("yt-dlp returned no title")
                             print(f"   Original Title: {full_title}")
                             
                             # Extract pattern: [ Show ][ ep #Number ]
@@ -263,8 +355,9 @@ class NewVideoHandler(FileSystemEventHandler):
             
             if moved_files:
                 print(f"Organized {len(moved_files)} files in {video_output_dir}")
-                
-                # Integrate social media publishing
+
+                # Count a successful edit for the dashboard, then enqueue for publishing.
+                self.edited_total += 1
                 self._publish_to_social_media(video_output_dir, video_name)
             else:
                 print("No output files found to organize")
@@ -273,24 +366,14 @@ class NewVideoHandler(FileSystemEventHandler):
             print(f"Error organizing output files: {e}")
     
     def _publish_to_social_media(self, video_output_dir, video_name):
-        """Publish video to social media platforms via Postiz API"""
+        """Enqueue an edited video for drip publishing (non-blocking)."""
         try:
-            print("📱 Starting social media publishing...")
-            
-            # Import and initialize publisher
-            from social_media_publisher import PostizPublisher
-            publisher = PostizPublisher(str(video_output_dir), source_link=self.source_link)
-            
-            # Start async publishing (non-blocking)
-            publisher.publish_async()
-            print("📱 Social media publishing started in background")
-            
-        except ImportError:
-            print("📱 Social media publisher not available (module not found)")
-        except ValueError as e:
-            print(f"📱 Social media publishing configuration error: {e}")
+            entry = self.publish_queue.enqueue(str(video_output_dir), video_name, self.source_link)
+            stats = self.publish_queue.stats()
+            print(f"📥 Queued '{video_name}' for publishing "
+                  f"(queue: {stats['pending']} pending, {stats['total']} total)")
         except Exception as e:
-            print(f"📱 Social media publishing error: {e}")
+            print(f"📥 Failed to enqueue '{video_name}' for publishing: {e}")
 
 def is_cifs_mount(path):
     """Check if a path is on a CIFS/SMB mount"""
@@ -325,15 +408,30 @@ def main():
     observer_type = "PollingObserver (CIFS detected)" if use_polling else "Observer (native filesystem)"
     
     print("🎬 Video File Monitor Starting...")
-    
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Monitor folder for new video files to process and publish.')
     parser.add_argument('--link', help='Optional URL of the original video/source to include in description')
+    parser.add_argument('--publish-delay', type=int, default=None,
+                        help='Minutes between publishes (overrides PUBLISH_INTERVAL_MINUTES; 0=immediate)')
+    parser.add_argument('--no-dashboard', action='store_true',
+                        help='Disable the periodic status dashboard')
     args = parser.parse_args()
-    
+
     if args.link:
         print(f"🔗 Source link enabled: {args.link}")
-    
+
+    # Resolve publishing cadence: CLI flag overrides env, which defaults to 0 (immediate).
+    publish_interval = args.publish_delay if args.publish_delay is not None else int(
+        os.getenv("PUBLISH_INTERVAL_MINUTES", "0"))
+    max_retries = int(os.getenv("PUBLISH_MAX_RETRIES", "3"))
+    dashboard_interval = 0 if args.no_dashboard else int(os.getenv("DASHBOARD_INTERVAL_SECONDS", "60"))
+
+    if publish_interval > 0:
+        print(f"📤 Drip publishing: one video every {publish_interval} minute(s)")
+    else:
+        print("📤 Publishing: immediate (each edited video published in order)")
+
     print(f"👀 Monitoring: {video_folder_path.absolute()}")
     print(f"📁 Output to: {output_folder.absolute()}")
     print(f"🔍 Observer type: {observer_type}")
@@ -343,15 +441,21 @@ def main():
     video_folder_path.mkdir(parents=True, exist_ok=True)
     output_folder.mkdir(exist_ok=True)
 
-    event_handler = NewVideoHandler(source_link=args.link)
-    
-    # Start the queue worker
+    event_handler = NewVideoHandler(
+        source_link=args.link,
+        publish_interval_minutes=publish_interval,
+        max_publish_retries=max_retries,
+        dashboard_interval_seconds=dashboard_interval,
+    )
+
+    # Start the queue worker and the publish scheduler
     event_handler.start_queue_worker()
-    
+    event_handler.start_publish_scheduler()
+
     observer = PollingObserver() if use_polling else Observer()
     observer.schedule(event_handler, str(video_folder_path), recursive=False)
     observer.start()
-    
+
     print("✅ Monitor started. Waiting for video files...")
     print("Press Ctrl+C to stop")
 
@@ -362,7 +466,11 @@ def main():
         print("\n🛑 Stopping monitor...")
         observer.stop()
         event_handler.stop_queue_worker()
+        event_handler.stop_publish_scheduler()
     observer.join()
+
+    # Final dashboard summary.
+    print("\n" + event_handler.render_dashboard())
     print("👋 Monitor stopped")
 
 if __name__ == "__main__":

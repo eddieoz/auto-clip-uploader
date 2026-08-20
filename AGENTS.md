@@ -36,6 +36,6 @@ Auto Clip Uploader is an automated video processing system that monitors for new
 4. Make minimal, focused changes
 
 ### Social Media Publishing (Postiz)
-- The publisher uses a rate limiter to prevent API overuse
-- Configuration is done via environment variables in `.env`
-- See `social_media_publisher/publisher.py` for the rate limiting implementation
+- Edited videos are appended to a disk-backed publish queue (`publish_queue.json`, gitignored) and drip-published one at a time on a configurable interval
+- Configuration is done via environment variables in `.env` (`PUBLISH_INTERVAL_MINUTES`, `PUBLISH_MAX_RETRIES`, `DASHBOARD_INTERVAL_SECONDS`)
+- See `social_media_publisher/publish_queue.py` for the queue/scheduler and `social_media_publisher/publisher.py` for the Postiz posting workflow
