@@ -321,37 +321,29 @@ class NewVideoHandler(FileSystemEventHandler):
             # reelsfy_outputs_dir = reelsfy_dir / "outputs" / "input"
             reelsfy_outputs_dir = video_output_dir
             
-            files_to_move = [
-                ("*.mp4", "final_video.mp4"),
-                ("*.srt", "subtitles.srt"), 
-                ("content.txt", "content.txt"),
-                ("transcript.txt", "transcript.txt"),
-                ("description.txt", "description.txt"),
-            ]
-            
             moved_files = []
             
             if reelsfy_outputs_dir.exists():
                 import glob
-                for pattern, dest_name in files_to_move:
-                    if pattern.startswith("*"):
-                        # Handle glob patterns
-                        matches = list(reelsfy_outputs_dir.glob(pattern))
-                        for match in matches:
-                            if match.is_file():
-                                dest_path = video_output_dir / dest_name.replace(".mp4", f"_{match.stem}.mp4").replace(".srt", f"_{match.stem}.srt")
-                                shutil.move(str(match), str(dest_path))
-                                moved_files.append(dest_path.name)
-                                print(f"Moved {match.name} to {dest_path.name}")
-                                break  # Only move the first match
-                    else:
-                        # Handle specific filenames
-                        source_path = reelsfy_outputs_dir / pattern
-                        if source_path.exists():
-                            dest_path = video_output_dir / dest_name
-                            shutil.move(str(source_path), str(dest_path))
-                            moved_files.append(dest_name)
-                            print(f"Moved {pattern} to {dest_name}")
+                # ONLY accept final-* prefixed files (complete: audio + video + subtitles + overlays)
+                final_videos = sorted(reelsfy_outputs_dir.glob("final-*.mp4"))
+                if final_videos:
+                    chosen = final_videos[0]
+                    dest_path = video_output_dir / f"final_video_{chosen.stem}.mp4"
+                    shutil.move(str(chosen), str(dest_path))
+                    moved_files.append(dest_path.name)
+                    print(f"Moved {chosen.name} to {dest_path.name}")
+                else:
+                    print(f"⚠️  No final video (final-*.mp4) found in {reelsfy_outputs_dir}")
+                
+                # Also move content/metadata files
+                for specific_file in ["content.txt", "transcript.txt", "description.txt"]:
+                    source_path = reelsfy_outputs_dir / specific_file
+                    if source_path.exists():
+                        dest_path = video_output_dir / specific_file
+                        shutil.move(str(source_path), str(dest_path))
+                        moved_files.append(specific_file)
+                        print(f"Moved {specific_file}")
             
             if moved_files:
                 print(f"Organized {len(moved_files)} files in {video_output_dir}")

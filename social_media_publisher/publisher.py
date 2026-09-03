@@ -241,20 +241,20 @@ class PostizPublisher:
     def _prepare_content(self) -> tuple[Path, str, object]:
         """
         Validate video files exist and extract content for publishing
-        
+
         Returns:
             tuple: (video_path, formatted_content, metadata)
         """
-        # Look for video file
-        video_path = self.output_dir / "final_video.mp4"
-        if not video_path.exists():
-            # Try alternative names
-            video_files = list(self.output_dir.glob("*.mp4"))
-            if video_files:
-                video_path = video_files[0]
-                self.logger.info(f"Using video file: {video_path.name}")
-            else:
-                raise FileNotFoundError(f"No video file found in {self.output_dir}")
+        # ONLY accept final-* prefixed files (complete: audio + video + subtitles + overlays)
+        final_videos = sorted(self.output_dir.glob("final-*.mp4"))
+        if final_videos:
+            video_path = final_videos[0]
+            self.logger.info(f"Using final video: {video_path.name}")
+        else:
+            raise FileNotFoundError(
+                f"No final video (final-*.mp4) found in {self.output_dir}. "
+                "Ensure reelsfy completed successfully."
+            )
         
         # Extract metadata using enhanced content extractor
         from .utils.content_extractor import ContentExtractor

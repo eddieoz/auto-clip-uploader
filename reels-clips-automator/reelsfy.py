@@ -144,14 +144,15 @@ openai.api_key = api_key
 # Per-client base_url is set explicitly below via openai_base_url (None => default endpoint)
 
 
-def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True, output_dir=None):
+def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
     """
     Clean up temporary files after successful processing.
 
     Args:
         tmp_dir (str): Path to temporary directory
-        preserve_outputs (bool): Whether to preserve output files (move them instead of delete)
-        output_dir (str): Directory to move output files to (defaults to "outputs/")
+        preserve_outputs (bool): Deprecated, kept for compatibility. All tmp files
+                                are deleted since the final complete video is already
+                                in the output directory created by generate_subtitle().
 
     Returns:
         bool: True if cleanup successful, False otherwise
@@ -170,84 +171,55 @@ def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True, output_dir=None
             print(f"✅ Cleanup: tmp directory is already empty")
             return True
 
-        # Use provided output_dir or default to "outputs/"
-        outputs_dir = output_dir if output_dir else "outputs/"
-        if not os.path.exists(outputs_dir):
-            os.makedirs(outputs_dir, exist_ok=True)
-
         files_cleaned = 0
-        files_preserved = 0
 
         for file_path in tmp_files:
             filename = os.path.basename(file_path)
 
             try:
-                # Check if this is an output file we might want to preserve
-                is_output_file = (
-                    filename.startswith("final-") or
-                    filename.endswith(".mp4") and "cropped" in filename or
-                    filename.endswith(".srt") and "final" in filename
-                )
+                # Delete all temporary files. The final complete video
+                # (with audio, subtitles, overlays) is already in output_dir.
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+                print(f"  🗑️  Removed: {filename}")
+                files_cleaned += 1
 
-                if preserve_outputs and is_output_file:
-                    # Move output file to outputs directory
-                    output_path = os.path.join(outputs_dir, filename)
-                    
-                    # Avoid overwriting existing files
-                    counter = 1
-                    base_name, ext = os.path.splitext(filename)
-                    while os.path.exists(output_path):
-                        output_path = os.path.join(outputs_dir, f"{base_name}_{counter}{ext}")
-                        counter += 1
-                    
-                    shutil.move(file_path, output_path)
-                    print(f"  📦 Preserved: {filename} → {output_path}")
-                    files_preserved += 1
-                else:
-                    # Remove temporary file
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                    elif os.path.isdir(file_path):
-                        shutil.rmtree(file_path)
-                    print(f"  🗑️  Removed: {filename}")
-                    files_cleaned += 1
-                    
             except Exception as e:
                 print(f"  ⚠️  Warning: Could not handle {filename}: {str(e)}")
-        
+
         print(f"✅ Cleanup completed:")
         print(f"   • Files cleaned: {files_cleaned}")
-        print(f"   • Files preserved: {files_preserved}")
         print(f"   • Temporary directory ready for next processing")
-        
+
         return True
-        
+
     except Exception as e:
         print(f"❌ Cleanup failed: {str(e)}")
         return False
 
 
-def cleanup_on_success(video_id, preserve_outputs=True, output_dir=None):
+def cleanup_on_success(video_id, preserve_outputs=True):
     """
     Perform cleanup operations after successful video processing.
 
     Args:
         video_id (str): The processed video identifier
-        preserve_outputs (bool): Whether to preserve output files
-        output_dir (str): Directory to move output files to
+        preserve_outputs (bool): Deprecated, kept for compatibility.
     """
     print(f"\n🎉 Processing completed successfully for: {video_id}")
     print("=" * 50)
 
     # Clean up tmp directory
-    cleanup_success = cleanup_tmp_directory(preserve_outputs=preserve_outputs, output_dir=output_dir)
-    
+    cleanup_success = cleanup_tmp_directory(preserve_outputs=preserve_outputs)
+
     if cleanup_success:
         print("✅ All cleanup operations completed successfully")
         print("🚀 System ready for next video processing")
     else:
         print("⚠️  Some cleanup operations failed - manual cleanup may be needed")
-    
+
     return cleanup_success
 
 
@@ -2219,7 +2191,7 @@ def __main__():
 
     # Clean up temporary files after successful processing
     try:
-        cleanup_on_success(video_id, preserve_outputs=True, output_dir=output_dir)
+        cleanup_on_success(video_id, preserve_outputs=True)
     except Exception as e:
         print(f"⚠️  Warning: Cleanup failed: {str(e)}")
         print("   Manual cleanup of tmp/ directory may be needed")
