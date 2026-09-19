@@ -681,6 +681,357 @@ def generate_thumbnail(face, text, thumb_dir):
     print(f"Thumbnail saved to: {thumbnail_path}")
 
 
+# ---------------------------------------------------------------------------
+# Layout-aware reframing (Story 8, P2.1): screencast-first
+#
+# Screencast-style sources (camera in the top third, screen content below) are
+# rendered as screen-filled 9:16 video with a circular tracking face-cam badge
+# (PiP) alternating with motion-following screen zoom. Talking-head sources
+# keep the pre-existing face-crop behavior unchanged.
+# ---------------------------------------------------------------------------
+
+# Layout classification
+LAYOUT_SCREENCAST = "screencast"
+LAYOUT_TALKING_HEAD = "talking_head"
+
+# Screencast rendering modes
+SCREENCAST_PIP = "pip"
+SCREENCAST_SCREEN_ZOOM = "screen_zoom"
+SCREENCAST_CLOSEUP = "closeup"
+FRAMING_MODE_VALID = ("auto", SCREENCAST_PIP, SCREENCAST_SCREEN_ZOOM, SCREENCAST_CLOSEUP)
+
+# FRAMING_MODE env override: auto (default) uses detection; the others force
+# the framing mode for the clip.
+FRAMING_MODE_ENV_VAR = "FRAMING_MODE"
+
+# Detection thresholds (binding per design)
+LAYOUT_SAMPLE_COUNT = 30            # frames sampled for layout detection
+LAYOUT_MIN_FACE_SAMPLE_RATIO = 0.30 # face found in >= 30% of samples
+LAYOUT_FACE_TOP_ZONE_RATIO = 0.40   # median face center-y in the top 40%
+LAYOUT_MAX_FACE_HEIGHT_RATIO = 0.35 # median face height <= 35% of frame height
+LAYOUT_MIN_EDGE_DENSITY = 0.05      # Canny non-zero ratio below the face > 0.05
+LAYOUT_SCREEN_MARGIN_RATIO = 0.10   # small margin below the median face box
+
+# PiP rendering specs
+PIP_BADGE_DIAMETER_RATIO = 0.28     # badge diameter ~28% of frame width (~300 px)
+PIP_FACE_MARGIN_RATIO = 0.25        # face crop expanded by ~25% margin
+PIP_BADGE_MARGIN_RATIO = 0.03       # badge distance from the frame edges
+
+# Deterministic variety schedule: alternate PiP -> screen-zoom on ~10 s
+# boundaries (fixed pattern, PiP first).
+SCREENCAST_SEGMENT_SECONDS = 10
+
+# Whole-clip push-in (PiP only): background zoom eases 100% -> 96%.
+PUSH_IN_START_SCALE = 1.0
+PUSH_IN_END_SCALE = 0.96
+
+# Motion energy search grid for screen-zoom mode
+MOTION_GRID_SIZE = 16
+
+def resolve_framing_override():
+    """Read the FRAMING_MODE env override. Invalid values fall back to auto."""
+    mode = os.environ.get(FRAMING_MODE_ENV_VAR, "auto").strip().lower()
+    if mode not in FRAMING_MODE_VALID:
+        print(f"FRAMING_MODE={mode!r} is not one of {FRAMING_MODE_VALID}, using auto")
+        return "auto"
+    return mode
+
+def median_face_box(face_boxes_per_sample):
+    """Median face box across samples (None samples ignored) or None."""
+    found = [
+        tuple(int(v) for v in box)
+        for box in (face_boxes_per_sample or [])
+        if box is not None
+    ]
+    if not found:
+        return None
+    med = np.median(np.array(found, dtype=np.float64), axis=0)
+    return tuple(int(round(v)) for v in med)
+
+def screen_region_from_median_box(median_box, frame_shape,
+                                  margin_ratio=LAYOUT_SCREEN_MARGIN_RATIO):
+    """
+    Screen payload region: everything below the median face box (with a small
+    margin) as (x, y, width, height). Falls back to the full frame when no
+    face box was established.
+    """
+    frame_height, frame_width = frame_shape[0], frame_shape[1]
+    if median_box is None:
+        return (0, 0, frame_width, frame_height)
+    _, face_y, _, face_h = median_box
+    margin = int(face_h * margin_ratio)
+    sy = min(max(face_y + face_h + margin, 0), max(frame_height - 1, 0))
+    return (0, sy, frame_width, frame_height - sy)
+
+def detect_layout(face_boxes_per_sample, frame_shape, edge_density_below_face,
+                  forced_mode="auto"):
+    """
+    Classify the clip layout from precomputed observations.
+
+    Screencast when: a face is found in >= 30% of samples AND the median face
+    box has center-y in the top 40% of the frame AND median face height <= 35%
+    of frame height AND the region below the median face box has meaningful
+    edge density (Canny non-zero ratio > 0.05). Otherwise talking_head.
+
+    A forced mode (FRAMING_MODE override) bypasses the classification.
+    """
+    if forced_mode in (SCREENCAST_PIP, SCREENCAST_SCREEN_ZOOM):
+        return LAYOUT_SCREENCAST
+    if forced_mode == SCREENCAST_CLOSEUP:
+        return LAYOUT_TALKING_HEAD
+
+    samples = list(face_boxes_per_sample or [])
+    if not samples:
+        return LAYOUT_TALKING_HEAD
+
+    found = [box for box in samples if box is not None]
+    if len(found) / len(samples) < LAYOUT_MIN_FACE_SAMPLE_RATIO:
+        return LAYOUT_TALKING_HEAD
+
+    med = median_face_box(found)
+    if med is None:
+        return LAYOUT_TALKING_HEAD
+    _, med_y, _, med_h = med
+    frame_height = frame_shape[0]
+    center_y = med_y + med_h / 2.0
+
+    if center_y / frame_height > LAYOUT_FACE_TOP_ZONE_RATIO:
+        return LAYOUT_TALKING_HEAD
+    if med_h / frame_height > LAYOUT_MAX_FACE_HEIGHT_RATIO:
+        return LAYOUT_TALKING_HEAD
+    if edge_density_below_face <= LAYOUT_MIN_EDGE_DENSITY:
+        return LAYOUT_TALKING_HEAD
+    return LAYOUT_SCREENCAST
+
+def collect_layout_observations(cap, face_cascade, frame_width, frame_height,
+                                sample_count=LAYOUT_SAMPLE_COUNT,
+                                debug_faces=False):
+    """
+    Sample ~30 evenly spaced frames cheaply (seek via grab/retrieve), run Haar
+    face detection on them, and collect the observations detect_layout needs:
+    (face_boxes_per_sample, edge_density_below_face).
+
+    The edge density is computed on the first sampled frame that had a face,
+    over the region below the median face box.
+    """
+    boxes = []
+    sampled = []
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = sample_count
+        sample_count = max(min(sample_count, total_frames), 1)
+
+        frames_read = 0
+        for i in range(sample_count):
+            target = int(i * total_frames / sample_count)
+            while frames_read < target:
+                if not cap.grab():
+                    break
+                frames_read += 1
+            if not cap.grab():
+                break
+            frames_read += 1
+            ret, frame = cap.retrieve()
+            if not ret or frame is None:
+                continue
+            sampled.append(frame)
+
+        for frame in sampled:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=7, minSize=(100, 100)
+            )
+            if faces is not None and len(faces) > 0:
+                fx, fy, fw, fh = faces[0]
+                boxes.append((int(fx), int(fy), int(fw), int(fh)))
+            else:
+                boxes.append(None)
+
+        edge_density = 0.0
+        med = median_face_box(boxes)
+        if med is not None:
+            frame_shape = (frame_height, frame_width)
+            region_x, region_y, region_w, region_h = screen_region_from_median_box(
+                med, frame_shape
+            )
+            for frame in sampled:
+                sub = frame[region_y:region_y + region_h, region_x:region_x + region_w]
+                if sub.size == 0:
+                    break
+                edges = cv2.Canny(sub, 50, 150)
+                if edges.size > 0:
+                    edge_density = np.count_nonzero(edges) / edges.size
+                break
+        if debug_faces:
+            print(f"Layout sampling: {len(sampled)} frames, faces in {sum(1 for b in boxes if b is not None)}, edge_density={edge_density:.4f}")
+        return boxes, edge_density
+    except Exception as e:
+        print(f"Layout sampling failed ({e}), treating as talking-head")
+        return [], 0.0
+
+def compute_push_in_scale(progress,
+                          start_scale=PUSH_IN_START_SCALE,
+                          end_scale=PUSH_IN_END_SCALE):
+    """Whole-clip push-in: smoothstep easing from start_scale to end_scale."""
+    p = min(max(progress, 0.0), 1.0)
+    smooth = p * p * (3.0 - 2.0 * p)
+    return start_scale + (end_scale - start_scale) * smooth
+
+def screencast_mode_for_frame(frame_count, fps, segment_seconds=SCREENCAST_SEGMENT_SECONDS):
+    """Deterministic variety: pip -> screen_zoom -> pip on ~10 s boundaries."""
+    if fps <= 0:
+        fps = 30.0
+    segment_frames = max(int(fps * segment_seconds), 1)
+    if (frame_count // segment_frames) % 2 == 0:
+        return SCREENCAST_PIP
+    return SCREENCAST_SCREEN_ZOOM
+
+def resolve_screencast_mode(frame_count, fps, forced="auto",
+                            segment_seconds=SCREENCAST_SEGMENT_SECONDS):
+    """Per-frame screencast mode: forced override or the deterministic schedule."""
+    if forced in (SCREENCAST_PIP, SCREENCAST_SCREEN_ZOOM):
+        return forced
+    return screencast_mode_for_frame(frame_count, fps, segment_seconds)
+
+def smooth_center(prev_center, raw_center, smoothing_factor=0.7, movement_threshold=5):
+    """
+    Existing EMA smoothing semantics (70% previous / 30% new) with the
+    existing dead-zone threshold. Applied EVERY frame now, also when tracking
+    is not frame-by-frame. Returns None only when both inputs are None.
+    """
+    if raw_center is None:
+        return prev_center
+    if prev_center is None:
+        return raw_center
+    dx = raw_center[0] - prev_center[0]
+    dy = raw_center[1] - prev_center[1]
+    movement_distance = (dx ** 2 + dy ** 2) ** 0.5
+    if movement_distance > movement_threshold:
+        return (
+            int(prev_center[0] * smoothing_factor + raw_center[0] * (1 - smoothing_factor)),
+            int(prev_center[1] * smoothing_factor + raw_center[1] * (1 - smoothing_factor)),
+        )
+    return prev_center
+
+def compute_motion_center(prev_gray, gray, frame_shape, grid=MOTION_GRID_SIZE):
+    """
+    Point of maximum motion energy between two downscaled gray frames, mapped
+    back to original frame coordinates. Returns None when motion is
+    negligible or there is no previous frame (caller falls back to the
+    screen-region center).
+    """
+    if prev_gray is None or gray is None:
+        return None
+    frame_height, frame_width = frame_shape[0], frame_shape[1]
+    prev_small = cv2.resize(prev_gray, (grid, grid), interpolation=cv2.INTER_AREA)
+    small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
+    diff = cv2.absdiff(small, prev_small)
+    if float(np.sum(diff)) <= 0.0:
+        return None
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(diff)
+    col, row = max_loc
+    cell_w = frame_width / grid
+    cell_h = frame_height / grid
+    return (int((col + 0.5) * cell_w), int((row + 0.5) * cell_h))
+
+def compute_screen_zoom_crop(screen_region, center, frame_shape):
+    """
+    9:16 crop window over the screen region, centered on `center` (the
+    motion point or the screen-region center fallback), clamped to the frame.
+    Returns (x, y, width, height).
+    """
+    frame_height, frame_width = frame_shape[0], frame_shape[1]
+    sx, sy, sw, sh = screen_region
+
+    crop_w = min(max(sw, 16), frame_width)
+    crop_h = int(crop_w * 16 / 9)
+    if crop_h > frame_height:
+        crop_h = frame_height
+        crop_w = max(int(frame_height * 9 / 16), 16)
+
+    cx = int(center[0])
+    cy = int(center[1])
+    if sw >= crop_w:
+        cx = max(cx, sx + crop_w // 2)
+        cx = min(cx, sx + sw - crop_w // 2)
+    cx = max(cx, crop_w // 2)
+    cx = min(cx, frame_width - crop_w // 2)
+    if crop_h <= frame_height - sy:
+        cy = max(cy, sy + crop_h // 2)
+    cy = max(cy, crop_h // 2)
+    cy = min(cy, frame_height - crop_h // 2)
+    return (cx - crop_w // 2, cy - crop_h // 2, crop_w, crop_h)
+
+def render_pip_frame(frame, screen_region, face_box, face_center, push_scale=1.0,
+                     last_badge=None, output_size=(1080, 1920)):
+    """
+    Screencast PiP rendering: background = the screen region (below the median
+    face box) as an aspect-preserving 9:16 crop scaled by push_scale, resized
+    to output_size; foreground = circular face-cam badge in the TOP-RIGHT
+    (face crop with margin, white ring border).
+
+    When the face is missing in this frame, the last badge crop is held.
+    Returns (output_frame, badge_crop_or_None).
+    """
+    out_w, out_h = output_size
+    frame_height, frame_width = frame.shape[:2]
+    sx, sy, sw, sh = screen_region
+
+    # Background: largest 9:16 window in the screen region, shrunk by the
+    # push-in scale, centered in the region, clamped to the frame.
+    if sw * 16 / 9 <= sh:
+        crop_w = sw
+        crop_h = int(sw * 16 / 9)
+    else:
+        crop_h = max(sh, 1)
+        crop_w = int(sh * 9 / 16)
+    crop_w = max(int(crop_w * push_scale), 16)
+    crop_h = max(int(crop_h * push_scale), 16)
+    bg_cx = sx + sw // 2
+    bg_cy = sy + sh // 2
+    bg_x = min(max(bg_cx - crop_w // 2, 0), max(frame_width - crop_w, 0))
+    bg_y = min(max(bg_cy - crop_h // 2, 0), max(frame_height - crop_h, 0))
+    background = frame[bg_y:bg_y + crop_h, bg_x:bg_x + crop_w]
+    output = cv2.resize(background, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
+
+    # Foreground badge: face crop with margin (or the held last badge).
+    badge = None
+    if face_box is not None and face_center is not None:
+        fx, fy, fw, fh = face_box
+        side = int(max(fw, fh) * (1.0 + 2 * PIP_FACE_MARGIN_RATIO))
+        side = max(side, 16)
+        half = side // 2
+        bc_x = int(face_center[0])
+        bc_y = int(face_center[1])
+        bx = min(max(bc_x - half, 0), max(frame_width - side, 0))
+        by = min(max(bc_y - half, 0), max(frame_height - side, 0))
+        badge = frame[by:by + side, bx:bx + side].copy()
+    elif last_badge is not None:
+        badge = last_badge
+
+    if badge is not None:
+        d = max(int(out_w * PIP_BADGE_DIAMETER_RATIO), 32)
+        margin = max(10, int(out_w * PIP_BADGE_MARGIN_RATIO))
+        badge_cx = out_w - d // 2 - margin
+        badge_cy = d // 2 + margin
+        badge_sq = cv2.resize(badge, (d, d), interpolation=cv2.INTER_CUBIC)
+
+        mask = np.zeros((d, d), dtype=np.uint8)
+        cv2.circle(mask, (d // 2, d // 2), d // 2, 255, -1)
+        x0 = badge_cx - d // 2
+        y0 = badge_cy - d // 2
+        region = output[y0:y0 + d, x0:x0 + d]
+        sel = mask > 0
+        region[sel] = badge_sq[sel]
+
+        # White ring border on top of the badge edge
+        ring_w = max(2, d // 30)
+        cv2.circle(output, (badge_cx, badge_cy), d // 2 - ring_w // 2,
+                   (255, 255, 255), ring_w)
+
+    return output, badge
+
 def calculate_target_face_size(frame_width, frame_height):
     """Calculate a dynamic threshold for face size based on video resolution."""
     # For 1920x1080 videos, use 345 as base
@@ -763,6 +1114,47 @@ def generate_short(
         input_fps = cap.get(cv2.CAP_PROP_FPS)
         print(f"Input video: {frame_width}x{frame_height} at {input_fps} fps")
 
+        # Story 8: layout detection, once per clip, before the frame loop.
+        # Screencasts render as screen-filled 9:16 with a face-cam badge /
+        # motion-following zoom; talking heads keep the existing face crop.
+        framing_override = resolve_framing_override()
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        layout = LAYOUT_TALKING_HEAD
+        screen_region = (0, 0, frame_width, frame_height)
+        obs_boxes, obs_edge_density = [], 0.0
+        if framing_override == SCREENCAST_CLOSEUP:
+            print(f"FRAMING_MODE=closeup override: using talking-head framing")
+        else:
+            obs_boxes, obs_edge_density = collect_layout_observations(
+                cap, face_cascade, frame_width, frame_height, debug_faces=debug_faces
+            )
+            layout = detect_layout(
+                obs_boxes,
+                (frame_height, frame_width),
+                obs_edge_density,
+                forced_mode=framing_override,
+            )
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if layout == LAYOUT_SCREENCAST:
+                med = median_face_box(obs_boxes)
+                screen_region = screen_region_from_median_box(
+                    med, (frame_height, frame_width)
+                )
+                print(
+                    f"Layout: {layout} (median face box={med}, "
+                    f"screen region={screen_region}, "
+                    f"edge_density={obs_edge_density:.4f}, override={framing_override})"
+                )
+            else:
+                print(f"Layout: {layout} (override={framing_override})")
+
+        # Screencast render state
+        last_badge = None            # held badge crop for detection misses
+        prev_badge_center = None     # EMA-smoothed badge center
+        prev_zoom_gray = None        # previous gray frame for motion energy
+        prev_zoom_center = None      # EMA-smoothed screen-zoom center
+        prev_screencast_mode = None  # for mode-switch debug prints
+
         # Interval to switch faces (calculated based on input fps for 5 seconds)
         switch_interval = int(input_fps * 5)  # 5 seconds at input fps
         print(
@@ -807,6 +1199,88 @@ def generate_short(
             ret, frame = cap.read()
 
             if ret == True:
+                # Story 8: screencast rendering path (guarded; the talking-head
+                # path below is unchanged).
+                if layout == LAYOUT_SCREENCAST:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(
+                        gray, scaleFactor=1.1, minNeighbors=7, minSize=(100, 100)
+                    )
+                    face_box = None
+                    if faces is not None and len(faces) > 0:
+                        face_box = max(
+                            (tuple(int(v) for v in f) for f in faces),
+                            key=lambda b: b[2] * b[3],
+                        )
+
+                    sc_mode = resolve_screencast_mode(
+                        frame_count, input_fps, forced=framing_override
+                    )
+                    if sc_mode != prev_screencast_mode:
+                        if debug_faces:
+                            print(
+                                f"Screencast mode switch: {prev_screencast_mode} -> "
+                                f"{sc_mode} at frame {frame_count}"
+                            )
+                        prev_screencast_mode = sc_mode
+
+                    if sc_mode == SCREENCAST_PIP:
+                        # Background push-in over the whole clip duration
+                        progress = frame_count / total_frames if total_frames > 0 else 0.0
+                        push_scale = compute_push_in_scale(progress)
+
+                        raw_center = None
+                        if face_box is not None:
+                            fb_x, fb_y, fb_w, fb_h = face_box
+                            raw_center = (fb_x + fb_w // 2, fb_y + fb_h // 2)
+                        # EMA smoothing applied EVERY frame (not only when
+                        # frame_tracking_enabled)
+                        badge_center = smooth_center(prev_badge_center, raw_center)
+                        prev_badge_center = badge_center
+
+                        rendered, badge_crop = render_pip_frame(
+                            frame,
+                            screen_region,
+                            face_box,
+                            badge_center,
+                            push_scale=push_scale,
+                            last_badge=last_badge,
+                        )
+                        if badge_crop is not None:
+                            last_badge = badge_crop
+                        out.write(rendered)
+
+                        if thumb and not smile_found and face_box is not None:
+                            fb_x, fb_y, fb_w, fb_h = face_box
+                            smile_found, smile_frame = find_smile(
+                                frame[fb_y : fb_y + fb_h, fb_x : fb_x + fb_w],
+                                output_file,
+                            )
+                    else:
+                        # Screen-zoom: follow the point of maximum motion energy,
+                        # fallback to the screen-region center when negligible.
+                        motion_center = compute_motion_center(
+                            prev_zoom_gray, gray, (frame_height, frame_width)
+                        )
+                        if motion_center is None:
+                            ms_x, ms_y, ms_w, ms_h = screen_region
+                            motion_center = (ms_x + ms_w // 2, ms_y + ms_h // 2)
+                        zoom_center = smooth_center(prev_zoom_center, motion_center)
+                        prev_zoom_center = zoom_center
+
+                        crop_x, crop_y, crop_w9, crop_h9 = compute_screen_zoom_crop(
+                            screen_region, zoom_center, (frame_height, frame_width)
+                        )
+                        crop_img = frame[crop_y : crop_y + crop_h9, crop_x : crop_x + crop_w9]
+                        resized = cv2.resize(
+                            crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC
+                        )
+                        out.write(resized)
+
+                    prev_zoom_gray = gray.copy()
+                    frame_count += 1
+                    continue
+
                 # If we don't have any face positions, detect the faces
                 # Switch faces if it's time to do so
                 if frame_count % switch_interval == 0:
