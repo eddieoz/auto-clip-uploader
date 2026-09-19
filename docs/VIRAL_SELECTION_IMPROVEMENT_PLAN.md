@@ -85,7 +85,14 @@ scope until the dashboard exposes per-clip metrics.
 
 - Recency anchor and concluding-topic architecture preserved (constraint 1).
 - Exactly one published clip per capture (constraint 2).
-- Byte-identical OFF-path: any env gate (e.g. `TOPIC_BOUNDARY_LLM`, default off
-  or on per approval) must degrade to today's behavior when unavailable.
+- Graceful degradation: the `TOPIC_BOUNDARY_LLM` gate (default "true") switches
+  OFF the S2 topic-trim and the S5 mandatory-hook injection — when OFF or when
+  the LLM pass fails, the prompt reverts to the pre-change baseline and the hook
+  stays optional. S3 (sentence/pause boundary snapping) and S4 (deterministic
+  window validation against the resolved window) are **always-on safety nets**:
+  they only ever refine or clamp toward the resolved window and can never make a
+  clip worse, so they are not gated. This means `TOPIC_BOUNDARY_LLM=false` is
+  byte-identical for the LLM-driven decisions (S2/S5) but still benefits from
+  the deterministic refinements (S3/S4).
 - Output naming and publish-queue contract unchanged.
 - TDD, commit per story, tests force-added under `tests/`.
