@@ -245,8 +245,11 @@ class PostizPublisher:
         Returns:
             tuple: (video_path, formatted_content, metadata)
         """
-        # ONLY accept final-* prefixed files (complete: audio + video + subtitles + overlays)
-        final_videos = sorted(self.output_dir.glob("final-*.mp4"))
+        # Match renamed final videos (final_video_*.mp4) first, then fall back to
+        # original reelsfy output names (final-*.mp4) for backward compatibility.
+        final_videos = sorted(self.output_dir.glob("final_video_*.mp4"))
+        if not final_videos:
+            final_videos = sorted(self.output_dir.glob("final-*.mp4"))
         if final_videos:
             video_path = final_videos[0]
             self.logger.info(f"Using final video: {video_path.name}")

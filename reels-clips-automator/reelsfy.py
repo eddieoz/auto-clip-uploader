@@ -144,6 +144,11 @@ openai.api_key = api_key
 # Per-client base_url is set explicitly below via openai_base_url (None => default endpoint)
 
 
+def copy_input_to_tmp(source_path, dest_path):
+    """Stage the input video without a shell so paths with spaces stay intact."""
+    shutil.copy2(source_path, dest_path)
+
+
 def cleanup_tmp_directory(tmp_dir="tmp/", preserve_outputs=True):
     """
     Clean up temporary files after successful processing.
@@ -1913,8 +1918,7 @@ def __main__():
         video_id = os.path.basename(args.file).split(".")[0]
         print(f"Using video_id: {video_id}")
         if path.exists(args.file) == True:
-            command = f"cp {args.file} tmp/input_video.mp4"
-            subprocess.call(command, shell=True)
+            copy_input_to_tmp(args.file, "tmp/input_video.mp4")
         else:
             print(f"File {args.file} does not exist")
             sys.exit(1)
