@@ -304,12 +304,13 @@ class TestGenerateSegmentsAppliesPlan:
             reelsfy.generate_segments([self._segment()], jump_cut_plans=plans)
 
         command = call_mock.call_args[0][0]
-        # Identical to the current single-cut command (behavior-preserving).
+        # Same command shape as the no-plan single cut, now with the
+        # Story 9 fast seek (-ss/-to before -i).
         assert command == (
-            "ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 "
+            "ffmpeg -y -hwaccel cuda -ss 10.0 -to 40.0 -i tmp/input_video.mp4 "
             "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
             "-maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k "
-            "-ss 10.0 -to 40.0 tmp/Test_Segment000.mp4"
+            "tmp/Test_Segment000.mp4"
         )
         assert "concat" not in command
 

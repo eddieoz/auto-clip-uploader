@@ -198,6 +198,19 @@ class TestSingleApplicationInvariant:
             [[100, 100, 200, 200]], dtype=np.int32
         )
 
+        # Story 9: the primary path is ONE pipe command started via
+        # subprocess.Popen (raw frames in, NVENC + muxed audio out); the
+        # legacy merge chain only runs as fallback.
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait.return_value = 0
+
+        commands = []
+
+        def popen_command_recorder(command, *args, **kwargs):
+            commands.append(command)
+            return proc
+
         with patch.object(reelsfy.cv2, "VideoCapture", return_value=cap), patch.object(
             reelsfy.cv2, "VideoWriter"
         ), patch.object(reelsfy.cv2, "CascadeClassifier", return_value=cascade), patch.object(
@@ -205,30 +218,40 @@ class TestSingleApplicationInvariant:
         ), patch.object(
             reelsfy.cv2, "destroyAllWindows"
         ), patch.object(
+            reelsfy.subprocess, "Popen", side_effect=popen_command_recorder
+        ), patch.object(
             reelsfy.subprocess, "call"
         ) as call_mock, patch.object(
             reelsfy, "TalkingFaceDetector", return_value=detector
         ):
             reelsfy.generate_short("input.mp4", "output_reel.mp4", title="test")
 
-        return _commands_called(call_mock)
+        commands.extend(_commands_called(call_mock))
+        return commands
 
     def test_generate_short_merge_has_no_loudnorm(self):
         commands = self._generate_short_commands()
 
-        merge_commands = [cmd for cmd in commands if "final-" in cmd]
-        assert merge_commands, "generate_short must issue its final merge command"
-        for cmd in merge_commands:
+        # Story 9: the single-pass pipe command IS the encode/merge step.
+        pipe_commands = [cmd for cmd in commands if "-f rawvideo" in cmd]
+        assert pipe_commands, (
+            "generate_short must start the single-pass pipe encoder"
+        )
+        for cmd in pipe_commands:
             assert "loudnorm" not in cmd, (
-                "generate_short merge must not master audio"
+                "generate_short encode must not master audio"
             )
 
-    def test_generate_short_merge_keeps_audio_copy(self):
+    def test_generate_short_merges_audio_in_same_pass(self):
         commands = self._generate_short_commands()
 
-        merge_commands = [cmd for cmd in commands if "final-" in cmd]
-        for cmd in merge_commands:
-            assert "-c:a copy" in cmd
+        # Audio is muxed from the segment source via -map 1:a in the same
+        # pass (AAC 192k) instead of a separate extraction + -c:a copy merge.
+        pipe_commands = [cmd for cmd in commands if "-f rawvideo" in cmd]
+        for cmd in pipe_commands:
+            assert "-map 1:a" in cmd
+            assert "-c:a aac -b:a 192k" in cmd
+            assert "output-audio.aac" not in cmd
 
     def test_generate_segments_has_no_loudnorm(self):
         segments = [

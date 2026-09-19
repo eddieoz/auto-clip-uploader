@@ -115,6 +115,14 @@ def _make_detector(lookahead_result=0, single_result=0):
     return detector
 
 
+def _success_pipe_proc():
+    """Pipe ffmpeg process mock that starts fine and exits 0 (Story 9)."""
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.wait.return_value = 0
+    return proc
+
+
 def _run_generate_short(
     frame,
     cascade_boxes,
@@ -129,6 +137,10 @@ def _run_generate_short(
     Simulates a 1920x1080 @ fps video of `total_frames` frames. The sampler
     sees `cascade_boxes` for every sampled frame; the frame loop sees the
     same for every read frame. Returns (result, writer_mock, capsys capture).
+
+    Story 9: the primary encode path pipes frames into one ffmpeg pass, so
+    the returned `writer` is the mocked _PipeFrameWriter sink receiving the
+    rendered frames.
     """
     detector = _make_detector(lookahead_result=0, single_result=0)
 
@@ -155,6 +167,10 @@ def _run_generate_short(
         reelsfy.cv2, "VideoWriter", return_value=writer
     ), patch.object(reelsfy.cv2, "CascadeClassifier", return_value=cascade), patch.object(
         reelsfy.cv2, "destroyAllWindows"
+    ), patch.object(
+        reelsfy.subprocess, "Popen", return_value=_success_pipe_proc()
+    ), patch.object(
+        reelsfy, "_PipeFrameWriter", return_value=writer
     ), patch.object(
         reelsfy.subprocess, "call"
     ), patch.object(
@@ -618,6 +634,10 @@ class TestScreencastEndToEnd:
             reelsfy.cv2, "VideoWriter", return_value=writer
         ), patch.object(reelsfy.cv2, "CascadeClassifier", return_value=cascade), patch.object(
             reelsfy.cv2, "destroyAllWindows"
+        ), patch.object(
+            reelsfy.subprocess, "Popen", return_value=_success_pipe_proc()
+        ), patch.object(
+            reelsfy, "_PipeFrameWriter", return_value=writer
         ), patch.object(reelsfy.subprocess, "call"), patch.object(
             reelsfy, "TalkingFaceDetector", return_value=detector
         ):

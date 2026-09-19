@@ -66,12 +66,24 @@ def _make_detector(lookahead_result=None, single_result=None):
     return detector
 
 
+def _success_pipe_proc():
+    """Pipe ffmpeg process mock that starts fine and exits 0 (Story 9)."""
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.wait.return_value = 0
+    return proc
+
+
 def _run_generate_short(debug_faces=False, detector=None):
     """
     Run generate_short against mocked cv2 and subprocess.
 
     Simulates a 1920x1080 @ 30fps video that yields exactly one frame with one
     detected face, then ends. Returns (result, writer_mock, waitkey_mock).
+
+    Story 9: the primary encode path pipes frames into one ffmpeg pass, so
+    the returned `writer` is the mocked _PipeFrameWriter sink receiving the
+    rendered frames.
 
     Returns a tuple so tests can assert on the return value, on frames written,
     and on waitKey polling without touching real video files.
@@ -103,6 +115,10 @@ def _run_generate_short(debug_faces=False, detector=None):
         reelsfy.cv2, "waitKey"
     ) as waitkey_mock, patch.object(
         reelsfy.cv2, "destroyAllWindows"
+    ), patch.object(
+        reelsfy.subprocess, "Popen", return_value=_success_pipe_proc()
+    ), patch.object(
+        reelsfy, "_PipeFrameWriter", return_value=writer
     ), patch.object(
         reelsfy.subprocess, "call"
     ), patch.object(

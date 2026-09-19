@@ -489,6 +489,21 @@ def _build_multi_piece_command(pieces, output_file):
     )
 
 
+def build_single_piece_command(start_time, end_time, output_file):
+    """Shell command cutting one segment from tmp/input_video.mp4.
+
+    -ss/-to sit BEFORE -i (fast seek; frame-accurate when re-encoding) so
+    ffmpeg no longer decodes the entire source per cut. NVENC output
+    settings are identical to the multi-piece builder."""
+    return (
+        "ffmpeg -y -hwaccel cuda "
+        f"-ss {start_time} -to {end_time} -i tmp/input_video.mp4 "
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k "
+        f"tmp/{output_file}"
+    )
+
+
 def generate_segments(response, jump_cut_plans=None):
     plans = jump_cut_plans or {}
     for i, segment in enumerate(response):
@@ -519,7 +534,7 @@ def generate_segments(response, jump_cut_plans=None):
             )
             command = _build_multi_piece_command(pieces, str(output_file))
         else:
-            command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
+            command = build_single_piece_command(start_time, end_time, str(output_file))
         subprocess.call(command, shell=True)
 
 
@@ -1049,6 +1064,58 @@ def calculate_target_face_size(frame_width, frame_height):
     scaled_threshold = int(base_threshold * scale_factor)
     return max(min_threshold, min(scaled_threshold, max_threshold))
 
+
+def build_pipe_ffmpeg_command(sanitized_input, sanitized_output, input_fps):
+    """Single-encode command for generate_short (Story 9).
+
+    Rendered BGR frames arrive on stdin (`-f rawvideo`); the segment input
+    supplies the audio via the second -i + -map 1:a. Video is encoded ONCE
+    with the existing NVENC settings and normalized to 30 fps; audio is
+    re-encoded to AAC 192k in the same pass. No mp4v intermediate, no
+    separate merge step."""
+    return (
+        "ffmpeg -y "
+        f"-f rawvideo -pix_fmt bgr24 -s 1080x1920 -r {input_fps} -i pipe:0 "
+        f"-i tmp/{sanitized_input} "
+        "-map 0:v -map 1:a "
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k "
+        "-r 30 -pix_fmt yuv420p "
+        "-c:a aac -b:a 192k "
+        f"tmp/{sanitized_output}"
+    )
+
+
+class _PipeFrameWriter:
+    """Frame sink that pipes raw BGR frames into a running ffmpeg process.
+
+    Replaces cv2.VideoWriter on the primary (single-encode) path; both the
+    screencast continue-branch and the talking-head path call write() with
+    a BGR numpy frame, which is streamed to the encoder's stdin. A broken
+    pipe is remembered (failed) instead of spewing per-frame errors; the
+    caller decides whether to fall back to the legacy encode chain."""
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.failed = False
+
+    def write(self, frame):
+        if self.failed:
+            return
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except Exception as e:
+            self.failed = True
+            print(f"Warning: frame pipe broke ({e}); skipping remaining frames")
+
+    def release(self):
+        try:
+            self.proc.stdin.close()
+        except Exception as e:
+            print(f"Warning: closing frame pipe failed: {e}")
+        self.proc.wait()
+
+
 def generate_short(
     input_file,
     output_file,
@@ -1059,6 +1126,7 @@ def generate_short(
     thumb_dir="",
     debug_faces=False,
     performance_profile=False,
+    _pipe=True,
 ):
     try:
         # Sanitize input and output file names
@@ -1165,11 +1233,36 @@ def generate_short(
         target_face_size = calculate_target_face_size(frame_width, frame_height)
         print(f"Dynamic target face size threshold: {target_face_size}")
 
-        # Define the codec and create VideoWriter object
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(
-            f"tmp/{sanitized_output}", fourcc, input_fps, (1080, 1920), True
-        )  # Use input fps
+        # Story 9: single-encode path. OpenCV stays the reader/decoder and
+        # all rendering logic is unchanged; rendered BGR frames are piped to
+        # ONE ffmpeg pass (NVENC + muxed audio + 30 fps normalize). The
+        # legacy mp4v VideoWriter + audio-merge chain is kept intact and
+        # used when the pipe process cannot start (and, via re-render, when
+        # it exits nonzero).
+        pipe_proc = None
+        out = None
+        if _pipe:
+            pipe_command = build_pipe_ffmpeg_command(
+                sanitized_input, f"final-{sanitized_output}", input_fps
+            )
+            print(f"Single-pass encode command: {pipe_command}")
+            try:
+                pipe_proc = subprocess.Popen(
+                    pipe_command, shell=True, stdin=subprocess.PIPE
+                )
+                out = _PipeFrameWriter(pipe_proc)
+            except Exception as e:
+                pipe_proc = None
+                print(
+                    f"Warning: could not start single-pass encoder ({e}); "
+                    "falling back to legacy mp4v + merge path"
+                )
+        if pipe_proc is None:
+            # Legacy path: define the codec and create VideoWriter object.
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(
+                f"tmp/{sanitized_output}", fourcc, input_fps, (1080, 1920), True
+            )  # Use input fps
         face_positions = []
         smile_found = False
         boxes = None
@@ -1646,13 +1739,37 @@ def generate_short(
         out.release()
         cv2.destroyAllWindows()
 
-        # Extract audio from original video
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_input} -vn -c:a aac -b:a 192k tmp/output-audio.aac"
-        subprocess.call(command, shell=True)
+        if pipe_proc is not None:
+            exit_code = pipe_proc.returncode
+            if exit_code is None or exit_code != 0:
+                print(
+                    f"Single-pass encode failed (exit code {exit_code}); "
+                    "falling back to legacy mp4v + merge path"
+                )
+                # Re-render through the legacy chain; the pipe consumed the
+                # frames, so the legacy writer needs a fresh pass. The
+                # recursive call skips the pipe entirely.
+                return generate_short(
+                    input_file,
+                    output_file,
+                    title,
+                    upscale,
+                    enhance,
+                    thumb,
+                    thumb_dir,
+                    debug_faces,
+                    performance_profile,
+                    _pipe=False,
+                )
+            # Success: the single pass already produced tmp/final-{output}.
+        else:
+            # Legacy encode chain (fallback / _pipe=False): extract audio
+            # from the original video, then merge audio and processed video.
+            command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_input} -vn -c:a aac -b:a 192k tmp/output-audio.aac"
+            subprocess.call(command, shell=True)
 
-        # Merge audio and processed video with better quality
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
-        subprocess.call(command, shell=True)
+            command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
+            subprocess.call(command, shell=True)
 
         # Save performance report if profiling is enabled
         if profiler is not None:
