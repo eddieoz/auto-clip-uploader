@@ -2132,6 +2132,163 @@ For {title_language} content, ensure cultural appropriateness and natural langua
 
 Return ONLY the JSON object without markdown formatting."""
 
+def resolve_topic_boundary_llm_enabled():
+    """S2 gate: TOPIC_BOUNDARY_LLM defaults to "true"; only the literal
+    "false" (any case) disables the topic-start LLM pass."""
+    enabled_raw = os.getenv('TOPIC_BOUNDARY_LLM', 'true').lower().strip()
+    enabled = enabled_raw != 'false'
+    if not enabled:
+        print("Topic boundary LLM disabled (TOPIC_BOUNDARY_LLM=false); keeping optimized window unchanged")
+    return enabled
+
+
+def _srt_like_to_seconds(value):
+    """Convert an SRT timestamp (HH:MM:SS,mmm) or bare seconds value into
+    float seconds. Returns None when the value cannot be interpreted."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        if "," in text or ":" in text:
+            return parse_srt_time(text)
+        return float(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _segment_start_srt(segment):
+    """Pick a printable start timestamp for a cue entry.
+
+    TopicAnalyzer's segment dicts carry SRT strings under 'start_time_srt'
+    and float seconds under 'start_time'; both shapes are handled so the
+    cue list always shows a timestamp."""
+    if not isinstance(segment, dict):
+        return ""
+    for key in ('start_time_srt', 'start_time'):
+        value = segment.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    start = segment.get('start_time')
+    if isinstance(start, (int, float)):
+        return format_timestamp(float(start))
+    return ""
+
+
+def _segment_start_seconds(segment):
+    """Numeric start (float seconds) of a segment dict, or None."""
+    if not isinstance(segment, dict):
+        return None
+    value = segment.get('start_time')
+    if value is None:
+        value = segment.get('start_time_srt')
+    return _srt_like_to_seconds(value)
+
+
+def resolve_topic_start_cue(transcript_content, segments):
+    """S2: ask the LLM where the FINAL topic begins in the capture.
+
+    Replay-buffer captures are <= 90 s and the final topic concludes at the
+    end, but the capture's start often holds the PREVIOUS topic's tail. The
+    numbered cue list below covers the full capture (nothing is truncated)
+    and the model must answer with the first cue that belongs to the final
+    topic.
+
+    Returns the 1-based cue index, or None on any failure (exception,
+    unparseable reply, out-of-range index) so the pipeline degrades to
+    today's untrimmed optimized window. Never raises.
+    """
+    if not segments:
+        print("Topic boundary LLM: no segments available; keeping window unchanged")
+        return None
+    if not resolve_topic_boundary_llm_enabled():
+        return None
+
+    # Cues come from the analyzed segments, which span the entire capture.
+    cue_lines = []
+    for index, segment in enumerate(segments, start=1):
+        text = segment.get('text', '') if isinstance(segment, dict) else ''
+        cue_lines.append(f"cue {index}: {_segment_start_srt(segment)} {text}")
+    prompt = f"""The following numbered cues cover a short video capture from its start to its end (nothing was cut):
+
+{chr(10).join(cue_lines)}
+
+The FINAL topic of this capture CONCLUDES at the end of the capture. Any cue text at the very beginning may still belong to the PREVIOUS topic.
+
+Return ONLY the cue number where the FINAL topic BEGINS — the first cue that belongs to the final topic, not the previous topic's tail. Respond with a single integer and nothing else."""
+
+    system = """You identify topic boundaries in video transcripts. You receive numbered cues covering a full short capture and must return only the cue number where the final topic begins."""
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        print(f"Topic boundary LLM: resolving final-topic start across {len(segments)} cues...")
+        client = openai.OpenAI(api_key=api_key, base_url=openai_base_url)
+        response = client.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
+        )
+
+        content = response.choices[0].message.content
+        content = content.replace("```json", "").replace("```", "").strip()
+
+        match = re.search(r"-?\d+", content)
+        if not match:
+            print(f"Topic boundary LLM: unparseable reply \"{content[:80]}\"; keeping window unchanged")
+            return None
+        cue_index = int(match.group())
+        if not (1 <= cue_index <= len(segments)):
+            print(f"Topic boundary LLM: cue index {cue_index} outside 1..{len(segments)}; keeping window unchanged")
+            return None
+        print(f"Topic boundary LLM: final topic begins at cue {cue_index}")
+        return cue_index
+    except Exception as e:
+        print(f"Topic boundary LLM pass failed ({e}); keeping window unchanged")
+        return None
+
+
+def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments, segments):
+    """Move the optimized window start to the resolved final-topic cue.
+
+    The end time and concluding topic are untouched — the recency anchor
+    (the final topic still concludes near the capture's end) is preserved.
+    A cue that is not strictly after the current window start leaves the
+    window unchanged, and supporting segments that begin before the new
+    window start are dropped. Returns the (optimized, supporting) pair.
+    """
+    if not isinstance(cue_index, int) or isinstance(cue_index, bool):
+        return optimized_segment, supporting_segments
+    if not (1 <= cue_index <= len(segments)):
+        return optimized_segment, supporting_segments
+
+    cue = segments[cue_index - 1]
+    cue_seconds = _segment_start_seconds(cue)
+    window_seconds = _srt_like_to_seconds(optimized_segment.get('start_time'))
+    end_seconds = _srt_like_to_seconds(optimized_segment.get('end_time'))
+    if cue_seconds is None or window_seconds is None or end_seconds is None:
+        print("Topic boundary LLM: could not compare cue/window timestamps; keeping window unchanged")
+        return optimized_segment, supporting_segments
+    if cue_seconds <= window_seconds:
+        print(f"Topic boundary LLM: cue {cue_index} starts at or before the window start; keeping window unchanged")
+        return optimized_segment, supporting_segments
+
+    previous_start = optimized_segment.get('start_time')
+    optimized_segment['start_time'] = _segment_start_srt(cue)
+    optimized_segment['duration'] = end_seconds - cue_seconds
+
+    trimmed_supporting = []
+    for segment in supporting_segments:
+        segment_seconds = _segment_start_seconds(segment)
+        if segment_seconds is None or segment_seconds >= cue_seconds:
+            trimmed_supporting.append(segment)
+
+    print(f"✂️ Topic boundary trim: window start {previous_start} → {optimized_segment['start_time']} (cue {cue_index}); supporting segments {len(supporting_segments)} → {len(trimmed_supporting)}")
+    return optimized_segment, trimmed_supporting
+
+
 def generate_viral(
     transcript_content,
     audio_path=None,
@@ -2230,7 +2387,22 @@ def generate_viral(
         optimized_segment = topic_analysis['optimized_segment']
         concluding_topic = topic_analysis['concluding_topic']
         supporting_segments = topic_analysis['supporting_segments']
-        
+
+        # S2: LLM topic-start pass — the capture's start often holds the tail
+        # of the previous topic. Resolve where the final topic begins and trim
+        # the window start to that cue; any failure keeps the window exactly
+        # as analyzed above. The end time (recency anchor) is untouched.
+        cue_index = resolve_topic_start_cue(
+            transcript_content, topic_analysis['segments']
+        )
+        if cue_index is not None:
+            optimized_segment, supporting_segments = trim_window_to_topic_start(
+                cue_index,
+                optimized_segment,
+                supporting_segments,
+                topic_analysis['segments'],
+            )
+
         # Create content description based on optimized segment
         segment_info = {
             "start_time": optimized_segment['start_time'],
