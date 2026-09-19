@@ -163,6 +163,10 @@ def _run_generate_short(
     cascade.detectMultiScale.side_effect = _content_based_boxes
 
     writer = MagicMock()
+    # The pipe writer contract (final-fix B): `failed` flags a broken
+    # frame pipe; the stub must model it so a healthy run is not
+    # misread as a mid-run encoder death.
+    writer.failed = False
 
     patches = [
         patch.object(reelsfy.cv2, "VideoCapture", return_value=cap),

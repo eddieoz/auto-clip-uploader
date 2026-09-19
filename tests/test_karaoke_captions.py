@@ -373,3 +373,64 @@ class TestGenerateSubtitleFallback:
         # No transcription available -> video written without subtitles,
         # function reports failure (ffmpeg mocked return code 1).
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# collect_segment_words: direct unit tests (final-fix F). The helper is
+# load-bearing for karaoke captions AND jump-cut remapping but previously
+# only had indirect coverage.
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSegmentWords:
+    SEGMENTS = [
+        {
+            "words": [
+                {"word": "before", "start": 9.0, "end": 9.4},
+                {"word": "overlap", "start": 9.8, "end": 10.2},
+                {"word": "hello", "start": 10.5, "end": 11.0},
+                {"word": "world", "start": 11.5, "end": 12.0},
+                {"word": "edge", "start": 11.8, "end": 12.2},
+                {"word": "after", "start": 12.5, "end": 13.0},
+            ]
+        }
+    ]
+
+    def _collect(self, segments="default", start="00:00:10,000", end="00:00:12,000"):
+        return reelsfy.collect_segment_words(
+            self.SEGMENTS if segments == "default" else segments, start, end
+        )
+
+    def test_selects_in_range_words_shifted_to_clip_relative(self):
+        words = self._collect()
+
+        by_word = {w["word"]: (w["start"], w["end"]) for w in words}
+        assert by_word["hello"] == (0.5, 1.0)
+        assert by_word["world"] == (1.5, 2.0)
+        # Words outside the segment range are excluded
+        assert "before" not in by_word
+        assert "after" not in by_word
+
+    def test_word_overlapping_seg_start_inclusive_midpoint(self):
+        # "overlap" spans seg_start (9.8-10.2): its midpoint sits exactly
+        # on seg_start, so it is selected and its negative shift clamps
+        # to 0.0 (clip-relative times are never negative).
+        words = self._collect()
+
+        by_word = {w["word"]: (w["start"], w["end"]) for w in words}
+        assert by_word["overlap"] == pytest.approx((0.0, 0.2))
+
+    def test_word_ending_exactly_at_seg_end_included(self):
+        # "world" ends exactly on seg_end (12.0) and is inside; "edge"
+        # has its midpoint exactly on seg_end and is also inclusive.
+        words = self._collect()
+
+        by_word = {w["word"]: (w["start"], w["end"]) for w in words}
+        assert by_word["world"] == pytest.approx((1.5, 2.0))
+        assert by_word["edge"] == pytest.approx((1.8, 2.2))
+
+    def test_none_or_empty_words_input_returns_none(self):
+        assert self._collect(segments=None) is None
+        assert self._collect(segments=[]) is None
+        assert self._collect(segments=[{"words": []}]) is None
+        assert self._collect(segments=[{}]) is None

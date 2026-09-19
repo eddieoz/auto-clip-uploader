@@ -1219,6 +1219,12 @@ def generate_short(
     thumb_text=None,
     _pipe=True,
 ):
+    # Fix C: initialized up-front so the error handler can clean up the
+    # encoder child (and the capture/writer) no matter where the failure
+    # happens — including inside the frame loop.
+    cap = None
+    out = None
+    pipe_proc = None
     try:
         # Sanitize input and output file names
         sanitized_input = sanitize_filename(os.path.splitext(input_file)[0]) + os.path.splitext(input_file)[1]
@@ -1842,11 +1848,20 @@ def generate_short(
 
         if pipe_proc is not None:
             exit_code = pipe_proc.returncode
-            if exit_code is None or exit_code != 0:
+            # Fix B: a zero exit code with a failed frame pipe means ffmpeg
+            # died mid-run and the output is truncated — it must fall back
+            # to the legacy re-render instead of publishing as success.
+            if exit_code is None or exit_code != 0 or out.failed:
                 print(
-                    f"Single-pass encode failed (exit code {exit_code}); "
+                    f"Single-pass encode failed (exit code {exit_code}, "
+                    f"frame pipe failed: {out.failed}); "
                     "falling back to legacy mp4v + merge path"
                 )
+                # The truncated partial must not survive as a stale
+                # "success" if the fallback below fails.
+                partial_output = f"tmp/final-{sanitized_output}"
+                if os.path.exists(partial_output):
+                    os.remove(partial_output)
                 # Re-render through the legacy chain; the pipe consumed the
                 # frames, so the legacy writer needs a fresh pass. The
                 # recursive call skips the pipe entirely.
@@ -1890,6 +1905,21 @@ def generate_short(
 
     except Exception as e:
         print(f"Error during video cropping: {str(e)}")
+        # Fix C: never leak the NVENC child (it holds tmp/final-* open).
+        # Closing stdin gives ffmpeg EOF; kill+wait guarantees the process
+        # is gone and reaped. The legacy writer just needs releasing.
+        if cap is not None:
+            cap.release()
+        if out is not None:
+            if pipe_proc is not None:
+                try:
+                    pipe_proc.stdin.close()
+                except Exception as close_error:
+                    print(f"Warning: closing frame pipe failed: {close_error}")
+                pipe_proc.kill()
+                pipe_proc.wait()
+            out.release()
+        cv2.destroyAllWindows()
 
 
 def build_segment_json_template():
@@ -3202,8 +3232,13 @@ AUDIO_MASTERING_FILTER = (
 
 
 def build_audio_filter_args():
-    """Shell fragment mastering the audio stream and re-encoding it to AAC."""
-    return f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k'
+    """Shell fragment mastering the audio stream and re-encoding it to AAC.
+
+    -ar 48000 pins the output rate: loudnorm processes at 192k internally
+    and would otherwise leave the AAC rate unpredictable, so the end-card
+    concat rungs (and the -c:a copy rung) could fail on differing stream
+    parameters."""
+    return f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k -ar 48000'
 
 
 # Polish features (Story 10 / P3.1-P3.3): mild visual grade on the main clip,
@@ -3238,7 +3273,7 @@ def resolve_video_grade():
         print(
             f"Visual grade: using VIDEO_LUT '{lut_path}' instead of eq/unsharp"
         )
-        return f"lut3d='{lut_path}'"
+        return f"lut3d='{escape_filter_option(lut_path)}'"
     grade_raw = os.getenv('VIDEO_GRADE', 'true').lower().strip()
     if grade_raw == 'false':
         print("Visual grade disabled (VIDEO_GRADE=false)")
@@ -3279,21 +3314,44 @@ def resolve_end_card_enabled():
     return enabled
 
 
+def escape_filter_option(text):
+    """Escape a user-set string for use inside a single-quoted ffmpeg
+    filter option value (drawtext text=..., lut3d file=...) that sits in
+    a shell double-quoted argument.
+
+    The value crosses the shell, the filtergraph parser (whose option
+    splitter is quote-blind) and the filter's own option parser, so each
+    special is written in the doubled form verified byte-exact against
+    ffmpeg 6.1 for BOTH drawtext and lut3d: backslash and colon doubled,
+    a literal quote as close-escape-reopen, and a double quote escaped
+    for the shell. '%' is left alone — pair with drawtext's
+    expansion=none, which keeps it verbatim."""
+    text = str(text)
+    text = text.replace("\\", r"\\\\")
+    text = text.replace("'", r"\\'\''")
+    text = text.replace(":", r"\\:")
+    text = text.replace('"', r'\"')
+    return text
+
+
 def build_end_card_command():
     """Pure builder for the 1.5 s end-card clip command.
 
     1080x1920 solid color (END_CARD_COLOR) with the CTA text (END_CARD_TEXT)
     centered via drawtext (OVERLAY_FONTFILE, fontsize 64, white, black
-    outline) plus a 0.4 s fade-in. Audio is a silent anullsrc encoded as AAC
-    44100 Hz stereo (the main audio's sample rate is not knowable reliably;
-    the assembly fallback ladder handles compatibility). NVENC settings match
+    outline, expansion=none so the CTA text renders verbatim) plus a
+    0.4 s fade-in. Audio is a silent anullsrc (44.1k) encoded
+    as AAC 48000 Hz stereo so both sides of the concat agree with the
+    mastering args' pinned -ar 48000. NVENC settings match
     the other concat pieces, and the end card is silent-sourced so no
     mastering filter ever touches it.
     """
     color = os.getenv('END_CARD_COLOR', END_CARD_DEFAULT_COLOR).strip()
-    text = os.getenv('END_CARD_TEXT', END_CARD_DEFAULT_TEXT)
+    text = escape_filter_option(
+        os.getenv('END_CARD_TEXT', END_CARD_DEFAULT_TEXT)
+    )
     drawtext = (
-        f"drawtext=text='{text}':fontfile={OVERLAY_FONTFILE}:"
+        f"drawtext=text='{text}':expansion=none:fontfile={OVERLAY_FONTFILE}:"
         f"fontsize={END_CARD_FONT_SIZE}:fontcolor=white:"
         "borderw=3:bordercolor=black:x=(w-tw)/2:y=(h-th)/2"
     )
@@ -3304,7 +3362,7 @@ def build_end_card_command():
         f"-vf \"{drawtext},fade=t=in:st=0:d={END_CARD_FADE_SECONDS}\" "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
-        "-c:a aac -b:a 192k -ar 44100 -ac 2 -shortest "
+        "-c:a aac -b:a 192k -ar 48000 -ac 2 -shortest "
         f"tmp/{END_CARD_FILE}"
     )
 

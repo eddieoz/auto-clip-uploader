@@ -307,6 +307,92 @@ class TestGenerateShortFallback:
 
         assert result == "tmp/final-output_reel.mp4"
 
+    def test_pipe_writer_failed_flag_falls_back_to_legacy(self, short_env):
+        # Final-fix B: ffmpeg can die mid-run while still exiting 0 —
+        # the writer remembers the broken pipe instead of the exit code
+        # lying about success. A truncated video must not be published.
+        short_env["proc"].stdin.write.side_effect = Exception("pipe broke")
+
+        result = short_env["run"]()
+
+        assert short_env["popen"].call_count == 1
+        short_env["writer_cls"].assert_called_once()
+
+        commands = _legacy_commands_of(short_env)
+        merges = [c for c in commands if "final-" in c]
+        assert merges, "legacy merge must run after the frame pipe broke"
+        assert merges[0].strip().endswith("tmp/final-output_reel.mp4")
+
+        assert result == "tmp/final-output_reel.mp4"
+
+    def test_pipe_writer_failed_flag_removes_partial_output(self, short_env):
+        # The truncated tmp/final-* output must not survive as a stale
+        # success if the fallback re-render fails downstream.
+        short_env["proc"].stdin.write.side_effect = Exception("pipe broke")
+
+        with patch.object(
+            reelsfy.os.path, "exists", return_value=True
+        ), patch.object(reelsfy.os, "remove") as remove_mock:
+            result = short_env["run"]()
+
+        remove_mock.assert_called_once_with("tmp/final-output_reel.mp4")
+        assert result == "tmp/final-output_reel.mp4"
+
+
+class TestFrameLoopExceptionCleanup:
+    """Final-fix C: an exception escaping the frame loop must not leak
+    the NVENC child (it holds tmp/final-* open). Stdin is closed and the
+    child is terminated/waited, and the error is NOT reported as success."""
+
+    def test_exception_in_frame_loop_cleans_up_child(self, short_env):
+        proc = short_env["proc"]
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.side_effect = [(True, frame), Exception("corrupt frame")]
+        cap.get.side_effect = lambda attr: {
+            cv2.CAP_PROP_FRAME_WIDTH: 1920.0,
+            cv2.CAP_PROP_FRAME_HEIGHT: 1080.0,
+            cv2.CAP_PROP_FPS: 30.0,
+        }.get(attr, 0.0)
+
+        # Inner patch overrides the fixture's fresh-capture side_effect for
+        # this run only (the fixture restores its own patch afterwards).
+        with patch.object(reelsfy.cv2, "VideoCapture", return_value=cap):
+            result = short_env["run"]()
+
+        # Child cleaned up: stdin closed (ffmpeg sees EOF), then killed and
+        # reaped so nothing keeps the output file open.
+        assert proc.stdin.close.called
+        assert proc.kill.called
+        assert proc.wait.called
+        # The failure is not published as success.
+        assert result is None
+
+    def test_exception_in_frame_loop_closes_stdin_before_kill(self, short_env):
+        # stdin.close must precede kill: ffmpeg needs EOF to finalize the
+        # container when the loop ends cleanly on an error elsewhere.
+        order = []
+        proc = short_env["proc"]
+        proc.stdin.close.side_effect = lambda: order.append("close")
+        proc.kill.side_effect = lambda: order.append("kill")
+        proc.wait.side_effect = lambda: order.append("wait")
+
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.side_effect = [(True, frame), Exception("corrupt frame")]
+        cap.get.side_effect = lambda attr: {
+            cv2.CAP_PROP_FRAME_WIDTH: 1920.0,
+            cv2.CAP_PROP_FRAME_HEIGHT: 1080.0,
+            cv2.CAP_PROP_FPS: 30.0,
+        }.get(attr, 0.0)
+
+        with patch.object(reelsfy.cv2, "VideoCapture", return_value=cap):
+            short_env["run"]()
+
+        assert order[:3] == ["close", "kill", "wait"]
+
 
 class TestReturnValueContract:
     """Story 1 contract intact: success returns tmp/final-{output}."""

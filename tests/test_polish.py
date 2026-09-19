@@ -177,6 +177,20 @@ class TestGradeInGenerateSubtitle:
         # Captions still burn on top of the LUT
         assert command.index("lut3d=") < command.index("subtitles=")
 
+    def test_video_lut_filter_specials_escaped(self, monkeypatch):
+        # Final-fix D: the user-set LUT path goes into lut3d='...'; spaces
+        # survive inside the quotes, but ' and : must be escaped so the
+        # filtergraph parser cannot split the filename. Expected form
+        # verified against ffmpeg 6.1 with the LUT file actually on disk.
+        _clear_polish_env(monkeypatch)
+        monkeypatch.setenv("VIDEO_LUT", "luts/warm grade's:sun.cube")
+
+        result = reelsfy.resolve_video_grade()
+
+        expected = "lut3d='" + r"luts/warm grade\\'\''s\\:sun.cube" + "'"
+        assert expected in result
+        assert "eq=" not in result
+
 
 class TestResolveMusicBed:
     """P3.3: pure env resolution for the music bed path."""
@@ -262,10 +276,11 @@ class TestEndCardCommand:
         assert "y=(h-th)/2" in command
         # Fade-in
         assert "fade=t=in:st=0:d=0.4" in command
-        # Silent AAC audio at 44100 Hz stereo
+        # Silent AAC audio, pinned to the same rate as the mastering args
+        # (anullsrc source stays at 44100; ffmpeg resamples to the -ar rate)
         assert "anullsrc=r=44100:cl=stereo" in command
         assert "-c:a aac" in command
-        assert "-ar 44100" in command
+        assert "-ar 48000" in command
         assert "-ac 2" in command
         # Same NVENC settings as the other concat pieces
         assert "h264_nvenc" in command
@@ -281,6 +296,52 @@ class TestEndCardCommand:
 
         assert "color=c=0xFFFFFF" in command
         assert "drawtext=text='Subscribe now'" in command
+
+    def test_end_card_audio_rate_matches_mastering_args(self, monkeypatch):
+        # Final-fix A: the concat rungs only line up when both sides of the
+        # assembly encode the same AAC sample rate.
+        _clear_polish_env(monkeypatch)
+
+        command = reelsfy.build_end_card_command()
+        mastering_args = reelsfy.build_audio_filter_args()
+
+        assert "-ar 48000" in command
+        assert "-ar 48000" in mastering_args
+
+    def test_env_text_with_filter_specials_is_escaped(self, monkeypatch):
+        # Final-fix D: user-set text goes into a drawtext text='...'
+        # filter value; the filtergraph specials must be escaped or the
+        # command breaks (or injects extra filter options). Expected
+        # forms verified byte-exact against ffmpeg 6.1: backslash and
+        # colon doubled, quote as close-escape-reopen; '%' verbatim via
+        # expansion=none.
+        monkeypatch.setenv("END_CARD_TEXT", "It's a: 100% test")
+
+        command = reelsfy.build_end_card_command()
+
+        expected = "drawtext=text='" + r"It\\'\''s a\\: 100% test" + "'"
+        assert expected in command
+        assert "expansion=none" in command
+
+    def test_env_text_escaping_runs_backslash_first(self, monkeypatch):
+        # A literal backslash must be doubled before quote/colon escaping,
+        # otherwise the introduced escapes get double-escaped.
+        monkeypatch.setenv("END_CARD_TEXT", "a\\:b")
+
+        command = reelsfy.build_end_card_command()
+
+        expected = "drawtext=text='a" + ("\\" * 6) + ":b'"
+        assert expected in command
+
+    def test_env_text_with_double_quote_is_shell_escaped(self, monkeypatch):
+        # The -vf argument is shell double-quoted, so a literal double
+        # quote in the CTA text must be backslash-escaped for the shell.
+        monkeypatch.setenv("END_CARD_TEXT", 'Vem "agora"')
+
+        command = reelsfy.build_end_card_command()
+
+        expected = "drawtext=text='" + 'Vem \\"agora\\"' + "'"
+        assert expected in command
 
 
 class TestGenerateEndCard:

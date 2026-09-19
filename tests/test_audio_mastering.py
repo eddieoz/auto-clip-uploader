@@ -107,6 +107,10 @@ class TestFilterChainDefinition:
         assert f'-af "{EXPECTED_CHAIN}"' in args
         assert "-c:a aac" in args
         assert "-b:a 192k" in args
+        # Final-fix A: the sample rate is pinned so loudnorm's internal
+        # 192k processing rate cannot leak an unpredictable AAC rate into
+        # the concat rungs.
+        assert "-ar 48000" in args
 
     def test_build_audio_filter_args_drops_audio_copy(self):
         args = reelsfy.build_audio_filter_args()
@@ -265,7 +269,12 @@ class TestSingleApplicationInvariant:
         with patch.object(reelsfy.subprocess, "call") as call_mock:
             reelsfy.generate_segments(segments)
 
-        for cmd in _commands_called(call_mock):
+        commands = _commands_called(call_mock)
+        # Non-vacuity guard: the invariant below is meaningless if the
+        # harness captured no command strings (or empty ones).
+        assert commands, "generate_segments must issue at least one command"
+        for cmd in commands:
+            assert cmd, "command under test must be non-empty"
             assert "loudnorm" not in cmd, (
                 "generate_segments must not master audio"
             )
