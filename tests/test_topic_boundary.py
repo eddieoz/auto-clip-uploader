@@ -323,12 +323,19 @@ class TestWiringInvariants:
         assert "TOPIC_BOUNDARY_LLM" in REELSFY_SOURCE
         assert "os.getenv('TOPIC_BOUNDARY_LLM', 'true')" in REELSFY_SOURCE
 
-    def test_primary_path_calls_resolve_before_segment_info(self):
+    def test_primary_path_calls_resolve_before_window_is_consumed(self):
+        """S3: resolve → trim → snap → the resolved window reaches the live
+        prompt's RESOLVED TOPIC WINDOW section (the former segment_info /
+        content-centric prompt build was dead code and has been removed)."""
         primary_marker = "Using Topic-Focused Content Generation"
         primary_start = REELSFY_SOURCE.index(primary_marker)
         resolve_call = REELSFY_SOURCE.find("resolve_topic_start_cue(", primary_start)
-        segment_info = REELSFY_SOURCE.find("segment_info = {", primary_start)
-        assert 0 < resolve_call < segment_info
+        trim_call = REELSFY_SOURCE.find("trim_window_to_topic_start(", primary_start)
+        snap_call = REELSFY_SOURCE.find("snap_window_to_boundaries(", primary_start)
+        resolved_section = REELSFY_SOURCE.find(
+            "RESOLVED TOPIC WINDOW", primary_start
+        )
+        assert 0 < resolve_call < trim_call < snap_call < resolved_section
 
     def test_trim_applied_on_primary_path(self):
         primary_marker = "Using Topic-Focused Content Generation"

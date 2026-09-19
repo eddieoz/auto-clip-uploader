@@ -2289,6 +2289,198 @@ def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments
     return optimized_segment, trimmed_supporting
 
 
+def _cue_bounds(cue):
+    """(start, end) float seconds of a TopicAnalyzer cue dict, or (None, None).
+
+    Cue dicts are dual-shape: floats under 'start_time'/'end_time' (or bare
+    'start'/'end'), SRT strings under 'start_time_srt'/'end_time_srt'."""
+    if not isinstance(cue, dict):
+        return None, None
+    start = _srt_like_to_seconds(cue.get('start_time'))
+    if start is None:
+        start = _srt_like_to_seconds(cue.get('start_time_srt'))
+    if start is None:
+        start = _srt_like_to_seconds(cue.get('start'))
+    end = _srt_like_to_seconds(cue.get('end_time'))
+    if end is None:
+        end = _srt_like_to_seconds(cue.get('end_time_srt'))
+    if end is None:
+        end = _srt_like_to_seconds(cue.get('end'))
+    return start, end
+
+
+def _cue_containing(segments, when):
+    """First cue whose [start, end) span contains `when`, or None."""
+    for cue in segments:
+        start, end = _cue_bounds(cue)
+        if start is not None and end is not None and start <= when < end:
+            return cue
+    return None
+
+
+def _last_sentence_start_offset(text):
+    """Character offset just after the LAST sentence terminator that still
+    leaves a non-empty remainder, or None."""
+    for index in range(len(text) - 2, -1, -1):
+        if text[index] in '.!?':
+            if text[index + 1:].strip():
+                return index + 1
+    return None
+
+
+def _last_terminator_offset(text):
+    """Character offset just after the LAST sentence terminator in `text`
+    (a terminator may be the final character), or None."""
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] in '.!?':
+            return index + 1
+    return None
+
+
+def _offset_to_seconds(cue_start, cue_end, text, offset):
+    """Map a character offset inside a cue's text onto its time span.
+
+    Whisper cues carry no word timestamps here, so the offset is placed
+    proportionally across the cue's duration."""
+    cue_duration = cue_end - cue_start
+    if cue_duration <= 0 or not text:
+        return None
+    return cue_start + (offset / len(text)) * cue_duration
+
+
+def snap_window_to_boundaries(window, segments, min_start_srt=None, min_duration=35.0):
+    """S3: refine an optimized window using transcript TEXT only (pure).
+
+    - START: within the cue containing the window start, move the start to
+      just after the LAST sentence terminator that still leaves a non-empty
+      remainder (open at a sentence start). The start NEVER moves earlier
+      than the window start, nor earlier than `min_start_srt` (the Task-13
+      topic-start cue's start; None = unbounded).
+    - END: within the cue containing the window end, move the end to just
+      after the last sentence terminator inside that cue (trim a trailing
+      partial sentence), but never below start + `min_duration`; if that
+      guard binds, the edge is left unchanged. The end never moves later.
+    - Any parse failure returns the input unchanged. Never raises.
+
+    Returns the refined window dict (a copy) or the input when unchanged.
+    """
+    try:
+        if not isinstance(window, dict) or not segments:
+            return window
+        start_seconds = _srt_like_to_seconds(window.get('start_time'))
+        end_seconds = _srt_like_to_seconds(window.get('end_time'))
+        if start_seconds is None or end_seconds is None:
+            return window
+
+        new_start = start_seconds
+        start_cue = _cue_containing(segments, start_seconds)
+        if start_cue is not None:
+            cue_start, cue_end = _cue_bounds(start_cue)
+            text = str(start_cue.get('text') or '')
+            offset = _last_sentence_start_offset(text)
+            if offset is not None and cue_start is not None and cue_end is not None:
+                candidate = _offset_to_seconds(cue_start, cue_end, text, offset)
+                if candidate is not None and start_seconds < candidate < end_seconds:
+                    new_start = candidate
+
+        min_start_seconds = _srt_like_to_seconds(min_start_srt) if min_start_srt is not None else None
+        if min_start_seconds is not None and new_start < min_start_seconds:
+            new_start = min_start_seconds
+
+        new_end = end_seconds
+        end_cue = _cue_containing(segments, end_seconds)
+        if end_cue is not None:
+            cue_start, cue_end = _cue_bounds(end_cue)
+            text = str(end_cue.get('text') or '')
+            offset = _last_terminator_offset(text)
+            if offset is not None and cue_start is not None and cue_end is not None:
+                candidate = _offset_to_seconds(cue_start, cue_end, text, offset)
+                if (
+                    candidate is not None
+                    and new_start < candidate < end_seconds
+                    and candidate >= new_start + min_duration
+                ):
+                    new_end = candidate
+
+        if abs(new_start - start_seconds) < 1e-9 and abs(new_end - end_seconds) < 1e-9:
+            return window
+        snapped = dict(window)
+        snapped['start_time'] = format_timestamp(new_start)
+        snapped['end_time'] = format_timestamp(new_end)
+        snapped['duration'] = new_end - new_start
+        print(
+            f"✂️ Boundary snap: start {window.get('start_time')} → {snapped['start_time']}, "
+            f"end {window.get('end_time')} → {snapped['end_time']}"
+        )
+        return snapped
+    except Exception as e:
+        print(f"Boundary snap failed ({e}); keeping window unchanged")
+        return window
+
+
+def refine_window_start_with_pause(window, audio_path, min_start_srt=None, neighborhood=1.5):
+    """S3: prosodic refinement of the text-snapped START point (never raises).
+
+    Builds an EnhancedAudioAnalyzer for `audio_path` and asks
+    detect_natural_boundaries for pauses inside a ±`neighborhood` window
+    around the current start; the nearest pause becomes the new start,
+    still respecting `min_start_srt` (None = the pause must simply stay
+    within the neighborhood). Audio load/analysis failures degrade to the
+    text-only snapped window. Keep it cheap: only the neighborhood matters
+    (a <=90 s capture)."""
+    try:
+        if not isinstance(window, dict):
+            return window
+        start_seconds = _srt_like_to_seconds(window.get('start_time'))
+        end_seconds = _srt_like_to_seconds(window.get('end_time'))
+        if start_seconds is None or end_seconds is None:
+            return window
+        if not audio_path or not os.path.isfile(str(audio_path)):
+            return window
+
+        from enhanced_audio_analyzer import EnhancedAudioAnalyzer
+
+        analyzer = EnhancedAudioAnalyzer(audio_path)
+        sample_rate = getattr(analyzer, 'sr', 22050)
+        if not sample_rate or sample_rate <= 0:
+            return window
+        lo = max(0.0, start_seconds - neighborhood)
+        hi = start_seconds + neighborhood
+        pauses = analyzer.detect_natural_boundaries(int(lo * sample_rate), int(hi * sample_rate))
+        if not pauses:
+            return window
+
+        min_start_seconds = _srt_like_to_seconds(min_start_srt) if min_start_srt is not None else None
+        candidates = []
+        for pause in pauses:
+            try:
+                absolute = lo + float(pause)
+            except (TypeError, ValueError):
+                continue
+            if absolute < lo or absolute > hi:
+                continue
+            if min_start_seconds is not None and absolute < min_start_seconds:
+                continue
+            candidates.append(absolute)
+        if not candidates:
+            return window
+
+        nearest = min(candidates, key=lambda t: abs(t - start_seconds))
+        if abs(nearest - start_seconds) < 0.01:
+            return window
+        refined = dict(window)
+        refined['start_time'] = format_timestamp(nearest)
+        refined['duration'] = end_seconds - nearest
+        print(
+            f"🎵 Prosodic snap: start {window.get('start_time')} → {refined['start_time']} "
+            f"(nearest pause within ±{neighborhood}s)"
+        )
+        return refined
+    except Exception as e:
+        print(f"Prosodic start refinement failed ({e}); keeping text-snapped start")
+        return window
+
+
 def generate_viral(
     transcript_content,
     audio_path=None,
@@ -2403,31 +2595,26 @@ def generate_viral(
                 topic_analysis['segments'],
             )
 
-        # Create content description based on optimized segment
-        segment_info = {
-            "start_time": optimized_segment['start_time'],
-            "end_time": optimized_segment['end_time'],
-            "title": optimized_segment['title'],
-            "duration": optimized_segment['duration'],
-            "concluding_topic_text": concluding_topic['text'],
-            "supporting_count": len(supporting_segments)
-        }
-        
-        print(f"✅ Using optimized segment:")
-        print(f"   • Duration: {segment_info['duration']:.1f}s")
-        print(f"   • Title: {segment_info['title']}")
-        print(f"   • Time: {segment_info['start_time']} → {segment_info['end_time']}")
-        
-        # Use content-centric prompt instead of viral detection
-        prompt = create_content_centric_prompt(
-            segment_info, concluding_topic, supporting_segments, title_language, json_template
+        # S3: refine the trimmed window to sentence/pause boundaries. The
+        # former content-centric prompt built here was dead code (the
+        # traditional prompt below is the one actually sent), so its guidance
+        # lives on as the resolved-window section injected into that live
+        # prompt: lead with the concluding topic, keep the narrative
+        # complete, and respect the resolved start/end boundaries.
+        min_start_srt = None
+        if (
+            isinstance(cue_index, int)
+            and not isinstance(cue_index, bool)
+            and 1 <= cue_index <= len(topic_analysis['segments'])
+        ):
+            min_start_srt = _segment_start_srt(topic_analysis['segments'][cue_index - 1])
+        optimized_segment = snap_window_to_boundaries(
+            optimized_segment, topic_analysis['segments'], min_start_srt=min_start_srt
         )
-        
-        system = create_content_centric_system_prompt(title_language)
-        
-        # Skip audio analysis since we already have optimized content
-        print("Skipping traditional audio analysis - using topic-focused approach")
-        
+        optimized_segment = refine_window_start_with_pause(
+            optimized_segment, audio_path, min_start_srt=min_start_srt
+        )
+
     else:
         print("\n==== Fallback to Traditional Analysis ====")
         print("Topic analysis unavailable, using original viral detection approach")
@@ -2482,16 +2669,6 @@ def generate_viral(
                 segments, min_duration=min_duration, max_duration=max_duration
             )
             print(f"Found {len(narrative_segments)} narrative segments")
-
-            if len(narrative_segments) > 0:
-                # Get optimal boundaries
-                optimal_boundaries = analyzer.get_optimal_boundaries(
-                    segments, target_duration_range=(35.0, 59.0)
-                )
-
-                if optimal_boundaries:
-                    print(f"Optimal boundaries found: {optimal_boundaries}")
-                    # TODO: Use these boundaries to create the video segment
 
             if len(narrative_segments) == 0:
                 print(
@@ -2578,6 +2755,28 @@ def generate_viral(
         print("No audio analysis performed - audio path missing or file doesn't exist")
         audio_context = ""
 
+    # The resolved topic window (Task-13 trim + S3 snapping) reaches the LIVE
+    # prompt as instruction prose — the single enforcement channel for
+    # Tasks 13+14 (deterministic validation of the returned window lands in
+    # S4). Empty on the fallback path so that path's prompt stays
+    # byte-identical.
+    resolved_window_section = ""
+    if 'topic_analysis' in locals() and 'error' not in topic_analysis:
+        resolved_window_section = (
+            "\nRESOLVED TOPIC WINDOW:\n"
+            f"- Resolved start: {optimized_segment['start_time']}\n"
+            f"- Resolved end: {optimized_segment['end_time']}\n"
+        )
+        if cue_index is not None:
+            resolved_window_section += (
+                f"- The final topic begins at cue {cue_index} of the numbered transcript cues above\n"
+            )
+        resolved_window_section += (
+            "The returned segment MUST start at or after the resolved start time and end at or "
+            "before the resolved end time. Prefer exactly the resolved boundaries; only a clear "
+            "sentence boundary justifies a slight adjustment within them.\n"
+        )
+
     # Format segments for GPT prompt
     formatted_segments = "\n".join(
         [
@@ -2603,7 +2802,7 @@ HOOK TEASER (optional):
 The provided transcript is as follows:
 
 {formatted_segments}
-{audio_context}
+{resolved_window_section}{audio_context}
 
 Based on your analysis, return a JSON document containing the timestamps (start and end) in SRT format (HH:MM:SS,mmm). 
 You will create a title and a complete, engaging Instagram post description in {title_language} language. 
