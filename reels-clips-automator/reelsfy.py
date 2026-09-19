@@ -2229,6 +2229,20 @@ def __main__():
 # __main__()
 
 
+# Audio mastering for the final published file: loudness-normalize to the
+# streaming-platform target (-14 LUFS) then gentle compression. Applied ONLY
+# in generate_subtitle's final mux; earlier pipeline stages pass audio through
+# untouched so the chain is applied exactly once.
+AUDIO_MASTERING_FILTER = (
+    "loudnorm=I=-14:LRA=11:tp=-1.5,acompressor=threshold=0.05:ratio=3:makeup=1.2"
+)
+
+
+def build_audio_filter_args():
+    """Shell fragment mastering the audio stream and re-encoding it to AAC."""
+    return f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k'
+
+
 def generate_subtitle(input_file, video_id, output_dir, video_title=None):
     """Generate subtitle for a video using Whisper and FFmpeg"""
     # Get channel name from root .env file
@@ -2435,7 +2449,7 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None):
             f'-map "[{last_filter}]" -map 0:a '
             f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
             f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
-            f'-c:a copy "{output_path}"'  # Added quotes around output path
+            f'{build_audio_filter_args()} "{output_path}"'
         )
     else:
         # No overlays, just copy
