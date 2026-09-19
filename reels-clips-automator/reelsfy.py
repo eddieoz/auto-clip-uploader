@@ -1902,8 +1902,13 @@ def generate_transcript(input_file):
             raise RuntimeError("All transcription methods failed") from fallback_error
 
 
-def save_metadata(metadata, output_dir):
-    """Save metadata in a copy-paste friendly format."""
+def save_metadata(metadata, output_dir, date_text=None, overlay_title=None):
+    """Save metadata in a copy-paste friendly format.
+
+    When date_text/overlay_title are provided, the burned-overlay info is
+    appended as a description fallback so platforms that re-crop or strip
+    burned-in text keep it.
+    """
     try:
         # Create a formatted text file for easy copy-paste
         formatted_text = f"""Title:
@@ -1914,6 +1919,13 @@ Description:
 
 Source: {metadata.get('source_link', 'N/A')}
 """
+        extra_lines = ""
+        if date_text is not None:
+            extra_lines += f"\nDate: {date_text}"
+        if overlay_title is not None:
+            extra_lines += f"\nOverlay title: {overlay_title}"
+        if extra_lines:
+            formatted_text = formatted_text.rstrip("\n") + extra_lines + "\n"
         # Save to file
         metadata_file = os.path.join(output_dir, "description.txt")
         with open(metadata_file, "w", encoding="utf-8") as file:
@@ -2338,8 +2350,14 @@ def __main__():
     print(f"\n==== Processing Generated Content ====")
     try:
         parsed_content = json.loads(content)
-        # Save metadata in a copy-paste friendly format
-        save_metadata(parsed_content["metadata"], f"{output_dir}")
+        # Save metadata in a copy-paste friendly format. Anything burned in
+        # the video (date + overlay title) must also be in the description.
+        save_metadata(
+            parsed_content["metadata"],
+            f"{output_dir}",
+            date_text=datetime.now().strftime("%d/%m/%Y"),
+            overlay_title=resolve_overlay_title(args.video_title, get_channel_name()),
+        )
         print(f"Processing {len(parsed_content['segments'])} generated segments...")
         # Jump cuts (Story 5): plan the intra-segment pause removal once per
         # segment so generate_segments (pieces) and the subtitle words below
@@ -2600,15 +2618,13 @@ def collect_segment_words(segments, start_time, end_time):
     return words if words else None
 
 
-def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtitle_words=None):
-    """Generate subtitle for a video using Whisper and FFmpeg
+def get_channel_name():
+    """Look up CHANNEL_NAME from the root .env file.
 
-    When subtitle_words (flat word list already offset to clip-relative time)
-    is provided and non-empty, word-level karaoke captions built from the
-    master transcript are burned instead of re-transcribing the clip. The
-    legacy re-transcription + SRT path is kept as the fallback.
+    Falls back to the current environment when the root .env does not
+    exist. Shared by the burned overlays and the description fallback so
+    both carry the same identity.
     """
-    # Get channel name from root .env file
     root_env_path = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), ".env")
     print(f"Looking for .env file at: {root_env_path}")
     if os.path.exists(root_env_path):
@@ -2620,6 +2636,60 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtit
         # Fallback to current environment
         channel_name = os.getenv("CHANNEL_NAME", "").strip('"')
         print(f"Channel name from current env: {channel_name}")
+    return channel_name
+
+
+def resolve_overlay_title(video_title, channel_name):
+    """Overlay-title precedence: video_title (arg) -> channel_name -> None."""
+    return video_title or (channel_name or None)
+
+
+# Burned overlays: subtle, semi-transparent, kept inside the top safe zone
+# (y=120 clears platform UI). Style values are binding for Story 6.
+OVERLAY_FONTFILE = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
+OVERLAY_FONT_SIZE = 32
+OVERLAY_FONT_COLOR = "white@0.65"
+OVERLAY_Y = 120
+OVERLAY_X_MARGIN = 30
+
+
+def build_overlay_filters(date_text, title_text, input_label="0:v"):
+    """Build the chained drawtext filters for the burned date/title overlays.
+
+    Pure helper so the exact style stays testable. Returns
+    (list_of_filter_strings, output_label): the date overlay sits top-left
+    (x=30) and the title/channel overlay top-right (x=W-tw-30), both at
+    y=120, fontsize=32, semi-transparent white. input_label is the video
+    stream label the first filter chains from; the date filter emits [v2]
+    and the title filter [v3], matching the historical chain labels.
+    output_label is the label of the final video stream (input_label
+    unchanged when neither overlay applies).
+    """
+    filters = []
+    last_label = input_label
+    if date_text:
+        filters.append(
+            f"[{last_label}]drawtext=text='{date_text}':fontfile={OVERLAY_FONTFILE}:fontsize={OVERLAY_FONT_SIZE}:fontcolor={OVERLAY_FONT_COLOR}:x={OVERLAY_X_MARGIN}:y={OVERLAY_Y}:shadowcolor=black:shadowx=2:shadowy=2[v2]"
+        )
+        last_label = "v2"
+    if title_text:
+        filters.append(
+            f"[{last_label}]drawtext=text='{title_text}':fontfile={OVERLAY_FONTFILE}:fontsize={OVERLAY_FONT_SIZE}:fontcolor={OVERLAY_FONT_COLOR}:x=W-tw-{OVERLAY_X_MARGIN}:y={OVERLAY_Y}:shadowcolor=black:shadowx=2:shadowy=2[v3]"
+        )
+        last_label = "v3"
+    return filters, last_label
+
+
+def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtitle_words=None):
+    """Generate subtitle for a video using Whisper and FFmpeg
+
+    When subtitle_words (flat word list already offset to clip-relative time)
+    is provided and non-empty, word-level karaoke captions built from the
+    master transcript are burned instead of re-transcribing the clip. The
+    legacy re-transcription + SRT path is kept as the fallback.
+    """
+    # Get channel name from root .env file (shared helper, current-env fallback)
+    channel_name = get_channel_name()
 
     # Get current date
     from datetime import datetime
@@ -2805,27 +2875,15 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtit
         ]
         last_filter = "v1"
 
-    # Add date overlay (top-left)
-    if date_text:
-        filter_parts.append(
-            f"[{last_filter}]drawtext=text='{date_text}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v2]"
-        )
-        last_filter = "v2"
-
-    # Add channel name or video title overlay (bottom-right, above subtitles)
+    # Add the restyled overlays: date (top-left) and video title or channel
+    # name (top-right), semi-transparent inside the top safe zone.
     if video_title:
-        # Use provided video title
         print(f"Using video title for overlay: {video_title}")
-        filter_parts.append(
-            f"[{last_filter}]drawtext=text='{video_title}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=W-tw-30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v3]"
-        )
-        last_filter = "v3"
-    elif channel_name:
-        # Fallback to channel name
-        filter_parts.append(
-            f"[{last_filter}]drawtext=text='{channel_name}':fontfile=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf:fontsize=38:fontcolor=white:x=W-tw-30:y=30:shadowcolor=black:shadowx=2:shadowy=2[v3]"
-        )
-        last_filter = "v3"
+    title_text = resolve_overlay_title(video_title, channel_name)
+    overlay_filters, last_filter = build_overlay_filters(
+        date_text, title_text, input_label=last_filter
+    )
+    filter_parts.extend(overlay_filters)
 
     # Build final FFmpeg command with proper spacing and quotes
     if filter_parts:
