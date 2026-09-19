@@ -359,7 +359,138 @@ def parse_srt_time(time_str):
     return h * 3600 + m * 60 + s + int(ms) / 1000
 
 
-def generate_segments(response):
+# Jump cuts (Story 5 / P1.3): remove intra-segment dead air at the
+# generate_segments stage, then remap the word timeline so captions stay in
+# sync with the condensed clip. When nothing is cut (or the escape hatch is
+# off) every path below is byte-identical to the previous pipeline.
+
+JUMP_CUT_DEFAULT_PAUSE_THRESHOLD = 0.6
+JUMP_CUT_DEFAULT_PADDING = 0.12
+
+
+def get_jump_cut_config():
+    """Get jump-cut configuration from environment variables with fallback.
+
+    Returns:
+        tuple: (enabled, pause_threshold). JUMP_CUTS_ENABLED defaults to
+        "true"; only the literal "false" (any case) disables jump cuts.
+        JUMP_CUT_PAUSE_THRESHOLD defaults to 0.6 seconds.
+    """
+    enabled_raw = os.getenv('JUMP_CUTS_ENABLED', 'true').lower().strip()
+    enabled = enabled_raw != 'false'
+    if not enabled:
+        print("Jump cuts disabled (JUMP_CUTS_ENABLED=false); keeping full-length segments")
+
+    threshold_raw = os.getenv(
+        'JUMP_CUT_PAUSE_THRESHOLD', str(JUMP_CUT_DEFAULT_PAUSE_THRESHOLD)
+    )
+    try:
+        threshold = float(threshold_raw)
+    except (TypeError, ValueError):
+        print(
+            f"Warning: Invalid JUMP_CUT_PAUSE_THRESHOLD '{threshold_raw}'. "
+            f"Falling back to default: {JUMP_CUT_DEFAULT_PAUSE_THRESHOLD}"
+        )
+        threshold = JUMP_CUT_DEFAULT_PAUSE_THRESHOLD
+    return enabled, threshold
+
+
+def build_jump_cut_plan(words, seg_start, seg_end, pause_threshold=0.6, padding=0.12):
+    """Build the jump-cut plan for one segment.
+
+    Args:
+        words: flat word list (Story 3 contract) restricted to the segment,
+            in clip-relative time exactly as collect_segment_words returns
+            them (i.e. already shifted by -seg_start). May be None/empty.
+        seg_start, seg_end: segment boundaries in source time (seconds).
+        pause_threshold: gaps strictly above this many seconds are cut.
+        padding: seconds kept on each side of a cut.
+
+    Returns:
+        tuple: (pieces, remapped_words).
+        pieces: list of (start, end) source-time tuples covering the segment
+            with intra-segment pauses removed; leading material before the
+            first word and trailing material after the last word are kept.
+        remapped_words: each word shifted left by the total removed duration
+            before it (clamped >= 0), or None when no words were given.
+        With no removable pauses (or no words) this is a single piece
+        (seg_start, seg_end) and words identical to today's -seg_start shift.
+    """
+    if not words:
+        return [(seg_start, seg_end)], None
+
+    # Sort defensively and restrict to the segment (clip-relative bounds).
+    seg_duration = seg_end - seg_start
+    clip_words = sorted(
+        (w for w in words if seg_start <= seg_start + float(w["start"]) <= seg_end),
+        key=lambda w: float(w["start"]),
+    )
+    if not clip_words or seg_duration <= 0:
+        return [(seg_start, seg_end)], list(words)
+
+    # Cut ranges in source time: between consecutive words, the range
+    # [prev_end + padding, next_start - padding] is removed when the gap
+    # exceeds the threshold and the cut range is positive.
+    cuts = []  # (cut_start, cut_end) in source time
+    for prev_w, next_w in zip(clip_words, clip_words[1:]):
+        prev_end_src = seg_start + float(prev_w["end"])
+        next_start_src = seg_start + float(next_w["start"])
+        if next_start_src - prev_end_src > pause_threshold:
+            cut_start = prev_end_src + padding
+            cut_end = next_start_src - padding
+            if cut_end > cut_start:
+                cuts.append((cut_start, cut_end))
+
+    if not cuts:
+        return [(seg_start, seg_end)], list(words)
+
+    pieces = []
+    cursor = seg_start
+    for cut_start, cut_end in cuts:
+        pieces.append((cursor, cut_start))
+        cursor = cut_end
+    pieces.append((cursor, seg_end))
+
+    remapped = []
+    for w in clip_words:
+        start_src = seg_start + float(w["start"])
+        removed_before = sum(
+            c_end - c_start for c_start, c_end in cuts if c_start <= start_src
+        )
+        remapped.append(
+            {
+                "word": w.get("word", ""),
+                "start": max(0.0, float(w["start"]) - removed_before),
+                "end": max(0.0, float(w["end"]) - removed_before),
+            }
+        )
+    return pieces, remapped
+
+
+def _build_multi_piece_command(pieces, output_file):
+    """Shell command cutting every piece from tmp/input_video.mp4 and
+    concatenating them into tmp/{output_file}, re-encoded with the NVENC
+    settings used by the single-cut path."""
+    inputs = []
+    parts = []
+    for j, (piece_start, piece_end) in enumerate(pieces):
+        inputs.append(f"-hwaccel cuda -ss {piece_start} -to {piece_end} -i tmp/input_video.mp4")
+        parts.append(f"[{j}:v][{j}:a]")
+    filter_complex = (
+        f"{''.join(parts)}concat=n={len(pieces)}:v=1:a=1[out_v][out_a]"
+    )
+    return (
+        "ffmpeg -y "
+        + " ".join(inputs)
+        + f" -filter_complex \"{filter_complex}\" -map \"[out_v]\" -map \"[out_a]\" "
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k "
+        f"tmp/{output_file}"
+    )
+
+
+def generate_segments(response, jump_cut_plans=None):
+    plans = jump_cut_plans or {}
     for i, segment in enumerate(response):
         print(i, segment)
 
@@ -376,8 +507,61 @@ def generate_segments(response):
             end_time += 30 - (end_time - start_time)
 
         output_file = f"{sanitize_filename(title)}{str(i).zfill(3)}.mp4"
-        command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
+        entry = plans.get(i)
+        pieces = entry[0] if entry else None
+        if pieces and len(pieces) > 1:
+            # Keep the short-segment end_time extension on the trailing piece.
+            pieces = list(pieces)
+            pieces[-1] = (pieces[-1][0], end_time)
+            print(
+                f"Jump cuts: cutting segment {i} as {len(pieces)} pieces "
+                f"(removed {pieces[-1][0] - start_time:.2f}s of pauses)"
+            )
+            command = _build_multi_piece_command(pieces, str(output_file))
+        else:
+            command = f"ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k -ss {start_time} -to {end_time} tmp/{str(output_file)}"
         subprocess.call(command, shell=True)
+
+
+def compute_jump_cut_plans(segments, transcript_segments, pause_threshold):
+    """Compute {index: (pieces, remapped_words)} for cuttable segments.
+
+    Only segments whose plan actually removes material are stored; every
+    other segment keeps today's single-cut / plain-shift behavior.
+    """
+    plans = {}
+    for i, segment in enumerate(segments or []):
+        seg_words = collect_segment_words(
+            transcript_segments, segment.get("start_time"), segment.get("end_time")
+        )
+        if not seg_words:
+            continue
+        try:
+            seg_start = parse_srt_time(segment.get("start_time"))
+            seg_end = parse_srt_time(segment.get("end_time"))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        pieces, remapped = build_jump_cut_plan(
+            seg_words, seg_start, seg_end, pause_threshold=pause_threshold
+        )
+        if pieces and len(pieces) > 1:
+            plans[i] = (pieces, remapped)
+            print(
+                f"Jump cuts: segment {i} ({segment.get('start_time')} - "
+                f"{segment.get('end_time')}) -> {len(pieces)} pieces"
+            )
+    return plans
+
+
+def resolve_subtitle_words(jump_cut_plans, index, transcript_segments, start_time, end_time):
+    """Subtitle words for one segment.
+
+    Returns the jump-cut remapped words when a plan exists for the segment,
+    otherwise the plain collect_segment_words shift (Story 4 behavior)."""
+    entry = (jump_cut_plans or {}).get(index)
+    if entry is not None:
+        return entry[1]
+    return collect_segment_words(transcript_segments, start_time, end_time)
 
 
 def find_smile(frame, output_file):
@@ -2157,7 +2341,18 @@ def __main__():
         # Save metadata in a copy-paste friendly format
         save_metadata(parsed_content["metadata"], f"{output_dir}")
         print(f"Processing {len(parsed_content['segments'])} generated segments...")
-        generate_segments(parsed_content["segments"])
+        # Jump cuts (Story 5): plan the intra-segment pause removal once per
+        # segment so generate_segments (pieces) and the subtitle words below
+        # share the same plan. Escape hatch off -> no plans at all.
+        jump_cut_enabled, jump_cut_threshold = get_jump_cut_config()
+        jump_cut_plans = {}
+        if jump_cut_enabled:
+            jump_cut_plans = compute_jump_cut_plans(
+                parsed_content["segments"],
+                transcript_result["segments"],
+                jump_cut_threshold,
+            )
+        generate_segments(parsed_content["segments"], jump_cut_plans=jump_cut_plans)
     except (json.JSONDecodeError, KeyError) as e:
         print(f"Error: Failed to process content: {str(e)}")
         cleanup_on_failure(video_id if 'video_id' in locals() else 'unknown', preserve_logs=True)
@@ -2191,7 +2386,11 @@ def __main__():
             final_output_name = sanitize_filename(f"final-{os.path.splitext(output_file)[0]}") + os.path.splitext(output_file)[1]
             # Reuse the master transcript word timestamps (clip-relative);
             # None when the transcriber has no word data -> SRT fallback.
-            subtitle_words = collect_segment_words(
+            # With jump cuts (Story 5) the remapped word timeline is used so
+            # captions stay in sync with the condensed clip.
+            subtitle_words = resolve_subtitle_words(
+                jump_cut_plans,
+                i,
                 transcript_result["segments"],
                 segment["start_time"],
                 segment["end_time"],
