@@ -3,7 +3,7 @@ import sys
 import textwrap
 import time
 import numpy as np
-from pytube import YouTube
+import yt_dlp
 import cv2
 import subprocess
 import openai
@@ -14,7 +14,6 @@ from os import path
 import shutil
 from dotenv import load_dotenv
 from dotenv import dotenv_values
-import whisper
 import tempfile
 import ffmpeg
 from enhanced_audio_analyzer import EnhancedAudioAnalyzer
@@ -341,12 +340,15 @@ def initialize_face_enhancer():
 
 
 # Download video
-def download_video(url, filename, tmp_dir):
-    yt = YouTube(url)
-    video = yt.streams.filter(file_extension="mp4").get_highest_resolution()
+def download_video(url, filename, tmp_dir="tmp/"):
+    """Download a YouTube video to tmp/{filename} using yt-dlp."""
+    ydl_opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": os.path.join(tmp_dir, filename),
+    }
 
-    # Download the video
-    video.download(filename=filename, output_path=tmp_dir)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
 
 # Segment Video function
@@ -599,7 +601,12 @@ def generate_short(
         smile_found = False
         boxes = None
         trackers = None
-        
+
+        # Explicit face-box state. Initialized to None so downstream code never
+        # relies on leaked loop variables: if no face box has been established
+        # yet (detection or tracking), the center-crop branch takes over.
+        x, y, w, h = None, None, None, None
+
         # Dynamic tracking variables
         tracking_mode = "static"  # Values: "static", "frame_by_frame"
         zoom_mode = "close_up"  # Values: "close_up", "wide_shot"
@@ -651,8 +658,9 @@ def generate_short(
                     zoom_in_enabled = random.random() < ZOOM_IN_PROBABILITY
                     
                     frame_tracking_enabled = (tracking_mode == "frame_by_frame")
-                    
-                    print(f"Interval {frame_count // switch_interval}: tracking_mode={tracking_mode}, zoom_mode={zoom_mode}, zoom_in={zoom_in_enabled}")
+
+                    if debug_faces:
+                        print(f"Interval {frame_count // switch_interval}: tracking_mode={tracking_mode}, zoom_mode={zoom_mode}, zoom_in={zoom_in_enabled}")
 
                     # Intelligently select best talking face using TalkingFaceDetector
                     # Convert faces to list of tuples for detector
@@ -730,7 +738,10 @@ def generate_short(
                             x, y, w, h = [int(v) for v in boxes[current_face_index]]
                             print(f"Frame-by-frame tracking - Frame: {frame_count}, Face: ({x}, {y}, {w}, {h})")
                         else:
-                            # Fallback to static positioning if tracking fails
+                            # Fallback to static positioning if tracking fails.
+                            # Keep the last known good face box (x, y, w, h)
+                            # deliberately - it is explicit state initialized
+                            # before the loop, not a leaked loop variable.
                             print(f"Frame-by-frame tracking failed, falling back to static mode")
                             frame_tracking_enabled = False
                     except Exception as e:
@@ -738,7 +749,9 @@ def generate_short(
                         frame_tracking_enabled = False
 
                 # Calculate face center and crop parameters (for both modes)
-                if len(face_positions) > 0:
+                # Only when a face box has actually been established; otherwise
+                # fall back to the center-crop branch below.
+                if len(face_positions) > 0 and x is not None:
                     # Calculate raw face center
                     raw_face_center = (x + w // 2, y + h // 2)
                     
@@ -851,7 +864,7 @@ def generate_short(
                             print(f"Cropping: {target_width}x{target_height}, crop_ratio={crop_ratio:.3f}, aspect={final_aspect_ratio:.3f}, face={face_size_category}, zoom_mode={zoom_mode}")
 
                 # Calculate the top-left corner of the 9:16 rectangle (only if we have face positions)
-                if len(face_positions) > 0:
+                if len(face_positions) > 0 and x is not None:
                     # Ideal top-left corner to center the face
                     crop_x = face_center[0] - target_width // 2
                     crop_y = face_center[1] - target_height // 2
@@ -970,9 +983,6 @@ def generate_short(
                 prev_frame = frame.copy()
 
                 frame_count += 1
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
             else:
                 break
 
@@ -997,6 +1007,9 @@ def generate_short(
 
         if thumb and smile_found:
             generate_thumbnail(smile_frame, title, thumb_dir)
+
+        # Return the final merged output path so callers can report success
+        return f"tmp/final-{sanitized_output}"
 
     except Exception as e:
         print(f"Error during video cropping: {str(e)}")
