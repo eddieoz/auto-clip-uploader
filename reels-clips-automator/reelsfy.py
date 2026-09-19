@@ -1196,6 +1196,33 @@ def generate_short(
         print(f"Error during video cropping: {str(e)}")
 
 
+def build_segment_json_template():
+    """Shared segment JSON template for BOTH generate_viral prompt paths.
+
+    Placeholder values are kept plain (no parenthetical guidance inside
+    values) so GPT cannot echo instructions into a real value, which
+    parse_srt_time would reject. The hook_* fields are OPTIONAL at parse
+    time: when GPT omits them (or they fail validation) the pipeline
+    behaves exactly as before Story 7 (no cold-open teaser).
+    """
+    return """
+    {
+        "segments": [
+            {
+                "start_time": "00:00:00,000",
+                "end_time": "00:00:00,000",
+                "title": "Title of the reels",
+                "description": "Description of the reels",
+                "tags": "Three relevant and objective one-word hashtags",
+                "hook_start_time": "00:00:05,000",
+                "hook_end_time": "00:00:08,000",
+                "hook_text": "Punchy 4-7 word hook"
+            }
+        ]
+    }
+    """
+
+
 def generate_metadata(transcript):
     json_template = """
         {
@@ -1333,6 +1360,11 @@ This segment represents the CONCLUDING topic from a 90-second conversation. Your
 
 Create a title and Instagram description in {title_language} that presents this concluding topic with proper context and narrative completeness.
 
+HOOK TEASER (optional):
+- "hook_start_time" and "hook_end_time": SRT timestamps (HH:MM:SS,mmm) INSIDE the segment, spanning the single most engaging sentence (2-5 seconds long).
+- "hook_text": a punchy 4-7 word hook in {title_language} that will be burned as text over the teaser.
+- These fields are optional: only include them when a clear hook sentence exists inside the segment.
+
 The Instagram description should:
 1. Lead with the concluding topic/message
 2. Provide necessary context from supporting segments
@@ -1460,19 +1492,7 @@ def generate_viral(
         )
 
     # Then generate viral segments
-    json_template = """
-    {
-        "segments": [
-            {
-                "start_time": "00:00:00,000",
-                "end_time": "00:00:00,000",
-                "title": "Title of the reels",
-                "description": "Description of the reels",
-                "tags": "Three relevant and objective one-word hashtags"
-            }
-        ]
-    }
-    """
+    json_template = build_segment_json_template()
 
     title_language = "Portuguese"
     
@@ -1671,11 +1691,16 @@ def generate_viral(
         ]
     )
 
-    prompt = f"""Given the following video transcript and audio analysis results, analyze each part for potential virality and identify the single most viral segment of maximum 59 seconds. 
-The segment should be complete with the full explanation for the audience to comprehend the entire information or message of the segment, 
+    prompt = f"""Given the following video transcript and audio analysis results, analyze each part for potential virality and identify the single most viral segment of maximum 59 seconds.
+The segment should be complete with the full explanation for the audience to comprehend the entire information or message of the segment,
 and have a minimum of {min_duration} seconds and maximum of 59 seconds in duration.
 
 Do not select a segment with partial or incomplete information.
+
+HOOK TEASER (optional):
+- "hook_start_time" and "hook_end_time": SRT timestamps (HH:MM:SS,mmm) INSIDE the segment, spanning the single most engaging sentence (2-5 seconds long).
+- "hook_text": a punchy 4-7 word hook in {title_language} that will be burned as text over the teaser.
+- These fields are optional: only include them when a clear hook sentence exists inside the segment.
 
 The provided transcript is as follows:
 
@@ -2417,12 +2442,24 @@ def __main__():
                 print(
                     f"Using {len(subtitle_words)} words from master transcript for subtitles"
                 )
-            generate_subtitle(
+            # Hook teaser (Story 7): optional cold-open. Missing/invalid hook
+            # fields fall through to today's behavior exactly. Every teaser
+            # failure mode ends in the direct publish, so the segment is
+            # never left without a published file.
+            try:
+                seg_start_sec = parse_srt_time(segment["start_time"])
+                seg_end_sec = parse_srt_time(segment["end_time"])
+                hook = parse_hook_fields(segment, seg_start_sec, seg_end_sec)
+            except Exception as e:
+                print(f"Hook teaser: could not evaluate hook fields: {str(e)}")
+                hook = None
+            publish_segment_with_optional_teaser(
                 final_output_name,
                 video_id,
                 output_dir,
                 video_title=args.video_title,
-                subtitle_words=subtitle_words
+                subtitle_words=subtitle_words,
+                hook=hook,
             )
             print(f"Segment {i+1} processing complete")
         except Exception as e:
@@ -2680,13 +2717,323 @@ def build_overlay_filters(date_text, title_text, input_label="0:v"):
     return filters, last_label
 
 
-def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtitle_words=None):
+# Cold-open hook teaser (Story 7 / P2.2): when GPT returns valid hook fields
+# for a segment, a 1.5-6 s teaser cut of that moment is burned with the hook
+# text, cropped to 9:16, and prepended to the main clip. Audio is mastered
+# exactly once per output stream: the teaser gets the chain in its burn step
+# and the main clip keeps it in generate_subtitle's final mux; the concat
+# between them is -c copy (or a video-only re-encode fallback) and NEVER
+# re-masters audio.
+
+HOOK_TEASER_MIN_DURATION = 1.5
+HOOK_TEASER_MAX_DURATION = 6.0
+HOOK_TEASER_FONT_SIZE = 64
+HOOK_TEASER_RAW_FILE = "hook-teaser-raw.mp4"
+HOOK_TEASER_CROPPED_FILE = "hook-teaser.mp4"
+HOOK_TEASER_OUTPUT_FILE = "hook-teaser.mp4"
+HOOK_TEASER_MAIN_OUTPUT_FILE = "hook-main.mp4"
+HOOK_TEASER_CONCAT_LIST = "tmp/hook-concat.txt"
+
+
+def parse_hook_fields(segment, seg_start_sec, seg_end_sec):
+    """Parse and validate the optional GPT hook fields for one segment.
+
+    Returns (hook_start_sec, hook_end_sec, hook_text) or None. All three
+    fields must be present with non-empty text; timestamps are parsed with
+    parse_srt_time and the range must be 1.5-6 s, strictly increasing, and
+    fully inside the segment boundaries.
+    """
+    if not isinstance(segment, dict):
+        return None
+    hook_start_raw = segment.get("hook_start_time")
+    hook_end_raw = segment.get("hook_end_time")
+    hook_text_raw = segment.get("hook_text")
+    if not hook_start_raw or not hook_end_raw or hook_text_raw is None:
+        return None
+    hook_text = str(hook_text_raw).strip()
+    if not hook_text:
+        return None
+    try:
+        hook_start = parse_srt_time(hook_start_raw)
+        hook_end = parse_srt_time(hook_end_raw)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if hook_end <= hook_start:
+        return None
+    duration = hook_end - hook_start
+    if duration < HOOK_TEASER_MIN_DURATION or duration > HOOK_TEASER_MAX_DURATION:
+        return None
+    if hook_start < seg_start_sec or hook_end > seg_end_sec:
+        return None
+    return hook_start, hook_end, hook_text
+
+
+def sanitize_hook_text(text):
+    """Make hook text safe inside a drawtext text='...' filter string.
+
+    Uppercases (hook style), strips apostrophes (drawtext would otherwise
+    break the quoting), and escapes ':' and '%' like drawtext requires.
+    """
+    text = str(text).strip().upper()
+    text = text.replace("'", "")
+    text = text.replace(":", r"\:")
+    text = text.replace("%", r"\%")
+    return text
+
+
+def build_hook_drawtext_filter(hook_text):
+    """Burned hook text: large white with black border, dead-center."""
+    text = sanitize_hook_text(hook_text)
+    return (
+        f"drawtext=text='{text}':fontfile={OVERLAY_FONTFILE}:"
+        f"fontsize={HOOK_TEASER_FONT_SIZE}:fontcolor=white:"
+        "borderw=3:bordercolor=black:x=(w-tw)/2:y=(h-th)/2"
+    )
+
+
+def build_teaser_cut_command(hook_start, hook_end):
+    """Cut the hook moment from tmp/input_video.mp4 (NVENC style as
+    generate_segments' single-cut path, audio re-encoded to AAC)."""
+    return (
+        "ffmpeg -y -hwaccel cuda -i tmp/input_video.mp4 "
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k "
+        f"-ss {hook_start} -to {hook_end} tmp/{HOOK_TEASER_RAW_FILE}"
+    )
+
+
+def build_teaser_burn_command(hook_text):
+    """Burn the hook text over the cropped teaser and master its audio
+    exactly once (same AUDIO_MASTERING_FILTER chain as the main clip).
+    Input is generate_short's audio-muxed final-<cropped> output."""
+    return (
+        f"ffmpeg -y -hwaccel cuda -i tmp/final-{HOOK_TEASER_CROPPED_FILE} "
+        f'-vf "{build_hook_drawtext_filter(hook_text)}" '
+        f"{build_audio_filter_args()} "
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 "
+        "-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
+        f"tmp/{HOOK_TEASER_OUTPUT_FILE}"
+    )
+
+
+def build_teaser_concat_command(concat_list_path, published_path):
+    """Stream-copy concat of teaser + main into the published path."""
+    return (
+        f'ffmpeg -y -f concat -safe 0 -i "{concat_list_path}" '
+        f'-c copy "{published_path}"'
+    )
+
+
+def build_teaser_concat_fallback_command(concat_list_path, published_path):
+    """Fallback when -c copy concat fails: re-encode VIDEO only; audio is
+    copied through, never re-mastered over the concatenation."""
+    return (
+        f'ffmpeg -y -f concat -safe 0 -i "{concat_list_path}" '
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
+        f'-c:a copy "{published_path}"'
+    )
+
+
+def generate_hook_teaser(hook_start, hook_end, hook_text):
+    """Build the 9:16 hook teaser from tmp/input_video.mp4.
+
+    Cut at [hook_start, hook_end] -> crop to 9:16 via generate_short -> burn
+    the hook text + master audio -> tmp/hook-teaser.mp4. Returns the teaser
+    path or None when any step fails (caller falls back to today's behavior).
+    """
+    try:
+        command = build_teaser_cut_command(hook_start, hook_end)
+        print(f"Hook teaser cut command: {command}")
+        result = subprocess.call(command, shell=True)
+        raw_path = f"tmp/{HOOK_TEASER_RAW_FILE}"
+        if (
+            result != 0
+            or not os.path.exists(raw_path)
+            or os.path.getsize(raw_path) == 0
+        ):
+            print(
+                f"Hook teaser: cutting failed (rc={result}); skipping teaser"
+            )
+            return None
+
+        print("Hook teaser piece cut, cropping to 9:16...")
+        cropped = generate_short(HOOK_TEASER_RAW_FILE, HOOK_TEASER_CROPPED_FILE)
+        if not cropped:
+            print("Hook teaser: 9:16 crop failed; skipping teaser")
+            return None
+
+        command = build_teaser_burn_command(hook_text)
+        print(f"Hook teaser burn command: {command}")
+        result = subprocess.call(command, shell=True)
+        teaser_path = f"tmp/{HOOK_TEASER_OUTPUT_FILE}"
+        if (
+            result != 0
+            or not os.path.exists(teaser_path)
+            or os.path.getsize(teaser_path) == 0
+        ):
+            print(
+                f"Hook teaser: burning hook text failed (rc={result}); "
+                "skipping teaser"
+            )
+            return None
+        return teaser_path
+    except Exception as e:
+        print(f"Hook teaser generation failed: {str(e)}")
+        return None
+
+
+def compute_published_output_path(output_dir, input_file):
+    """Published path generate_subtitle derives from the cropped input name
+    (shared by the main loop so the teaser concat targets the same file and
+    the published `final-*` naming stays unchanged)."""
+    output_filename = os.path.basename(input_file)
+    base_name = os.path.splitext(output_filename)[0]
+    extension = os.path.splitext(output_filename)[1]
+    output_filename = sanitize_filename(base_name) + extension
+    return f"{output_dir}/{output_filename}"
+
+
+def assemble_hook_teaser_final(
+    teaser_path, main_path, published_path, concat_list_path=None
+):
+    """Concat teaser + main into the published path with `-c copy`.
+
+    Falls back to a video-only NVENC re-encode (-c:a copy) when the
+    stream-copy concat fails. Audio is never re-mastered here.
+    """
+    concat_list_path = concat_list_path or HOOK_TEASER_CONCAT_LIST
+    try:
+        # ffmpeg's concat demuxer resolves relative entry paths against the
+        # LIST FILE's directory (not the cwd), so the entries must be
+        # absolute or both concat attempts would look for tmp/tmp/... .
+        teaser_abs = os.path.abspath(teaser_path)
+        main_abs = os.path.abspath(main_path)
+        with open(concat_list_path, "w", encoding="utf-8") as f:
+            f.write(f"file '{teaser_abs}'\n")
+            f.write(f"file '{main_abs}'\n")
+        command = build_teaser_concat_command(concat_list_path, published_path)
+        print(f"Hook teaser concat command: {command}")
+        result = subprocess.call(command, shell=True)
+        if (
+            result == 0
+            and os.path.exists(published_path)
+            and os.path.getsize(published_path) > 0
+        ):
+            print(f"Hook teaser assembly complete: {published_path}")
+            return True
+        print(
+            f"Hook teaser: concat -c copy failed (rc={result}); "
+            "falling back to video re-encode"
+        )
+        command = build_teaser_concat_fallback_command(
+            concat_list_path, published_path
+        )
+        print(f"Hook teaser fallback command: {command}")
+        result = subprocess.call(command, shell=True)
+        if result == 0 and os.path.exists(published_path):
+            print(f"Hook teaser fallback assembly complete: {published_path}")
+            return True
+        print(f"Hook teaser: fallback assembly also failed (rc={result})")
+        return False
+    except Exception as e:
+        print(f"Hook teaser assembly failed: {str(e)}")
+        return False
+
+
+def publish_segment_with_optional_teaser(
+    final_output_name,
+    video_id,
+    output_dir,
+    video_title=None,
+    subtitle_words=None,
+    hook=None,
+):
+    """Publish one segment, prepending the hook teaser when hook is valid.
+
+    hook is a parsed (hook_start, hook_end, hook_text) tuple from
+    parse_hook_fields, or None. Every failure mode degrades to today's
+    direct-publish behavior (generate_subtitle writing the published file):
+    teaser generation failure, missing burned main file, and — as the last
+    fallback — teaser assembly failure, so the segment never ends without
+    a published file.
+    """
+    direct_publish_kwargs = {
+        "video_title": video_title,
+        "subtitle_words": subtitle_words,
+    }
+    published_path = compute_published_output_path(output_dir, final_output_name)
+
+    main_output_path = None
+    teaser_path = None
+    if hook:
+        hook_start, hook_end, hook_text = hook
+        print(f"Hook teaser: {hook_start:.2f}s-{hook_end:.2f}s '{hook_text}'")
+        teaser_path = generate_hook_teaser(hook_start, hook_end, hook_text)
+        if teaser_path:
+            main_output_path = f"tmp/{HOOK_TEASER_MAIN_OUTPUT_FILE}"
+        else:
+            print("Hook teaser: generation failed; publishing without teaser")
+
+    if not main_output_path:
+        generate_subtitle(
+            final_output_name, video_id, output_dir, **direct_publish_kwargs
+        )
+        return
+
+    # Write the burned main clip to tmp/, then concat teaser in front of it
+    # into the published path.
+    burned_ok = generate_subtitle(
+        final_output_name,
+        video_id,
+        output_dir,
+        main_output_path=main_output_path,
+        **direct_publish_kwargs,
+    )
+    if (
+        not burned_ok
+        or not os.path.exists(main_output_path)
+        or os.path.getsize(main_output_path) == 0
+    ):
+        print(
+            "Hook teaser: burned main file missing; falling back to "
+            "direct publish without teaser"
+        )
+        generate_subtitle(
+            final_output_name, video_id, output_dir, **direct_publish_kwargs
+        )
+        return
+
+    if assemble_hook_teaser_final(teaser_path, main_output_path, published_path):
+        return
+    print(
+        "Hook teaser: assembly failed; publishing the video directly "
+        "without the teaser"
+    )
+    generate_subtitle(
+        final_output_name, video_id, output_dir, **direct_publish_kwargs
+    )
+
+
+def generate_subtitle(
+    input_file,
+    video_id,
+    output_dir,
+    video_title=None,
+    subtitle_words=None,
+    main_output_path=None,
+):
     """Generate subtitle for a video using Whisper and FFmpeg
 
     When subtitle_words (flat word list already offset to clip-relative time)
     is provided and non-empty, word-level karaoke captions built from the
     master transcript are burned instead of re-transcribing the clip. The
     legacy re-transcription + SRT path is kept as the fallback.
+
+    When main_output_path is provided (hook teaser assembly, Story 7), the
+    burned main clip is written to that tmp path INSTEAD of the published
+    output_dir; the caller then concats the teaser in front of it. Without
+    it the behavior and output path are identical to before.
     """
     # Get channel name from root .env file (shared helper, current-env fallback)
     channel_name = get_channel_name()
@@ -2850,11 +3197,10 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtit
             temp_srt_file = None
 
     # Create output path for final video with overlays
-    output_filename = os.path.basename(input_file)
-    base_name = os.path.splitext(output_filename)[0]
-    extension = os.path.splitext(output_filename)[1]
-    output_filename = sanitize_filename(base_name) + extension
-    output_path = f"{output_dir}/{output_filename}"
+    output_path = compute_published_output_path(output_dir, input_file)
+    if main_output_path:
+        print(f"Hook teaser: writing burned main clip to {main_output_path}")
+        output_path = main_output_path
 
     # Check if subtitle file was generated
     if temp_ass_file:
