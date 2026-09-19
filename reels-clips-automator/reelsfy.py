@@ -352,6 +352,13 @@ def download_video(url, filename, tmp_dir="tmp/"):
 
 
 # Segment Video function
+def parse_srt_time(time_str):
+    """Parse an SRT timestamp (HH:MM:SS,mmm) into total seconds."""
+    time_parts, ms = str(time_str).split(",")
+    h, m, s = map(int, time_parts.split(":"))
+    return h * 3600 + m * 60 + s + int(ms) / 1000
+
+
 def generate_segments(response):
     for i, segment in enumerate(response):
         print(i, segment)
@@ -360,17 +367,7 @@ def generate_segments(response):
         end_time = segment.get("end_time", 0)
         title = segment.get("title", 0)
 
-        # Handle SRT format timestamps (HH:MM:SS,mmm)
-        def parse_srt_time(time_str):
-            # Split into time and milliseconds
-            time_parts, ms = time_str.split(",")
-            # Split time into hours, minutes, seconds
-            h, m, s = map(int, time_parts.split(":"))
-            # Convert to total seconds
-            total_seconds = h * 3600 + m * 60 + s + int(ms) / 1000
-            return total_seconds
-
-        # Convert timestamps to seconds
+        # Convert timestamps to seconds (SRT format HH:MM:SS,mmm)
         start_time = parse_srt_time(start_time)
         end_time = parse_srt_time(end_time)
 
@@ -2192,11 +2189,23 @@ def __main__():
             )
             print(f"Adding subtitles to video for segment {i+1}...")
             final_output_name = sanitize_filename(f"final-{os.path.splitext(output_file)[0]}") + os.path.splitext(output_file)[1]
+            # Reuse the master transcript word timestamps (clip-relative);
+            # None when the transcriber has no word data -> SRT fallback.
+            subtitle_words = collect_segment_words(
+                transcript_result["segments"],
+                segment["start_time"],
+                segment["end_time"],
+            )
+            if subtitle_words:
+                print(
+                    f"Using {len(subtitle_words)} words from master transcript for subtitles"
+                )
             generate_subtitle(
                 final_output_name,
                 video_id,
                 output_dir,
-                video_title=args.video_title
+                video_title=args.video_title,
+                subtitle_words=subtitle_words
             )
             print(f"Segment {i+1} processing complete")
         except Exception as e:
@@ -2243,8 +2252,163 @@ def build_audio_filter_args():
     return f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k'
 
 
-def generate_subtitle(input_file, video_id, output_dir, video_title=None):
-    """Generate subtitle for a video using Whisper and FFmpeg"""
+# Karaoke ASS captions: large, centered, word-by-word captions built from the
+# master transcript word timestamps (no re-transcription of the cropped clip).
+
+ASS_DEFAULT_FONT_FAMILY = "Noto Sans"
+ASS_DEFAULT_HIGHLIGHT_COLOR = "&H0000FFFF"  # ASS is &HAABBGGRR; this is yellow
+ASS_PRIMARY_COLOR = "&H00FFFFFF"  # white
+ASS_MAX_WORDS_PER_GROUP = 3
+ASS_PUNCTUATION_BREAK = (".", "!", "?")
+
+
+def _ass_timestamp(seconds):
+    """Format seconds as an ASS timestamp (H:MM:SS.cc)."""
+    seconds = max(0.0, float(seconds))
+    total_cs = int(seconds * 100)
+    h = total_cs // 360000
+    m = (total_cs // 6000) % 60
+    s = (total_cs // 100) % 60
+    cs = total_cs % 100
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _ass_escape(text):
+    """Escape word text so braces cannot start ASS override blocks.
+
+    Commas need no escaping: the Dialogue Text field is the last field, so
+    commas cannot break field parsing.
+    """
+    return str(text).replace("{", "\\{").replace("}", "\\}")
+
+
+def build_karaoke_ass(words, font_family=None, highlight_color=None):
+    """Build a complete ASS karaoke subtitle document from word timestamps.
+
+    Args:
+        words: flat list of {"word": str, "start": float, "end": float}
+            (clip-relative seconds), sorted by start.
+        font_family: optional font family; defaults to env
+            CAPTION_FONT_FAMILY, falling back to "Noto Sans".
+        highlight_color: optional ASS color for the current word; defaults to
+            env CAPTION_HIGHLIGHT_COLOR, falling back to &H0000FFFF (yellow).
+
+    Returns the ASS document string, or None when no words are available
+    (the caller falls back to the legacy SRT path).
+    """
+    if not words:
+        return None
+
+    words = sorted(
+        (w for w in words if w.get("word")),
+        key=lambda w: w.get("start", 0.0),
+    )
+    if not words:
+        return None
+
+    font = font_family or os.getenv("CAPTION_FONT_FAMILY", ASS_DEFAULT_FONT_FAMILY)
+    highlight = highlight_color or os.getenv(
+        "CAPTION_HIGHLIGHT_COLOR", ASS_DEFAULT_HIGHLIGHT_COLOR
+    )
+
+    # Group words into caption lines of at most 3 words; a new group also
+    # starts after a word ending with sentence punctuation.
+    groups = []
+    current_group = []
+    for word in words:
+        current_group.append(word)
+        if (
+            len(current_group) >= ASS_MAX_WORDS_PER_GROUP
+            or str(word["word"]).strip().endswith(ASS_PUNCTUATION_BREAK)
+        ):
+            groups.append(current_group)
+            current_group = []
+    if current_group:
+        groups.append(current_group)
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Karaoke,{font},58,{ASS_PRIMARY_COLOR},&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,60,60,250,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    def display_word(word):
+        return _ass_escape(str(word["word"]).strip().upper())
+
+    events = []
+    for group in groups:
+        group_end = group[-1]["end"]
+
+        # One dialogue per word: the full group text with the current word
+        # highlighted, the other words in the default white. Each dialogue
+        # spans until the next word starts (group end for the last word) so
+        # coverage is continuous with no gaps and no overlapping lines.
+        for i, word in enumerate(group):
+            if i + 1 < len(group):
+                event_end = max(float(group[i + 1]["start"]), float(word["start"]))
+            else:
+                event_end = group_end
+            tokens = [display_word(w) for w in group]
+            tokens[i] = (
+                f"{{\\c{highlight}&}}{tokens[i]}{{\\c{ASS_PRIMARY_COLOR}&}}"
+            )
+            events.append(
+                f"Dialogue: 0,{_ass_timestamp(word['start'])},"
+                f"{_ass_timestamp(event_end)},"
+                f"Karaoke,,0,0,0,," + " ".join(tokens)
+            )
+
+    return header + "\n".join(events) + "\n"
+
+
+def collect_segment_words(segments, start_time, end_time):
+    """Collect master-transcript words inside an SRT segment time range.
+
+    Picks the words (midpoint inside [start_time, end_time], SRT
+    HH:MM:SS,mmm timestamps) from the in-memory transcript segments and
+    shifts them to clip-relative time. Returns None when the transcript has
+    no word data so the caller falls back to re-transcription.
+    """
+    try:
+        seg_start = parse_srt_time(start_time)
+        seg_end = parse_srt_time(end_time)
+    except (ValueError, AttributeError):
+        return None
+
+    words = []
+    for segment in segments or []:
+        for word in segment.get("words") or []:
+            start = float(word["start"])
+            end = float(word["end"])
+            midpoint = (start + end) / 2
+            if seg_start <= midpoint <= seg_end:
+                words.append(
+                    {
+                        "word": str(word["word"]).strip(),
+                        "start": max(0.0, start - seg_start),
+                        "end": max(0.0, end - seg_start),
+                    }
+                )
+    return words if words else None
+
+
+def generate_subtitle(input_file, video_id, output_dir, video_title=None, subtitle_words=None):
+    """Generate subtitle for a video using Whisper and FFmpeg
+
+    When subtitle_words (flat word list already offset to clip-relative time)
+    is provided and non-empty, word-level karaoke captions built from the
+    master transcript are burned instead of re-transcribing the clip. The
+    legacy re-transcription + SRT path is kept as the fallback.
+    """
     # Get channel name from root .env file
     root_env_path = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), ".env")
     print(f"Looking for .env file at: {root_env_path}")
@@ -2381,21 +2545,40 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None):
                 print(f"Error in fallback Whisper transcription: {str(fallback_error)}")
                 return None
 
-    # Generate subtitles using the configured STT model
-    print(f"Transcribing video: tmp/{input_file}")
-    srt_content = transcribe_with_configured_model(f"tmp/{input_file}")
-
-    # Create temporary SRT file
+    # Prefer karaoke captions from the master transcript words (no
+    # re-transcription); fall back to the legacy SRT path otherwise.
     input_base = os.path.basename(input_file).split(".")[0]
-    temp_srt_file = f"tmp/{input_base}.srt"
+    temp_ass_file = None
+    if subtitle_words:
+        ass_content = build_karaoke_ass(subtitle_words)
+        if ass_content:
+            temp_ass_file = f"tmp/{input_base}.ass"
+            try:
+                with open(temp_ass_file, "w", encoding="utf-8") as f:
+                    f.write(ass_content)
+                print(f"Karaoke subtitle file created: {temp_ass_file}")
+            except IOError as e:
+                print(f"Error writing karaoke subtitle file: {str(e)}")
+                temp_ass_file = None
+        else:
+            print("No word timestamps available, falling back to SRT subtitles")
 
-    if srt_content:
-        with open(temp_srt_file, "w", encoding="utf-8") as f:
-            f.write(srt_content)
-        print(f"Subtitle file created: {temp_srt_file}")
-    else:
-        print("No subtitles generated, will create video without subtitles")
+    temp_srt_file = f"tmp/{input_base}.srt"
+    if temp_ass_file:
+        srt_content = None
         temp_srt_file = None
+    else:
+        # Generate subtitles using the configured STT model
+        print(f"Transcribing video: tmp/{input_file}")
+        srt_content = transcribe_with_configured_model(f"tmp/{input_file}")
+
+        if srt_content:
+            with open(temp_srt_file, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+            print(f"Subtitle file created: {temp_srt_file}")
+        else:
+            print("No subtitles generated, will create video without subtitles")
+            temp_srt_file = None
 
     # Create output path for final video with overlays
     output_filename = os.path.basename(input_file)
@@ -2405,7 +2588,12 @@ def generate_subtitle(input_file, video_id, output_dir, video_title=None):
     output_path = f"{output_dir}/{output_filename}"
 
     # Check if subtitle file was generated
-    if not temp_srt_file or not os.path.exists(temp_srt_file):
+    if temp_ass_file:
+        print(f"Using karaoke subtitle file: {temp_ass_file}")
+        # libass reads styles from the ASS file itself, so no force_style.
+        filter_parts = [f"subtitles='{temp_ass_file}'[v1]"]
+        last_filter = "v1"
+    elif not temp_srt_file or not os.path.exists(temp_srt_file):
         print(f"Warning: No subtitle file available, creating video without subtitles")
         # Create video with only overlays (no subtitles)
         filter_parts = []
