@@ -353,14 +353,12 @@ class TestWiringInvariants:
         assert "audio_analysis_summary.txt" in REELSFY_SOURCE
         assert "EnhancedAudioAnalyzer(audio_path)" in REELSFY_SOURCE
 
-    def test_content_centric_functions_retained_test_hook_still_references_them(
-        self,
-    ):
-        # tests/test_hook_teaser.py still calls these functions directly, so
-        # the brief's grep condition keeps the definitions; only the dead
-        # call site inside generate_viral is removed.
-        assert "def create_content_centric_prompt" in REELSFY_SOURCE
-        assert "def create_content_centric_system_prompt" in REELSFY_SOURCE
+    def test_content_centric_functions_deleted_as_dead_code(self):
+        # The content-centric prompt functions were production-dead (their
+        # only call site in generate_viral was removed in Task 14) and have
+        # been deleted entirely from reelsfy.py.
+        assert "def create_content_centric_prompt" not in REELSFY_SOURCE
+        assert "def create_content_centric_system_prompt" not in REELSFY_SOURCE
 
 
 # ---------------------------------------------------------------------------

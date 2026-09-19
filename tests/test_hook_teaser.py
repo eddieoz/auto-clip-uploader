@@ -205,26 +205,6 @@ class TestPromptHookFields:
         assert "segments" in parsed
         assert "hook_start_time" in parsed["segments"][0]
 
-    def test_json_template_hook_fields_optional_in_instructions(self):
-        # Guidance lives in the prompt instruction lines, not in the JSON
-        # placeholder values (GPT must not echo instructions into values).
-        segment_info = {
-            "start_time": "00:00:00,000",
-            "end_time": "00:00:40,000",
-            "title": "Title",
-            "duration": 40.0,
-        }
-        concluding_topic = {"text": "Topic text", "topic_keywords": ["a"], "topic_confidence": 0.9}
-
-        prompt = reelsfy.create_content_centric_prompt(
-            segment_info, concluding_topic, [], "Portuguese",
-            reelsfy.build_segment_json_template(),
-        )
-        fallback_source = inspect.getsource(reelsfy.generate_viral)
-
-        assert "optional" in prompt.lower()
-        assert "optional" in fallback_source.lower()
-
     def test_json_template_values_have_no_parentheticals(self):
         # Example values must be plain: a parenthetical like
         # "00:00:05,000 (optional; ...)" echoed by GPT would be rejected by
@@ -233,24 +213,6 @@ class TestPromptHookFields:
 
         assert "(" not in template
         assert ")" not in template
-
-    def test_content_centric_prompt_mentions_hook_fields(self):
-        segment_info = {
-            "start_time": "00:00:00,000",
-            "end_time": "00:00:40,000",
-            "title": "Title",
-            "duration": 40.0,
-        }
-        concluding_topic = {"text": "Topic text", "topic_keywords": ["a"], "topic_confidence": 0.9}
-
-        prompt = reelsfy.create_content_centric_prompt(
-            segment_info, concluding_topic, [], "Portuguese",
-            reelsfy.build_segment_json_template(),
-        )
-
-        assert "hook_start_time" in prompt
-        assert "hook_end_time" in prompt
-        assert "hook_text" in prompt
 
     def test_fallback_viral_prompt_mentions_hook_fields(self):
         # The fallback prompt is built inline in generate_viral; verify the
