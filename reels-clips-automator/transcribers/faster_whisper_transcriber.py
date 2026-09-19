@@ -64,21 +64,32 @@ class FasterWhisperTranscriber(BaseTranscriber):
             # Use configured language or auto-detect
             if self._language:
                 logger.info(f"Using configured language: {self._language}")
-                segments, info = self._model.transcribe(audio_path, language=self._language)
+                segments, info = self._model.transcribe(audio_path, language=self._language, word_timestamps=True)
             else:
                 logger.info("Using automatic language detection")
-                segments, info = self._model.transcribe(audio_path)
+                segments, info = self._model.transcribe(audio_path, word_timestamps=True)
 
             logger.info(f"Transcription info - Language: {info.language}, Duration: {info.duration:.2f}s")
 
             # Convert Faster Whisper segments to standard format
             result_segments = []
             for segment in segments:
-                result_segments.append({
+                entry = {
                     "start": segment.start,
                     "end": segment.end,
                     "text": segment.text.strip()
-                })
+                }
+                # Map word-level timestamps into the contract format when available
+                if segment.words:
+                    entry["words"] = [
+                        {
+                            "word": word.word.strip(),
+                            "start": word.start,
+                            "end": word.end
+                        }
+                        for word in segment.words
+                    ]
+                result_segments.append(entry)
 
             logger.info(f"Transcription completed. Language: {info.language}, "
                        f"Duration: {info.duration:.2f}s, Segments: {len(result_segments)}")

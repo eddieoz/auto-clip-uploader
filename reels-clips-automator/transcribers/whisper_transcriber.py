@@ -41,19 +41,30 @@ class WhisperTranscriber(BaseTranscriber):
             # Use configured language or auto-detect
             if self._language:
                 logger.info(f"Using configured language: {self._language}")
-                result = self._model.transcribe(audio_path, language=self._language)
+                result = self._model.transcribe(audio_path, language=self._language, word_timestamps=True)
             else:
                 logger.info("Using automatic language detection")
-                result = self._model.transcribe(audio_path)
+                result = self._model.transcribe(audio_path, word_timestamps=True)
 
             # Convert Whisper segments to standard format
             segments = []
             for segment in result["segments"]:
-                segments.append({
+                entry = {
                     "start": segment["start"],
                     "end": segment["end"],
                     "text": segment["text"].strip()
-                })
+                }
+                # Map word-level timestamps into the contract format when available
+                if segment.get("words"):
+                    entry["words"] = [
+                        {
+                            "word": word["word"].strip(),
+                            "start": word["start"],
+                            "end": word["end"]
+                        }
+                        for word in segment["words"]
+                    ]
+                segments.append(entry)
 
             return segments
 

@@ -19,7 +19,15 @@ class BaseTranscriber(ABC):
                 {
                     "start": float,  # Start time in seconds
                     "end": float,    # End time in seconds
-                    "text": str      # Transcribed text
+                    "text": str,     # Transcribed text
+                    "words": [       # Optional word-level timestamps
+                        {            # Only present when the backend provides them;
+                            "word": str,   # Word text (stripped)
+                            "start": float,  # Start time in seconds
+                            "end": float     # End time in seconds
+                        },
+                        ...
+                    ]
                 },
                 ...
             ]
