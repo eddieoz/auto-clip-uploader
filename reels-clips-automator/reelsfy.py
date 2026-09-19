@@ -3097,6 +3097,130 @@ def build_audio_filter_args():
     return f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k'
 
 
+# Polish features (Story 10 / P3.1-P3.3): mild visual grade on the main clip,
+# a 1.5 s end-card CTA appended at assembly, and an optional music bed mixed
+# under the speech. Each feature is env-gated and must be inert (commands
+# byte-identical to the previous behavior) whenever it is off/unset.
+
+# P3.1: exact grade chain from the brief — mild saturation/contrast lift plus
+# a light sharpen. Prepended as the FIRST video filter in generate_subtitle so
+# captions and overlays burn ON TOP of the graded image.
+VIDEO_GRADE_FILTER = "eq=saturation=1.06:contrast=1.02,unsharp=5:5:0.6"
+
+# P3.2: end card CTA constants.
+END_CARD_FILE = "end-card.mp4"
+END_CARD_DURATION_SECONDS = 1.5
+END_CARD_FADE_SECONDS = 0.4
+END_CARD_FONT_SIZE = 64
+END_CARD_DEFAULT_COLOR = "0x14213D"
+END_CARD_DEFAULT_TEXT = "Segue para mais!"
+
+
+def resolve_video_grade():
+    """Resolve the P3.1 visual grade from the environment.
+
+    Returns the grade filter string that opens generate_subtitle's video
+    chain, or None when grading is disabled. VIDEO_GRADE defaults to "true"
+    (only the literal "false" disables, like JUMP_CUTS_ENABLED); when
+    VIDEO_LUT is set to a path, lut3d=<path> replaces the eq/unsharp pair.
+    """
+    lut_path = os.getenv('VIDEO_LUT', '').strip()
+    if lut_path:
+        print(
+            f"Visual grade: using VIDEO_LUT '{lut_path}' instead of eq/unsharp"
+        )
+        return f"lut3d='{lut_path}'"
+    grade_raw = os.getenv('VIDEO_GRADE', 'true').lower().strip()
+    if grade_raw == 'false':
+        print("Visual grade disabled (VIDEO_GRADE=false)")
+        return None
+    return VIDEO_GRADE_FILTER
+
+
+def resolve_music_bed():
+    """Resolve the P3.3 music bed path from MUSIC_BED.
+
+    Unset/empty (the default) means OFF and every command stays identical
+    to the no-music-bed behavior.
+    """
+    path = os.getenv('MUSIC_BED', '').strip()
+    if not path:
+        return None
+    print(f"Music bed enabled: {path}")
+    return path
+
+
+def build_music_bed_audio_filters():
+    """Audio half of the music-bed -filter_complex: the bed is mixed UNDER
+    the speech (-24 dB) and the SAME mastering chain is applied to the mix,
+    so the audio is still mastered exactly once."""
+    return (
+        "[1:a]volume=-24dB[m];[0:a][m]amix=inputs=2:duration=first[aout];"
+        f"[aout]{AUDIO_MASTERING_FILTER}[aout2]"
+    )
+
+
+def resolve_end_card_enabled():
+    """P3.2 gate: END_CARD_ENABLED defaults to "true"; only the literal
+    "false" (any case) disables the end card."""
+    enabled_raw = os.getenv('END_CARD_ENABLED', 'true').lower().strip()
+    enabled = enabled_raw != 'false'
+    if not enabled:
+        print("End card disabled (END_CARD_ENABLED=false); publishing without it")
+    return enabled
+
+
+def build_end_card_command():
+    """Pure builder for the 1.5 s end-card clip command.
+
+    1080x1920 solid color (END_CARD_COLOR) with the CTA text (END_CARD_TEXT)
+    centered via drawtext (OVERLAY_FONTFILE, fontsize 64, white, black
+    outline) plus a 0.4 s fade-in. Audio is a silent anullsrc encoded as AAC
+    44100 Hz stereo (the main audio's sample rate is not knowable reliably;
+    the assembly fallback ladder handles compatibility). NVENC settings match
+    the other concat pieces, and the end card is silent-sourced so no
+    mastering filter ever touches it.
+    """
+    color = os.getenv('END_CARD_COLOR', END_CARD_DEFAULT_COLOR).strip()
+    text = os.getenv('END_CARD_TEXT', END_CARD_DEFAULT_TEXT)
+    drawtext = (
+        f"drawtext=text='{text}':fontfile={OVERLAY_FONTFILE}:"
+        f"fontsize={END_CARD_FONT_SIZE}:fontcolor=white:"
+        "borderw=3:bordercolor=black:x=(w-tw)/2:y=(h-th)/2"
+    )
+    return (
+        "ffmpeg -y -hwaccel cuda "
+        f"-f lavfi -i color=c={color}:s=1080x1920:d={END_CARD_DURATION_SECONDS} "
+        "-f lavfi -i anullsrc=r=44100:cl=stereo "
+        f"-vf \"{drawtext},fade=t=in:st=0:d={END_CARD_FADE_SECONDS}\" "
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
+        "-c:a aac -b:a 192k -ar 44100 -ac 2 -shortest "
+        f"tmp/{END_CARD_FILE}"
+    )
+
+
+def generate_end_card():
+    """Build tmp/end-card.mp4 once per segment; returns the path or None
+    when the build fails (the caller assembles without the end card)."""
+    try:
+        command = build_end_card_command()
+        print(f"End card command: {command}")
+        result = subprocess.call(command, shell=True)
+        end_card_path = f"tmp/{END_CARD_FILE}"
+        if (
+            result != 0
+            or not os.path.exists(end_card_path)
+            or os.path.getsize(end_card_path) == 0
+        ):
+            print(f"End card: build failed (rc={result}); skipping end card")
+            return None
+        return end_card_path
+    except Exception as e:
+        print(f"End card generation failed: {str(e)}")
+        return None
+
+
 # Karaoke ASS captions: large, centered, word-by-word captions built from the
 # master transcript word timestamps (no re-transcription of the cropped clip).
 
@@ -3426,6 +3550,19 @@ def build_teaser_concat_fallback_command(concat_list_path, published_path):
     )
 
 
+def build_teaser_concat_full_fallback_command(concat_list_path, published_path):
+    """Last-resort assembly fallback (end-card assemblies only): full
+    re-encode of video (NVENC) AND audio (plain AAC re-encode) when both
+    -c copy and the video-only re-encode fail. Audio is re-encoded WITHOUT
+    the mastering chain — never re-mastered over the concatenation."""
+    return (
+        f'ffmpeg -y -f concat -safe 0 -i "{concat_list_path}" '
+        "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
+        "-maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
+        f'-c:a aac -b:a 192k "{published_path}"'
+    )
+
+
 def generate_hook_teaser(hook_start, hook_end, hook_text):
     """Build the 9:16 hook teaser from tmp/input_video.mp4.
 
@@ -3486,23 +3623,25 @@ def compute_published_output_path(output_dir, input_file):
 
 
 def assemble_hook_teaser_final(
-    teaser_path, main_path, published_path, concat_list_path=None
+    teaser_path, main_path, published_path, concat_list_path=None, end_card_path=None
 ):
-    """Concat teaser + main into the published path with `-c copy`.
+    """Concat teaser (if any) + main + end card (if any) into the published
+    path with `-c copy`.
 
     Falls back to a video-only NVENC re-encode (-c:a copy) when the
-    stream-copy concat fails. Audio is never re-mastered here.
+    stream-copy concat fails, and — only when an end card is part of the
+    assembly — to a final full re-encode (NVENC + plain AAC). Audio is never
+    re-mastered here.
     """
     concat_list_path = concat_list_path or HOOK_TEASER_CONCAT_LIST
     try:
         # ffmpeg's concat demuxer resolves relative entry paths against the
         # LIST FILE's directory (not the cwd), so the entries must be
         # absolute or both concat attempts would look for tmp/tmp/... .
-        teaser_abs = os.path.abspath(teaser_path)
-        main_abs = os.path.abspath(main_path)
+        entries = [path for path in (teaser_path, main_path, end_card_path) if path]
         with open(concat_list_path, "w", encoding="utf-8") as f:
-            f.write(f"file '{teaser_abs}'\n")
-            f.write(f"file '{main_abs}'\n")
+            for entry in entries:
+                f.write(f"file '{os.path.abspath(entry)}'\n")
         command = build_teaser_concat_command(concat_list_path, published_path)
         print(f"Hook teaser concat command: {command}")
         result = subprocess.call(command, shell=True)
@@ -3525,6 +3664,21 @@ def assemble_hook_teaser_final(
         if result == 0 and os.path.exists(published_path):
             print(f"Hook teaser fallback assembly complete: {published_path}")
             return True
+        if end_card_path:
+            # The silent end card can force a -c:a copy failure (sample-rate
+            # mismatch); one last rung re-encodes video AND audio (no
+            # mastering) so the assembly still succeeds.
+            command = build_teaser_concat_full_fallback_command(
+                concat_list_path, published_path
+            )
+            print(f"Hook teaser full fallback command: {command}")
+            result = subprocess.call(command, shell=True)
+            if result == 0 and os.path.exists(published_path):
+                print(
+                    f"Hook teaser full fallback assembly complete: "
+                    f"{published_path}"
+                )
+                return True
         print(f"Hook teaser: fallback assembly also failed (rc={result})")
         return False
     except Exception as e:
@@ -3555,6 +3709,14 @@ def publish_segment_with_optional_teaser(
     }
     published_path = compute_published_output_path(output_dir, final_output_name)
 
+    # P3.2: build the end card once per segment. A failed build degrades to
+    # today's behavior (assembly without the end card / direct publish).
+    end_card_path = None
+    if resolve_end_card_enabled():
+        end_card_path = generate_end_card()
+        if end_card_path:
+            print(f"End card ready: {end_card_path}")
+
     main_output_path = None
     teaser_path = None
     if hook:
@@ -3566,14 +3728,19 @@ def publish_segment_with_optional_teaser(
         else:
             print("Hook teaser: generation failed; publishing without teaser")
 
-    if not main_output_path:
+    if not main_output_path and not end_card_path:
         generate_subtitle(
             final_output_name, video_id, output_dir, **direct_publish_kwargs
         )
         return
 
-    # Write the burned main clip to tmp/, then concat teaser in front of it
-    # into the published path.
+    if not main_output_path:
+        # No teaser but an end card: burn the main clip to tmp/ so the end
+        # card can be appended by the concat assembly.
+        main_output_path = f"tmp/{HOOK_TEASER_MAIN_OUTPUT_FILE}"
+
+    # Write the burned main clip to tmp/, then concat teaser (if any) and the
+    # end card (if any) around it into the published path.
     burned_ok = generate_subtitle(
         final_output_name,
         video_id,
@@ -3595,7 +3762,9 @@ def publish_segment_with_optional_teaser(
         )
         return
 
-    if assemble_hook_teaser_final(teaser_path, main_output_path, published_path):
+    if assemble_hook_teaser_final(
+        teaser_path, main_output_path, published_path, end_card_path=end_card_path
+    ):
         return
     print(
         "Hook teaser: assembly failed; publishing the video directly "
@@ -3628,6 +3797,11 @@ def generate_subtitle(
     """
     # Get channel name from root .env file (shared helper, current-env fallback)
     channel_name = get_channel_name()
+
+    # P3.1/P3.3: resolve the polish features. Both are inert when off/unset
+    # (commands byte-identical to the previous behavior).
+    grade_filter = resolve_video_grade()
+    music_bed = resolve_music_bed()
 
     # Get current date
     from datetime import datetime
@@ -3797,19 +3971,32 @@ def generate_subtitle(
     if temp_ass_file:
         print(f"Using karaoke subtitle file: {temp_ass_file}")
         # libass reads styles from the ASS file itself, so no force_style.
-        filter_parts = [f"subtitles='{temp_ass_file}'[v1]"]
+        if grade_filter:
+            # P3.1: grade FIRST, captions burn on top of the graded image.
+            filter_parts = [
+                f"{grade_filter}[v0]",
+                f"[v0]subtitles='{temp_ass_file}'[v1]",
+            ]
+        else:
+            filter_parts = [f"subtitles='{temp_ass_file}'[v1]"]
         last_filter = "v1"
     elif not temp_srt_file or not os.path.exists(temp_srt_file):
         print(f"Warning: No subtitle file available, creating video without subtitles")
         # Create video with only overlays (no subtitles)
-        filter_parts = []
-        last_filter = "0:v"
+        if grade_filter:
+            filter_parts = [f"{grade_filter}[v0]"]
+            last_filter = "v0"
+        else:
+            filter_parts = []
+            last_filter = "0:v"
     else:
         print(f"Using subtitle file: {temp_srt_file}")
         # Build filter complex starting with subtitles
-        filter_parts = [
-            f"subtitles='{temp_srt_file}':force_style='Alignment=2,MarginV=130,MarginL=55,MarginR=55,Fontname=Noto Sans,Fontsize=6,PrimaryColour=&H00ffffff,SecondaryColour=&H000000ff,OutlineColour=&H00000000,BackColour=&H80000000,Outline=1.5,Shadow=1.5,BorderStyle=1'[v1]"
-        ]
+        srt_subtitles = f"subtitles='{temp_srt_file}':force_style='Alignment=2,MarginV=130,MarginL=55,MarginR=55,Fontname=Noto Sans,Fontsize=6,PrimaryColour=&H00ffffff,SecondaryColour=&H000000ff,OutlineColour=&H00000000,BackColour=&H80000000,Outline=1.5,Shadow=1.5,BorderStyle=1'[v1]"
+        if grade_filter:
+            filter_parts = [f"{grade_filter}[v0]", f"[v0]{srt_subtitles}"]
+        else:
+            filter_parts = [srt_subtitles]
         last_filter = "v1"
 
     # Add the restyled overlays: date (top-left) and video title or channel
@@ -3823,16 +4010,42 @@ def generate_subtitle(
     filter_parts.extend(overlay_filters)
 
     # Build final FFmpeg command with proper spacing and quotes
-    if filter_parts:
-        filter_complex = ";".join(filter_parts)
-        ffmpeg_command = (
-            f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
-            f'-filter_complex "{filter_complex}" '  # Added space
-            f'-map "[{last_filter}]" -map 0:a '
-            f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
-            f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
-            f'{build_audio_filter_args()} "{output_path}"'
-        )
+    if filter_parts or music_bed:
+        if music_bed:
+            # P3.3: bed mixed UNDER the speech, then mastered exactly once;
+            # the video chain itself is unchanged.
+            audio_complex = build_music_bed_audio_filters()
+            video_complex = ";".join(filter_parts) if filter_parts else None
+            filter_complex = (
+                f"{video_complex};{audio_complex}" if video_complex else audio_complex
+            )
+            video_map = (
+                f'-map "[{last_filter}]"' if filter_parts else "-map 0:v"
+            )
+            video_codec = (
+                "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 "
+                "-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p"
+                if filter_parts
+                else "-c:v copy"
+            )
+            ffmpeg_command = (
+                f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '
+                f'-stream_loop -1 -i "{music_bed}" '
+                f'-filter_complex "{filter_complex}" '
+                f'{video_map} -map "[aout2]" '
+                f"{video_codec} "
+                f'-c:a aac -b:a 192k "{output_path}"'
+            )
+        elif filter_parts:
+            filter_complex = ";".join(filter_parts)
+            ffmpeg_command = (
+                f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
+                f'-filter_complex "{filter_complex}" '  # Added space
+                f'-map "[{last_filter}]" -map 0:a '
+                f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
+                f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
+                f'{build_audio_filter_args()} "{output_path}"'
+            )
     else:
         # No overlays, just copy
         ffmpeg_command = (

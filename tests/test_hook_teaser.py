@@ -555,6 +555,7 @@ class TestPublishSegmentWithOptionalTeaser:
         generate_subtitle_side_effect=None,
         teaser_path="tmp/hook-teaser.mp4",
         assemble_return=False,
+        env=None,
     ):
         """Run publish_segment_with_optional_teaser with the teaser helpers
         mocked. Returns (generate_subtitle_mock, assemble_mock)."""
@@ -569,6 +570,11 @@ class TestPublishSegmentWithOptionalTeaser:
             reelsfy, "generate_hook_teaser", return_value=teaser_path
         ), patch.object(
             reelsfy, "assemble_hook_teaser_final", assemble_mock
+        ), patch.object(
+            # Story 10: keep the default-ON end card hermetic (no real ffmpeg)
+            reelsfy, "generate_end_card", MagicMock(return_value="tmp/end-card.mp4")
+        ), patch.dict(
+            os.environ, env or {}
         ), patch(
             "os.path.exists", return_value=True
         ), patch(
@@ -597,7 +603,12 @@ class TestPublishSegmentWithOptionalTeaser:
         )
 
     def test_no_hook_publishes_directly(self):
-        generate_subtitle_mock, assemble_mock = self._run(hook=None)
+        # No hook fields AND the end card disabled: exactly the legacy
+        # no-teaser behavior (Story 10's end card defaults ON and is covered
+        # by tests/test_polish.py).
+        generate_subtitle_mock, assemble_mock = self._run(
+            hook=None, env={"END_CARD_ENABLED": "false"}
+        )
 
         assert generate_subtitle_mock.call_count == 1
         assert self._is_direct_publish_call(generate_subtitle_mock.call_args)
@@ -638,7 +649,11 @@ class TestPublishSegmentWithOptionalTeaser:
         assemble_mock.assert_not_called()
 
     def test_teaser_generation_failure_publishes_directly(self):
-        generate_subtitle_mock, assemble_mock = self._run(teaser_path=None)
+        # Legacy degradation (end card disabled): a failed teaser still
+        # publishes the video through the direct generate_subtitle path.
+        generate_subtitle_mock, assemble_mock = self._run(
+            teaser_path=None, env={"END_CARD_ENABLED": "false"}
+        )
 
         assert generate_subtitle_mock.call_count == 1
         assert self._is_direct_publish_call(generate_subtitle_mock.call_args)
