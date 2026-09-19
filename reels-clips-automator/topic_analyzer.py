@@ -13,6 +13,23 @@ from dataclasses import dataclass
 import json
 
 
+def phrase_matches(text_lower: str, phrase: str) -> bool:
+    """
+    Match a phrase in text using word boundaries instead of a plain substring test.
+
+    Uses ``re.search`` with ``\\b`` on both sides of the escaped phrase so a
+    listed phrase no longer matches inside a larger word ("so" no longer
+    matches "person"). Multi-word phrases are collapsed to ``\\s+`` between
+    their words so spacing variations still match, and the search is
+    case-insensitive. Empty text or an empty/whitespace-only phrase never
+    matches.
+    """
+    if not text_lower or not phrase or not phrase.strip():
+        return False
+    pattern = r"\b" + r"\s+".join(re.escape(word) for word in phrase.split()) + r"\b"
+    return re.search(pattern, text_lower, re.IGNORECASE) is not None
+
+
 @dataclass
 class TopicSegment:
     """Represents a topic segment within the transcript."""
@@ -224,13 +241,13 @@ class TopicAnalyzer:
             
             # Check for transition indicators
             has_transition = any(
-                phrase in segment.text.lower() 
+                phrase_matches(segment.text.lower(), phrase)
                 for phrase in self.transition_phrases
             )
             
             # Check for conclusion indicators
             has_conclusion = any(
-                phrase in segment.text.lower() 
+                phrase_matches(segment.text.lower(), phrase)
                 for phrase in self.conclusion_phrases
             )
             
@@ -260,7 +277,7 @@ class TopicAnalyzer:
         keyword_bonus = min(keyword_density * 2, 0.3)
         
         # Boost for coherence indicators
-        coherence_bonus = sum(0.05 for phrase in self.coherence_keywords if phrase in text)
+        coherence_bonus = sum(0.05 for phrase in self.coherence_keywords if phrase_matches(text, phrase))
         coherence_bonus = min(coherence_bonus, 0.2)
         
         # Boost for longer segments (more content)
@@ -306,7 +323,7 @@ class TopicAnalyzer:
             
             # Conclusion phrase bonus
             has_conclusion = any(
-                phrase in segment.text.lower() 
+                phrase_matches(segment.text.lower(), phrase)
                 for phrase in self.conclusion_phrases
             )
             if has_conclusion:
@@ -434,7 +451,7 @@ class TopicAnalyzer:
         
         # Coherence indicator bonus
         has_coherence = any(
-            phrase in segment.text.lower() 
+            phrase_matches(segment.text.lower(), phrase)
             for phrase in self.coherence_keywords
         )
         coherence_bonus = 0.2 if has_coherence else 0
@@ -476,22 +493,22 @@ class TopicAnalyzer:
         
         # Setup/Introduction indicators
         setup_phrases = ['let me explain', 'first', 'to begin', 'initially', 'starting with']
-        if any(phrase in segment_text for phrase in setup_phrases):
+        if any(phrase_matches(segment_text, phrase) for phrase in setup_phrases):
             return 'setup'
         
         # Development/Elaboration indicators  
         development_phrases = ['furthermore', 'additionally', 'also', 'moreover', 'next']
-        if any(phrase in segment_text for phrase in development_phrases):
+        if any(phrase_matches(segment_text, phrase) for phrase in development_phrases):
             return 'development'
         
         # Bridge/Transition indicators
         bridge_phrases = ['however', 'but', 'on the other hand', 'meanwhile', 'then']
-        if any(phrase in segment_text for phrase in bridge_phrases):
+        if any(phrase_matches(segment_text, phrase) for phrase in bridge_phrases):
             return 'bridge'
         
         # Evidence/Support indicators
         evidence_phrases = ['for example', 'such as', 'specifically', 'in fact', 'actually']
-        if any(phrase in segment_text for phrase in evidence_phrases):
+        if any(phrase_matches(segment_text, phrase) for phrase in evidence_phrases):
             return 'evidence'
         
         return 'context'  # Default role
