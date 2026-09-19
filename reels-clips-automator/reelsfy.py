@@ -20,6 +20,7 @@ from enhanced_audio_analyzer import EnhancedAudioAnalyzer
 from topic_analyzer import TopicAnalyzer
 from talking_face_detector import TalkingFaceDetector
 from performance_profiler import PerformanceProfiler
+from face_quality_scorer import FaceQualityScorer
 
 # Define workspace directory
 WORKSPACE_DIR = os.getcwd()  # Use current working directory instead of script location
@@ -696,6 +697,44 @@ def generate_thumbnail(face, text, thumb_dir):
     print(f"Thumbnail saved to: {thumbnail_path}")
 
 
+# Polish features (Story 11, P3.5): instead of taking the first smiling frame
+# (early exit), smile candidates are COLLECTED across the clip (up to
+# SMILE_CANDIDATE_LIMIT) and the one with the best face-quality score wins.
+SMILE_CANDIDATE_LIMIT = 5
+
+
+def select_best_smile_frame(candidates):
+    """
+    Pick the smile candidate with the best FaceQualityScorer score.
+
+    Scoring failures (exception or no usable scores) fall back to the FIRST
+    candidate — the previous first-smile behavior.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    scores = []
+    try:
+        scorer = FaceQualityScorer()
+        for candidate in candidates:
+            ch, cw = candidate.shape[:2]
+            scores.append(scorer.score_face_quality(candidate, (0, 0, cw, ch)))
+    except Exception as e:
+        print(f"Warning: smile quality scoring failed ({e}); using first smile frame")
+        return candidates[0]
+    usable = [
+        (i, s)
+        for i, s in enumerate(scores)
+        if isinstance(s, (int, float)) and not isinstance(s, bool)
+    ]
+    if not usable:
+        return candidates[0]
+    best_index = max(usable, key=lambda item: item[1])[0]
+    print(f"[INFO] Selected smile frame {best_index + 1}/{len(candidates)} (best quality)")
+    return candidates[best_index]
+
+
 # ---------------------------------------------------------------------------
 # Layout-aware reframing (Story 8, P2.1): screencast-first
 #
@@ -1116,6 +1155,57 @@ class _PipeFrameWriter:
         self.proc.wait()
 
 
+# Polish features (Story 11, P3.4): the center-crop fallback (no face in the
+# current frame) no longer hard-centers when the clip HAS seen a face earlier;
+# the largest 9:16 window is positioned on the last known face center instead.
+# Pure helper so the math is testable; crop_ratio=1 matches the local
+# CROP_RATIO_BIG inside generate_short.
+def compute_fallback_crop(
+    frame_width, frame_height, last_face_center=None, crop_ratio=1
+):
+    """
+    Compute the top-left corner and size of the fallback 9:16 crop window.
+
+    last_face_center is the (x, y) of the most recently tracked face center
+    (the EMA-smoothed prev_face_center when available). None keeps the
+    current centered behavior exactly.
+    """
+    vertical_ratio = 9 / 16
+
+    # Largest possible 9:16 box that fits in the frame (same max-window math
+    # as the face-path crop).
+    max_possible_width = frame_width
+    max_possible_height = int(frame_width / vertical_ratio)
+    if max_possible_height > frame_height:
+        max_possible_height = frame_height
+        max_possible_width = int(frame_height * vertical_ratio)
+
+    crop_height = int(max_possible_height * crop_ratio)
+    crop_width = int(max_possible_width * crop_ratio)
+
+    if last_face_center is None:
+        # No face history: hard-centered crop (previous behavior).
+        crop_x = max(0, (frame_width - crop_width) // 2)
+        crop_y = max(0, (frame_height - crop_height) // 2)
+    else:
+        # Position the window on the last known face center, clamped to
+        # frame bounds (same positioning as the face-path crop).
+        crop_x = last_face_center[0] - crop_width // 2
+        crop_y = last_face_center[1] - crop_height // 2
+        if crop_x < 0:
+            crop_x = 0
+        elif crop_x + crop_width > frame_width:
+            crop_x = frame_width - crop_width
+        if crop_y < 0:
+            crop_y = 0
+        elif crop_y + crop_height > frame_height:
+            crop_y = frame_height - crop_height
+        crop_x = max(0, crop_x)
+        crop_y = max(0, crop_y)
+
+    return crop_x, crop_y, crop_width, crop_height
+
+
 def generate_short(
     input_file,
     output_file,
@@ -1126,6 +1216,7 @@ def generate_short(
     thumb_dir="",
     debug_faces=False,
     performance_profile=False,
+    thumb_text=None,
     _pipe=True,
 ):
     try:
@@ -1264,7 +1355,9 @@ def generate_short(
                 f"tmp/{sanitized_output}", fourcc, input_fps, (1080, 1920), True
             )  # Use input fps
         face_positions = []
-        smile_found = False
+        # Story 11: collected smile candidates (no first-smile early exit);
+        # the best-quality candidate becomes the thumbnail at the end.
+        smile_candidates = []
         boxes = None
         trackers = None
 
@@ -1343,12 +1436,18 @@ def generate_short(
                             last_badge = badge_crop
                         out.write(rendered)
 
-                        if thumb and not smile_found and face_box is not None:
+                        if (
+                            thumb
+                            and len(smile_candidates) < SMILE_CANDIDATE_LIMIT
+                            and face_box is not None
+                        ):
                             fb_x, fb_y, fb_w, fb_h = face_box
-                            smile_found, smile_frame = find_smile(
+                            candidate_found, candidate_frame = find_smile(
                                 frame[fb_y : fb_y + fb_h, fb_x : fb_x + fb_w],
                                 output_file,
                             )
+                            if candidate_found:
+                                smile_candidates.append(candidate_frame)
                     else:
                         # Screen-zoom: follow the point of maximum motion energy,
                         # fallback to the screen-region center when negligible.
@@ -1699,26 +1798,28 @@ def generate_short(
                             crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC
                         )
 
-                    if thumb and not smile_found:
-                        smile_found, smile_frame = find_smile(
+                    if (
+                        thumb
+                        and len(smile_candidates) < SMILE_CANDIDATE_LIMIT
+                    ):
+                        candidate_found, candidate_frame = find_smile(
                             frame[y : y + h, x : x + w], output_file
                         )
+                        if candidate_found:
+                            smile_candidates.append(candidate_frame)
 
                     out.write(resized)
                 else:
-                    # If no faces detected, use the largest possible centered crop
-                    max_possible_width = frame_width
-                    max_possible_height = int(frame_width / VERTICAL_RATIO)
-                    
-                    if max_possible_height > frame_height:
-                        max_possible_height = frame_height
-                        max_possible_width = int(frame_height * VERTICAL_RATIO)
-                        
-                    crop_height = int(max_possible_height * CROP_RATIO_BIG)
-                    crop_width = int(max_possible_width * CROP_RATIO_BIG)
-                    
-                    crop_x = max(0, (frame_width - crop_width) // 2)
-                    crop_y = max(0, (frame_height - crop_height) // 2)
+                    # If no faces detected, use the largest possible crop.
+                    # Story 11 (P3.4): when the clip HAS seen a face earlier,
+                    # position that window on the last known face center so
+                    # off-center speakers keep their framing through
+                    # detection gaps; with no face history the helper keeps
+                    # the previous hard-centered behavior exactly.
+                    last_face_center = prev_face_center
+                    crop_x, crop_y, crop_width, crop_height = compute_fallback_crop(
+                        frame_width, frame_height, last_face_center, CROP_RATIO_BIG
+                    )
                     crop_img = frame[
                         crop_y : crop_y + crop_height, crop_x : crop_x + crop_width
                     ]
@@ -1759,6 +1860,7 @@ def generate_short(
                     thumb_dir,
                     debug_faces,
                     performance_profile,
+                    thumb_text=thumb_text,
                     _pipe=False,
                 )
             # Success: the single pass already produced tmp/final-{output}.
@@ -1777,8 +1879,11 @@ def generate_short(
             profiler.save_report(report_path)
             profiler.print_summary()
 
-        if thumb and smile_found:
-            generate_thumbnail(smile_frame, title, thumb_dir)
+        if thumb and smile_candidates:
+            # Story 11 (P3.5): best face-quality candidate wins; hook text
+            # (when present) is preferred over the raw title.
+            smile_frame = select_best_smile_frame(smile_candidates)
+            generate_thumbnail(smile_frame, thumb_text or title, thumb_dir)
 
         # Return the final merged output path so callers can report success
         return f"tmp/final-{sanitized_output}"
@@ -3005,6 +3110,16 @@ def __main__():
 
         try:
             print(f"Generating short video for segment {i+1}...")
+            # Story 11 (P3.5): hook fields are evaluated up-front so the hook
+            # text (when present) is used as the thumbnail text; missing or
+            # invalid fields fall through to today's title behavior exactly.
+            try:
+                seg_start_sec = parse_srt_time(segment["start_time"])
+                seg_end_sec = parse_srt_time(segment["end_time"])
+                hook = parse_hook_fields(segment, seg_start_sec, seg_end_sec)
+            except Exception as e:
+                print(f"Hook teaser: could not evaluate hook fields: {str(e)}")
+                hook = None
             generate_short(
                 input_file,
                 output_file,
@@ -3015,6 +3130,7 @@ def __main__():
                 output_dir,
                 args.debug_faces,
                 args.performance_profile,
+                thumb_text=(hook[2] if hook else None),
             )
             print(f"Adding subtitles to video for segment {i+1}...")
             final_output_name = sanitize_filename(f"final-{os.path.splitext(output_file)[0]}") + os.path.splitext(output_file)[1]
@@ -3033,17 +3149,10 @@ def __main__():
                 print(
                     f"Using {len(subtitle_words)} words from master transcript for subtitles"
                 )
-            # Hook teaser (Story 7): optional cold-open. Missing/invalid hook
-            # fields fall through to today's behavior exactly. Every teaser
-            # failure mode ends in the direct publish, so the segment is
-            # never left without a published file.
-            try:
-                seg_start_sec = parse_srt_time(segment["start_time"])
-                seg_end_sec = parse_srt_time(segment["end_time"])
-                hook = parse_hook_fields(segment, seg_start_sec, seg_end_sec)
-            except Exception as e:
-                print(f"Hook teaser: could not evaluate hook fields: {str(e)}")
-                hook = None
+            # Hook teaser (Story 7): optional cold-open. `hook` was parsed
+            # above (before generate_short) for the thumbnail text; every
+            # teaser failure mode ends in the direct publish, so the segment
+            # is never left without a published file.
             publish_segment_with_optional_teaser(
                 final_output_name,
                 video_id,
