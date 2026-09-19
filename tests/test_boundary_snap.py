@@ -429,7 +429,11 @@ def _run_generate_viral(
 
     captured = {}
 
-    def _capture(model, messages, n, stop):
+    # **kwargs: since Task 15 the live call also carries
+    # response_format={"type": "json_object"}; the stub accepts it so the
+    # tests below exercise the primary (structured-output) path rather
+    # than the degrade-and-retry fallback.
+    def _capture(model, messages, n, stop, **kwargs):
         captured["messages"] = messages
         response = MagicMock()
         response.choices[0].message.content = final_reply

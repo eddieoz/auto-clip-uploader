@@ -1949,6 +1949,30 @@ def build_segment_json_template():
     """
 
 
+def request_json_completion(client, model, messages):
+    """Chat completion preferring structured JSON output, with degradation.
+
+    Both JSON-returning LLM calls (``generate_metadata`` and
+    ``generate_viral``) ask the endpoint for a structured JSON object via
+    ``response_format={"type": "json_object"}``. Custom OPENAI_BASE_URL
+    endpoints may not support the parameter: when the call carrying it
+    fails (TypeError/KeyError/400-class status error), retry ONCE without
+    it. The caller's existing JSON-repair chain stays as the last-resort
+    path for whatever comes back.
+    """
+    base_kwargs = {"model": model, "messages": messages, "n": 1, "stop": None}
+    try:
+        return client.chat.completions.create(
+            response_format={"type": "json_object"}, **base_kwargs
+        )
+    except Exception as exc:
+        print(
+            f"Structured output rejected by endpoint ({type(exc).__name__}); "
+            "retrying once without response_format"
+        )
+        return client.chat.completions.create(**base_kwargs)
+
+
 def generate_metadata(transcript):
     json_template = """
         {
@@ -1981,8 +2005,8 @@ Please replace the placeholder values with the actual results from your analysis
 
     try:
         client = openai.OpenAI(api_key=api_key, base_url=openai_base_url)
-        response = client.chat.completions.create(
-            model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
+        response = request_json_completion(
+            client, os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages
         )
 
         content = response.choices[0].message.content
@@ -2418,6 +2442,95 @@ def snap_window_to_boundaries(window, segments, min_start_srt=None, min_duration
         return window
 
 
+def validate_segment_against_window(
+    segment, resolved_window, min_duration=35.0, max_duration=59.0
+):
+    """S4: deterministic validation of the LLM-returned segment (pure).
+
+    With a usable `resolved_window` (the heuristic + trimmed + snapped
+    window from the primary path) the returned start/end are clamped into
+    it and the duration recomputed; a clamped duration outside
+    [min_duration, max_duration] REPLACES the segment's times with the
+    resolved window's times — the resolved window is trusted over an
+    out-of-range LLM answer.
+
+    Without a usable resolved window (fallback path, gate off, LLM pass
+    failed) only the duration-range check applies: an out-of-range segment
+    is left unchanged with a warning note (pre-S4 behavior).
+
+    Any unparseable returned time leaves the segment unchanged (downstream
+    parsers already tolerate that). Pure: no I/O; never raises.
+
+    Returns (segment, notes) — the (possibly corrected) segment plus a
+    list of human-readable notes describing every correction/warning.
+    """
+    notes = []
+    try:
+        if not isinstance(segment, dict):
+            return segment, ["S4 validation: segment is not a dict; left unchanged"]
+        start_seconds = _srt_like_to_seconds(segment.get('start_time'))
+        end_seconds = _srt_like_to_seconds(segment.get('end_time'))
+        if start_seconds is None or end_seconds is None:
+            return segment, [
+                "S4 validation: returned segment times are unparseable; leaving unchanged"
+            ]
+
+        window_start = None
+        window_end = None
+        if isinstance(resolved_window, dict):
+            window_start = _srt_like_to_seconds(resolved_window.get('start_time'))
+            window_end = _srt_like_to_seconds(resolved_window.get('end_time'))
+        has_window = (
+            window_start is not None
+            and window_end is not None
+            and window_end > window_start
+        )
+
+        if has_window:
+            clamped_start = min(max(start_seconds, window_start), window_end)
+            clamped_end = min(max(end_seconds, window_start), window_end)
+            duration = clamped_end - clamped_start
+            if duration < min_duration - 1e-9 or duration > max_duration + 1e-9:
+                corrected = dict(segment)
+                corrected['start_time'] = resolved_window['start_time']
+                corrected['end_time'] = resolved_window['end_time']
+                corrected['duration'] = window_end - window_start
+                notes.append(
+                    f"S4 validation: clamped duration {duration:.1f}s is outside "
+                    f"[{min_duration}, {max_duration}]s; replacing segment with the "
+                    f"resolved window {resolved_window['start_time']} --> "
+                    f"{resolved_window['end_time']}"
+                )
+                return corrected, notes
+            if (
+                abs(clamped_start - start_seconds) > 1e-9
+                or abs(clamped_end - end_seconds) > 1e-9
+            ):
+                corrected = dict(segment)
+                corrected['start_time'] = format_timestamp(clamped_start)
+                corrected['end_time'] = format_timestamp(clamped_end)
+                corrected['duration'] = duration
+                notes.append(
+                    f"S4 validation: segment clamped into the resolved window "
+                    f"({corrected['start_time']} --> {corrected['end_time']}, "
+                    f"{duration:.1f}s)"
+                )
+                return corrected, notes
+            return segment, notes
+
+        # Fallback path: no usable resolved window — duration check only.
+        duration = end_seconds - start_seconds
+        if duration < min_duration - 1e-9 or duration > max_duration + 1e-9:
+            notes.append(
+                f"Warning: no resolved window; returned segment duration "
+                f"{duration:.1f}s is outside [{min_duration}, {max_duration}]s; "
+                f"leaving unchanged"
+            )
+        return segment, notes
+    except Exception as e:
+        return segment, [f"S4 validation failed ({e}); leaving segment unchanged"]
+
+
 def refine_window_start_with_pause(window, audio_path, min_start_srt=None, neighborhood=1.5):
     """S3: prosodic refinement of the text-snapped START point (never raises).
 
@@ -2609,7 +2722,10 @@ def generate_viral(
         ):
             min_start_srt = _segment_start_srt(topic_analysis['segments'][cue_index - 1])
         optimized_segment = snap_window_to_boundaries(
-            optimized_segment, topic_analysis['segments'], min_start_srt=min_start_srt
+            optimized_segment,
+            topic_analysis['segments'],
+            min_start_srt=min_start_srt,
+            min_duration=min_duration,
         )
         optimized_segment = refine_window_start_with_pause(
             optimized_segment, audio_path, min_start_srt=min_start_srt
@@ -2840,8 +2956,8 @@ Return ONLY the JSON object, without any markdown formatting or code block marke
     ]
 
     client = openai.OpenAI(api_key=api_key, base_url=openai_base_url)
-    response = client.chat.completions.create(
-        model=os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages=messages, n=1, stop=None
+    response = request_json_completion(
+        client, os.getenv('OPENAI_MODEL', 'gpt-5-mini'), messages
     )
 
     content = response.choices[0].message.content
@@ -2870,6 +2986,29 @@ Return ONLY the JSON object, without any markdown formatting or code block marke
                     }
                 ]
             }
+
+    # S4: deterministic validation of the returned segment. The primary
+    # path carries a resolved topic window (Task-13 trim + S3 snapping), so
+    # the returned times are clamped into it and an out-of-range clamped
+    # duration is replaced by the window itself. The fallback path keeps
+    # today's behavior: only the duration range is checked and out-of-range
+    # segments are left unchanged with a warning.
+    resolved_window = None
+    if 'topic_analysis' in locals() and 'error' not in topic_analysis:
+        resolved_window = optimized_segment
+    if isinstance(viral_json, dict) and isinstance(viral_json.get("segments"), list):
+        validated_segments = []
+        for returned_segment in viral_json["segments"]:
+            returned_segment, validation_notes = validate_segment_against_window(
+                returned_segment,
+                resolved_window,
+                min_duration=min_duration,
+                max_duration=max_duration,
+            )
+            for note in validation_notes:
+                print(note)
+            validated_segments.append(returned_segment)
+        viral_json["segments"] = validated_segments
 
     # Merge metadata and viral segments
     # Merge metadata and viral segments
