@@ -164,7 +164,7 @@ class TestResolveTopicStartCue:
     @pytest.mark.parametrize("reply", ["3", "cue 3", " 3 ", "Cue 3"])
     def test_valid_reply_returns_cue_index(self, monkeypatch, reply):
         result, mock_openai = _resolve_with_reply(monkeypatch, reply)
-        assert result == 3
+        assert result == (3, [])
         mock_openai.OpenAI.assert_called_once()
 
     def test_prompt_contains_every_cue_text(self, monkeypatch):
@@ -203,7 +203,7 @@ class TestResolveTopicStartCue:
             result = reelsfy.resolve_topic_start_cue(
                 "srt content", _make_segments()
             )
-        assert result is None
+        assert result == (None, [])
 
     @pytest.mark.parametrize(
         "reply", ["sorry, I cannot help with that", "", "none"]
@@ -212,14 +212,14 @@ class TestResolveTopicStartCue:
         result, _ = _resolve_with_reply(
             monkeypatch, reply, segments=_make_segments()
         )
-        assert result is None
+        assert result == (None, [])
 
     @pytest.mark.parametrize("reply", ["0", "99", "9999"])
     def test_out_of_range_reply_returns_none(self, monkeypatch, reply):
         result, _ = _resolve_with_reply(
             monkeypatch, reply, segments=_make_segments()
         )
-        assert result is None
+        assert result == (None, [])
 
     def test_gate_off_never_constructs_client(self, monkeypatch):
         segments = _make_segments()
@@ -227,12 +227,12 @@ class TestResolveTopicStartCue:
         monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "false")
         with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
             result = reelsfy.resolve_topic_start_cue("srt content", segments)
-        assert result is None
+        assert result == (None, [])
         mock_openai.OpenAI.assert_not_called()
 
     def test_gate_defaults_to_enabled(self, monkeypatch):
         result, mock_openai = _resolve_with_reply(monkeypatch, "3")
-        assert result == 3
+        assert result == (3, [])
         mock_openai.OpenAI.assert_called_once()
 
     def test_empty_segments_returns_none_without_llm(self, monkeypatch):
@@ -240,7 +240,7 @@ class TestResolveTopicStartCue:
         monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "true")
         with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
             result = reelsfy.resolve_topic_start_cue("srt content", [])
-        assert result is None
+        assert result == (None, [])
         mock_openai.OpenAI.assert_not_called()
 
 

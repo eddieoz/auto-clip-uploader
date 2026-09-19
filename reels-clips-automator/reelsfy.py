@@ -2210,24 +2210,118 @@ def _segment_start_seconds(segment):
     return _srt_like_to_seconds(value)
 
 
+def _segment_end_srt(segment):
+    """Pick a printable end timestamp for a cue entry.
+
+    Mirror of _segment_start_srt for the END edge: SRT strings first, then
+    a formatted float, then an empty string when nothing parses."""
+    if not isinstance(segment, dict):
+        return ""
+    for key in ('end_time_srt', 'end_time'):
+        value = segment.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    end = segment.get('end_time')
+    if isinstance(end, (int, float)):
+        return format_timestamp(float(end))
+    return ""
+
+
+def _parse_hook_candidates(value):
+    """Well-formed hook candidate dicts from the boundary reply (S5).
+
+    Only the SHAPE is validated here (dict with int cue_start/cue_end and
+    non-empty text); range/window/duration validation happens in
+    select_hook_candidate. Malformed entries are skipped, never raising.
+    """
+    if not isinstance(value, list):
+        return []
+    parsed = []
+    for item in value:
+        try:
+            if not isinstance(item, dict):
+                continue
+            cue_start = item.get('cue_start')
+            cue_end = item.get('cue_end')
+            text = item.get('text')
+            if isinstance(cue_start, bool) or not isinstance(cue_start, int):
+                continue
+            if isinstance(cue_end, bool) or not isinstance(cue_end, int):
+                continue
+            if not isinstance(text, str) or not text.strip():
+                continue
+            parsed.append(
+                {
+                    "cue_start": cue_start,
+                    "cue_end": cue_end,
+                    "text": text.strip(),
+                }
+            )
+        except Exception:
+            continue
+    return parsed
+
+
+def _parse_boundary_reply(content, cue_count):
+    """Parse the boundary reply into (cue_index, hook_candidates).
+
+    The cue number and the hook candidates are parsed INDEPENDENTLY: a
+    missing/invalid candidates list never invalidates the cue number and
+    vice versa. Legacy integer-only replies fall back to the first-number
+    regex; a missing/out-of-range cue number yields None for the cue only.
+    """
+    cue_index = None
+    text = str(content) if content is not None else ""
+    text = text.replace("```json", "").replace("```", "").strip()
+    payload = None
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        raw_cue = payload.get('cue_number')
+        if (
+            isinstance(raw_cue, int)
+            and not isinstance(raw_cue, bool)
+            and 1 <= raw_cue <= cue_count
+        ):
+            cue_index = raw_cue
+        hook_candidates = _parse_hook_candidates(payload.get('hook_candidates'))
+    else:
+        hook_candidates = []
+        match = re.search(r"-?\d+", text)
+        if match:
+            try:
+                value = int(match.group())
+                if 1 <= value <= cue_count:
+                    cue_index = value
+            except ValueError:
+                cue_index = None
+    return cue_index, hook_candidates
+
+
 def resolve_topic_start_cue(transcript_content, segments):
-    """S2: ask the LLM where the FINAL topic begins in the capture.
+    """S2/S5: ask the LLM where the FINAL topic begins + hook candidates.
 
     Replay-buffer captures are <= 90 s and the final topic concludes at the
     end, but the capture's start often holds the PREVIOUS topic's tail. The
     numbered cue list below covers the full capture (nothing is truncated)
     and the model must answer with the first cue that belongs to the final
-    topic.
+    topic; on top of that cue number it proposes up to 3 hook candidates
+    inside the final topic (S5 hook-first selection).
 
-    Returns the 1-based cue index, or None on any failure (exception,
-    unparseable reply, out-of-range index) so the pipeline degrades to
-    today's untrimmed optimized window. Never raises.
+    Returns (cue_index, hook_candidates): cue_index is the 1-based cue
+    index or None on any failure (exception, unparseable reply, out-of-range
+    index) so the pipeline degrades to today's untrimmed optimized window;
+    hook_candidates is a possibly empty list of
+    {"cue_start", "cue_end", "text"} dicts. A missing/invalid candidates
+    list never invalidates the cue number and vice versa. Never raises.
     """
     if not segments:
         print("Topic boundary LLM: no segments available; keeping window unchanged")
-        return None
+        return None, []
     if not resolve_topic_boundary_llm_enabled():
-        return None
+        return None, []
 
     # Cues come from the analyzed segments, which span the entire capture.
     cue_lines = []
@@ -2240,9 +2334,14 @@ def resolve_topic_start_cue(transcript_content, segments):
 
 The FINAL topic of this capture CONCLUDES at the end of the capture. Any cue text at the very beginning may still belong to the PREVIOUS topic.
 
-Return ONLY the cue number where the FINAL topic BEGINS — the first cue that belongs to the final topic, not the previous topic's tail. Respond with a single integer and nothing else."""
+Return ONLY a JSON object (no markdown, no code block markers) with EXACTLY this shape:
 
-    system = """You identify topic boundaries in video transcripts. You receive numbered cues covering a full short capture and must return only the cue number where the final topic begins."""
+{{"cue_number": <integer>, "hook_candidates": [{{"cue_start": <integer>, "cue_end": <integer>, "text": "<hook sentence>"}}]}}
+
+- "cue_number": the cue number where the FINAL topic BEGINS — the first cue that belongs to the final topic, not the previous topic's tail.
+- "hook_candidates": up to 3 hook candidates INSIDE the final topic, best first. Each candidate spans ONE engaging sentence (2-5 seconds long): "cue_start" is the first cue number of the hook sentence, "cue_end" is the last cue number of the hook sentence, and "text" is the hook sentence verbatim. Use an empty list when no clear hook sentence exists."""
+
+    system = """You identify topic boundaries in video transcripts and propose hook candidates. You receive numbered cues covering a full short capture and must return the cue number where the final topic begins plus hook candidates inside the final topic."""
 
     messages = [
         {"role": "system", "content": system},
@@ -2257,21 +2356,22 @@ Return ONLY the cue number where the FINAL topic BEGINS — the first cue that b
         )
 
         content = response.choices[0].message.content
-        content = content.replace("```json", "").replace("```", "").strip()
-
-        match = re.search(r"-?\d+", content)
-        if not match:
-            print(f"Topic boundary LLM: unparseable reply \"{content[:80]}\"; keeping window unchanged")
-            return None
-        cue_index = int(match.group())
-        if not (1 <= cue_index <= len(segments)):
-            print(f"Topic boundary LLM: cue index {cue_index} outside 1..{len(segments)}; keeping window unchanged")
-            return None
-        print(f"Topic boundary LLM: final topic begins at cue {cue_index}")
-        return cue_index
+        cue_index, hook_candidates = _parse_boundary_reply(content, len(segments))
+        if cue_index is None:
+            print(
+                f"Topic boundary LLM: unparseable or out-of-range reply "
+                f"\"{str(content)[:80]}\"; keeping window unchanged"
+            )
+        else:
+            print(f"Topic boundary LLM: final topic begins at cue {cue_index}")
+        if hook_candidates:
+            print(
+                f"Topic boundary LLM: {len(hook_candidates)} hook candidate(s) proposed"
+            )
+        return cue_index, hook_candidates
     except Exception as e:
         print(f"Topic boundary LLM pass failed ({e}); keeping window unchanged")
-        return None
+        return None, []
 
 
 def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments, segments):
@@ -2440,6 +2540,71 @@ def snap_window_to_boundaries(window, segments, min_start_srt=None, min_duration
     except Exception as e:
         print(f"Boundary snap failed ({e}); keeping window unchanged")
         return window
+
+
+def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments):
+    """S5: first hook candidate inside the resolved window (pure).
+
+    Candidates come from the boundary LLM pass and reference cues by their
+    1-based numbers ("cue_start"/"cue_end"), so the cue→seconds mapping
+    walks `segments`. A candidate survives when its span (start of cue_start
+    to end of cue_end) falls inside [window_start_srt, window_end_srt] and
+    spans HOOK_TEASER_MIN_DURATION..HOOK_TEASER_MAX_DURATION seconds. The
+    model ranks the candidates, so the FIRST survivor wins. Malformed
+    candidates are skipped, never raising. Returns
+    {"hook_start_time", "hook_end_time", "hook_text"} (SRT + text) or None.
+    """
+    try:
+        if not isinstance(candidates, list) or not segments:
+            return None
+        window_start = _srt_like_to_seconds(window_start_srt)
+        window_end = _srt_like_to_seconds(window_end_srt)
+        if window_start is None or window_end is None or window_end <= window_start:
+            return None
+        for candidate in candidates:
+            try:
+                if not isinstance(candidate, dict):
+                    continue
+                cue_start = candidate.get('cue_start')
+                cue_end = candidate.get('cue_end')
+                text = candidate.get('text')
+                if isinstance(cue_start, bool) or not isinstance(cue_start, int):
+                    continue
+                if isinstance(cue_end, bool) or not isinstance(cue_end, int):
+                    continue
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                if not (1 <= cue_start <= len(segments)) or not (
+                    1 <= cue_end <= len(segments)
+                ):
+                    continue
+                span_start, _ = _cue_bounds(segments[cue_start - 1])
+                _, span_end = _cue_bounds(segments[cue_end - 1])
+                if span_start is None or span_end is None:
+                    continue
+                if span_end <= span_start:
+                    continue
+                if span_start < window_start - 1e-9 or span_end > window_end + 1e-9:
+                    continue
+                duration = span_end - span_start
+                if (
+                    duration < HOOK_TEASER_MIN_DURATION - 1e-9
+                    or duration > HOOK_TEASER_MAX_DURATION + 1e-9
+                ):
+                    continue
+                return {
+                    "hook_start_time": _segment_start_srt(segments[cue_start - 1])
+                    or format_timestamp(span_start),
+                    "hook_end_time": _segment_end_srt(segments[cue_end - 1])
+                    or format_timestamp(span_end),
+                    "hook_text": text.strip(),
+                }
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        print(f"Hook candidate selection failed ({e}); keeping the hook optional")
+        return None
 
 
 def validate_segment_against_window(
@@ -2697,7 +2862,9 @@ def generate_viral(
         # of the previous topic. Resolve where the final topic begins and trim
         # the window start to that cue; any failure keeps the window exactly
         # as analyzed above. The end time (recency anchor) is untouched.
-        cue_index = resolve_topic_start_cue(
+        # S5: the same pass also proposes hook candidates inside the final
+        # topic; selection against the snapped window happens below.
+        cue_index, hook_candidates = resolve_topic_start_cue(
             transcript_content, topic_analysis['segments']
         )
         if cue_index is not None:
@@ -2878,6 +3045,18 @@ def generate_viral(
     # byte-identical.
     resolved_window_section = ""
     if 'topic_analysis' in locals() and 'error' not in topic_analysis:
+        # S5: hook-first selection — the first boundary-pass hook candidate
+        # inside the snapped resolved window becomes a MANDATORY hook in the
+        # live prompt, so the burned cold-open teaser and the returned
+        # hook_text are the same sentence. With no survivor (gate off, LLM
+        # pass failed, no valid candidate) nothing is appended: the section
+        # stays byte-identical to Task 14's and the hook remains optional.
+        selected_hook = select_hook_candidate(
+            hook_candidates,
+            optimized_segment['start_time'],
+            optimized_segment['end_time'],
+            topic_analysis['segments'],
+        )
         resolved_window_section = (
             "\nRESOLVED TOPIC WINDOW:\n"
             f"- Resolved start: {optimized_segment['start_time']}\n"
@@ -2892,6 +3071,16 @@ def generate_viral(
             "before the resolved end time. Prefer exactly the resolved boundaries; only a clear "
             "sentence boundary justifies a slight adjustment within them.\n"
         )
+        if selected_hook:
+            resolved_window_section += (
+                "\nMANDATORY HOOK:\n"
+                "- You MUST return hook_start_time / hook_end_time / hook_text with EXACTLY these values:\n"
+                f"- hook_start_time: {selected_hook['hook_start_time']}\n"
+                f"- hook_end_time: {selected_hook['hook_end_time']}\n"
+                f'- hook_text: "{selected_hook["hook_text"]}"\n'
+                "Return these hook fields unchanged and keep the hook span fully inside the "
+                "returned segment.\n"
+            )
 
     # Format segments for GPT prompt
     formatted_segments = "\n".join(

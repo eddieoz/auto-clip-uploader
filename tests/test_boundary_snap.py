@@ -449,7 +449,7 @@ def _run_generate_viral(
     ), patch.object(
         reelsfy, "generate_metadata", return_value=metadata
     ), patch.object(
-        reelsfy, "resolve_topic_start_cue", return_value=2
+        reelsfy, "resolve_topic_start_cue", return_value=(2, [])
     ) as resolve_mock, patch.object(
         reelsfy.openai, "OpenAI", openai_module.OpenAI
     ), patch.object(
