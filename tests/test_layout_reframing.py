@@ -10,10 +10,12 @@ Covers:
    region, push-in scale eases 100% -> 96%.
 3. Screen-zoom crop centers on the synthetic high-motion point and EMA
    smooths (with the existing dead-zone threshold).
-4. Deterministic variety schedule (10 s boundaries, pip first, alternating).
+4. Deterministic variety schedule (5 s boundaries, pip first, alternating).
 5. Talking-head behavior contract preserved (random modes still reachable,
    center-crop fallback intact).
 6. Badge hold-on-detection-miss behavior.
+7. Badge stabilization helpers (strong EMA, dead-zone, re-crop on real
+   movement only, size smoothing).
 
 All cv2.VideoCapture/VideoWriter and Haar usage is mocked - no real video is
 processed. Follows the sys.modules stub pattern from
@@ -455,6 +457,58 @@ class TestScreenZoom:
 
 
 # ---------------------------------------------------------------------------
+# 3. Badge stabilization (user feedback: badge content shook every frame)
+# ---------------------------------------------------------------------------
+
+
+class TestBadgeStabilization:
+    def test_smooth_badge_side_first_value_taken_as_is(self):
+        assert reelsfy.smooth_badge_side(None, 320) == 320
+
+    def test_smooth_badge_side_blends_with_prev(self):
+        # 90% previous / 10% new with the PIP_BADGE_SMOOTHING_FACTOR default
+        assert reelsfy.smooth_badge_side(300, 400) == int(300 * 0.9 + 400 * 0.1)
+
+    def test_smooth_badge_side_keeps_prev_on_miss(self):
+        assert reelsfy.smooth_badge_side(310, None) == 310
+
+    def test_should_recenter_true_when_nothing_held(self):
+        assert reelsfy.should_recenter_badge((500, 200), None, 320)
+
+    def test_should_recenter_false_for_small_jitter(self):
+        # Jitter below 12% of the badge size is frozen out
+        assert not reelsfy.should_recenter_badge((505, 203), (500, 200), 320)
+
+    def test_should_recenter_true_on_real_movement(self):
+        # 100 px drift is far beyond 12% of a 320 px badge
+        assert reelsfy.should_recenter_badge((600, 200), (500, 200), 320)
+
+    def test_should_recenter_false_when_center_none(self):
+        assert not reelsfy.should_recenter_badge(None, (500, 200), 320)
+
+    def test_render_pip_frame_face_side_override(self):
+        frame = make_screencast_frame()
+        region = reelsfy.screen_region_from_median_box(SC_FACE, FRAME_SHAPE)
+        out_a, badge_a = reelsfy.render_pip_frame(
+            frame, region, SC_FACE, (920, 180), push_scale=1.0,
+            last_badge=None, face_side=400,
+        )
+        # Explicit face_side drives the crop size (EMA-smoothed in the loop)
+        assert badge_a.shape[0] == 400
+        # Same call with a DIFFERENT explicit side produces a different crop
+        _, badge_b = reelsfy.render_pip_frame(
+            frame, region, SC_FACE, (920, 180), push_scale=1.0,
+            last_badge=None, face_side=500,
+        )
+        assert badge_b.shape[0] == 500
+
+    def test_stabilization_constants_binding(self):
+        assert reelsfy.PIP_BADGE_SMOOTHING_FACTOR == 0.9
+        assert reelsfy.PIP_BADGE_MOVEMENT_THRESHOLD == 15
+        assert 0.0 < reelsfy.PIP_BADGE_RECENTER_RATIO < 0.5
+
+
+# ---------------------------------------------------------------------------
 # 4. Deterministic variety schedule
 # ---------------------------------------------------------------------------
 
@@ -463,16 +517,21 @@ class TestVarietySchedule:
     def test_first_segment_is_pip(self):
         assert reelsfy.screencast_mode_for_frame(0, 30.0) == "pip"
 
-    def test_within_10s_is_pip(self):
-        assert reelsfy.screencast_mode_for_frame(299, 30.0) == "pip"
+    def test_within_5s_is_pip(self):
+        assert reelsfy.screencast_mode_for_frame(149, 30.0) == "pip"
 
     def test_second_segment_is_screen_zoom(self):
-        assert reelsfy.screencast_mode_for_frame(300, 30.0) == "screen_zoom"
-        assert reelsfy.screencast_mode_for_frame(500, 30.0) == "screen_zoom"
+        assert reelsfy.screencast_mode_for_frame(150, 30.0) == "screen_zoom"
+        assert reelsfy.screencast_mode_for_frame(299, 30.0) == "screen_zoom"
 
-    def test_pattern_alternates_every_10s(self):
-        assert reelsfy.screencast_mode_for_frame(899, 30.0) == "pip"
-        assert reelsfy.screencast_mode_for_frame(900, 30.0) == "screen_zoom"
+    def test_pattern_alternates_every_5s(self):
+        assert reelsfy.screencast_mode_for_frame(299, 30.0) == "screen_zoom"
+        assert reelsfy.screencast_mode_for_frame(300, 30.0) == "pip"
+        assert reelsfy.screencast_mode_for_frame(449, 30.0) == "pip"
+        assert reelsfy.screencast_mode_for_frame(450, 30.0) == "screen_zoom"
+
+    def test_segment_seconds_is_5(self):
+        assert reelsfy.SCREENCAST_SEGMENT_SECONDS == 5
 
     def test_forced_pip_overrides_schedule(self):
         for fc in (0, 300, 600, 900):
@@ -488,7 +547,7 @@ class TestVarietySchedule:
     def test_auto_uses_schedule(self):
         assert reelsfy.resolve_screencast_mode(0, 30.0, forced="auto") == "pip"
         assert (
-            reelsfy.resolve_screencast_mode(300, 30.0, forced="auto")
+            reelsfy.resolve_screencast_mode(150, 30.0, forced="auto")
             == "screen_zoom"
         )
 

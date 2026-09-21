@@ -771,9 +771,19 @@ PIP_BADGE_DIAMETER_RATIO = 0.28     # badge diameter ~28% of frame width (~300 p
 PIP_FACE_MARGIN_RATIO = 0.25        # face crop expanded by ~25% margin
 PIP_BADGE_MARGIN_RATIO = 0.03       # badge distance from the frame edges
 
-# Deterministic variety schedule: alternate PiP -> screen-zoom on ~10 s
+# PiP badge stabilization: the Haar detector jitters its box every frame, so the
+# badge EMA is strong (90% previous / 10% new) with a generous dead-zone, the
+# crop SIZE is EMA-smoothed too (box-scale jitter would pulse the badge), and the
+# crop is only RE-TAKEN when the smoothed center drifted beyond a fraction of the
+# badge size — between recenters the badge content is held, so jitter cannot
+# shake it.
+PIP_BADGE_SMOOTHING_FACTOR = 0.9    # badge EMA: 90% previous / 10% new
+PIP_BADGE_MOVEMENT_THRESHOLD = 15   # detector jitter (px) ignored by the EMA
+PIP_BADGE_RECENTER_RATIO = 0.12     # re-crop only after drifting > 12% of badge size
+
+# Deterministic variety schedule: alternate PiP -> screen-zoom on ~5 s
 # boundaries (fixed pattern, PiP first).
-SCREENCAST_SEGMENT_SECONDS = 10
+SCREENCAST_SEGMENT_SECONDS = 5
 
 # Whole-clip push-in (PiP only): background zoom eases 100% -> 96%.
 PUSH_IN_START_SCALE = 1.0
@@ -1017,8 +1027,38 @@ def compute_screen_zoom_crop(screen_region, center, frame_shape):
     cy = min(cy, frame_height - crop_h // 2)
     return (cx - crop_w // 2, cy - crop_h // 2, crop_w, crop_h)
 
+def smooth_badge_side(prev_side, raw_side, smoothing_factor=PIP_BADGE_SMOOTHING_FACTOR):
+    """
+    EMA on the badge crop SIZE so detector box-scale jitter does not pulse the
+    badge content. None handling mirrors smooth_center: a missing raw keeps the
+    previous size; the first raw is taken as-is.
+    """
+    if raw_side is None:
+        return prev_side
+    if prev_side is None:
+        return raw_side
+    return int(prev_side * smoothing_factor + raw_side * (1 - smoothing_factor))
+
+
+def should_recenter_badge(badge_center, held_badge_center, badge_side,
+                          recenter_ratio=PIP_BADGE_RECENTER_RATIO):
+    """
+    True only when there is no held crop yet, or the smoothed center drifted
+    beyond recenter_ratio of the badge size. Between recenters the badge crop
+    is held unchanged, so per-frame detector jitter cannot shake the badge.
+    """
+    if badge_center is None:
+        return False
+    if held_badge_center is None:
+        return True
+    dx = badge_center[0] - held_badge_center[0]
+    dy = badge_center[1] - held_badge_center[1]
+    threshold = max(int(badge_side or 0), 1) * recenter_ratio
+    return (dx * dx + dy * dy) ** 0.5 > threshold
+
+
 def render_pip_frame(frame, screen_region, face_box, face_center, push_scale=1.0,
-                     last_badge=None, output_size=(1080, 1920)):
+                     last_badge=None, output_size=(1080, 1920), face_side=None):
     """
     Screencast PiP rendering: background = the screen region (below the median
     face box) as an aspect-preserving 9:16 crop scaled by push_scale, resized
@@ -1053,7 +1093,7 @@ def render_pip_frame(frame, screen_region, face_box, face_center, push_scale=1.0
     badge = None
     if face_box is not None and face_center is not None:
         fx, fy, fw, fh = face_box
-        side = int(max(fw, fh) * (1.0 + 2 * PIP_FACE_MARGIN_RATIO))
+        side = face_side if face_side else int(max(fw, fh) * (1.0 + 2 * PIP_FACE_MARGIN_RATIO))
         side = max(side, 16)
         half = side // 2
         bc_x = int(face_center[0])
@@ -1316,6 +1356,8 @@ def generate_short(
         # Screencast render state
         last_badge = None            # held badge crop for detection misses
         prev_badge_center = None     # EMA-smoothed badge center
+        prev_badge_side = None       # EMA-smoothed badge crop size
+        held_badge_center = None     # center used for the currently held crop
         prev_zoom_gray = None        # previous gray frame for motion energy
         prev_zoom_center = None      # EMA-smoothed screen-zoom center
         prev_screencast_mode = None  # for mode-switch debug prints
@@ -1422,21 +1464,44 @@ def generate_short(
                         push_scale = compute_push_in_scale(progress)
 
                         raw_center = None
+                        raw_side = None
                         if face_box is not None:
                             fb_x, fb_y, fb_w, fb_h = face_box
                             raw_center = (fb_x + fb_w // 2, fb_y + fb_h // 2)
-                        # EMA smoothing applied EVERY frame (not only when
-                        # frame_tracking_enabled)
-                        badge_center = smooth_center(prev_badge_center, raw_center)
+                            raw_side = int(
+                                max(fb_w, fb_h) * (1.0 + 2 * PIP_FACE_MARGIN_RATIO)
+                            )
+                        # Badge EMA smoothing applied EVERY frame (not only when
+                        # frame_tracking_enabled); strong factor + dead-zone so
+                        # detector jitter does not shake the badge.
+                        badge_center = smooth_center(
+                            prev_badge_center,
+                            raw_center,
+                            PIP_BADGE_SMOOTHING_FACTOR,
+                            PIP_BADGE_MOVEMENT_THRESHOLD,
+                        )
                         prev_badge_center = badge_center
+                        badge_side = smooth_badge_side(prev_badge_side, raw_side)
+                        prev_badge_side = badge_side
+
+                        # Re-crop only on real movement: between recenters the
+                        # badge content is held, freezing detector jitter.
+                        if should_recenter_badge(badge_center, held_badge_center, badge_side):
+                            held_badge_center = badge_center
+                            render_face_box = face_box
+                            render_face_center = badge_center
+                        else:
+                            render_face_box = None
+                            render_face_center = None
 
                         rendered, badge_crop = render_pip_frame(
                             frame,
                             screen_region,
-                            face_box,
-                            badge_center,
+                            render_face_box,
+                            render_face_center,
                             push_scale=push_scale,
                             last_badge=last_badge,
+                            face_side=badge_side,
                         )
                         if badge_crop is not None:
                             last_badge = badge_crop
