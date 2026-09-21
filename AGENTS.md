@@ -39,3 +39,10 @@ Auto Clip Uploader is an automated video processing system that monitors for new
 - Edited videos are appended to a disk-backed publish queue (`publish_queue.json`, gitignored) and drip-published one at a time on a configurable interval
 - Configuration is done via environment variables in `.env` (`PUBLISH_INTERVAL_MINUTES`, `PUBLISH_MAX_RETRIES`, `DASHBOARD_INTERVAL_SECONDS`)
 - See `social_media_publisher/publish_queue.py` for the queue/scheduler and `social_media_publisher/publisher.py` for the Postiz posting workflow
+
+### Video Editing Pipeline (reelsfy)
+- Segment selection keeps the OBS replay-buffer model: the topic CONCLUDES near the end of the capture (recency anchor). An LLM pass (`TOPIC_BOUNDARY_LLM`, default on) trims the previous topic's tail from the clip start and proposes hook candidates; every LLM/audio failure degrades to the heuristic behavior.
+- Screencast framing (`FRAMING_MODE`: auto/pip/screen_zoom/closeup) alternates PiP badge ↔ screen-zoom every 5 seconds; the PiP badge is EMA-stabilized and only re-crops on real face movement.
+- All editing features are env-gated with in-code defaults (`JUMP_CUTS_ENABLED`, `CAPTION_FONT_FAMILY`, `CAPTION_HIGHLIGHT_COLOR`, `VIDEO_GRADE`, `VIDEO_LUT`, `END_CARD_ENABLED`, `END_CARD_TEXT`, `END_CARD_COLOR`, `MUSIC_BED`) — see `reels-clips-automator/.env.example`.
+- Design docs: `docs/VIDEO_EDITING_IMPROVEMENT_PLAN.md` (rendering) and `docs/VIRAL_SELECTION_IMPROVEMENT_PLAN.md` (segment selection).
+- Regression tests live in `tests/` (gitignored — force-add new test files); run with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/`.

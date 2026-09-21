@@ -7,12 +7,15 @@ Built with Python 3.11, CUDA acceleration, and PyTorch for high-performance vide
 ## Features
 
 - 📁 **Automated File Monitoring** - Watches configured folders for new video files
-- 🎯 **AI-Powered Viral Detection** - Uses AI to identify engaging segments
-- 🎬 **Video Processing** - Converts to 9:16 vertical format with cropping and enhancement
-- 📝 **Automatic Transcription** - Whisper-based audio transcription
-- 🎨 **Subtitle Generation** - Overlay subtitles with customizable styling
-- 🖼️ **Thumbnail Creation** - Generates eye-catching thumbnails
-- 📱 **Multi-Platform Publishing** - Direct posting to Twitter, Instagram, YouTube, and much more via Postiz
+- 🎯 **AI-Powered Viral Detection** - Topic-aware segment selection: an LLM pass trims the previous topic's tail and picks the hook-first moment; heuristic topic analysis stays as the fallback
+- 🎬 **Video Processing** - Converts to 9:16 vertical with layout-aware framing for screencasts (circular face-cam PiP badge or motion-following zoom) and face tracking for talking heads
+- 🗣️ **Audio Mastering** - loudnorm (−14 LUFS) + gentle compression on every final output
+- ✂️ **Jump Cuts** - Intra-segment dead air removed with caption timing remapping
+- 📝 **Karaoke Captions** - Per-word highlighted ASS subtitles with customizable font and color
+- 🪝 **Cold-Open Hook Teaser** - The hook sentence is cut, cropped, and burned before the full clip
+- 🎨 **Polish** - Mild visual grade, optional LUT, end-card CTA, optional music bed
+- 🖼️ **Thumbnail Creation** - Best-quality smile frame with hook-text preference
+- 📱 **Multi-Platform Publishing** - Drip publishing to Twitter, Instagram, YouTube, and more via Postiz
 - 🔍 **Face Enhancement** - Optional RealESRGAN face upscaling
 
 ## Quick Start
@@ -78,8 +81,20 @@ python reelsfy.py --file /path/to/video.mp4 --upscale --enhance --thumb
 - Platform-specific channel IDs and publishing preferences
 
 ### Video Processing (reels-clips-automator/.env)
-- `OPENAI_API_KEY` - For AI-powered viral segment detection
+- `OPENAI_API_KEY` - For AI-powered segment selection and metadata generation
 - `CHANNEL_NAME` - Your channel identifier
+- `STT_MODEL` / `WHISPER_MODEL` / `FASTER_WHISPER_*` - Transcription engine
+- `TOPIC_BOUNDARY_LLM` - LLM topic-start pass (default on; `false` = legacy heuristics)
+- `JUMP_CUTS_ENABLED` / `JUMP_CUT_PAUSE_THRESHOLD` - Dead-air removal
+- `CAPTION_FONT_FAMILY` / `CAPTION_HIGHLIGHT_COLOR` - Karaoke caption styling
+- `FRAMING_MODE` - Screencast framing: `auto`, `pip`, `screen_zoom`, `closeup`
+- `VIDEO_GRADE` / `VIDEO_LUT` - Visual grade and optional .cube LUT
+- `END_CARD_ENABLED` / `END_CARD_TEXT` / `END_CARD_COLOR` - End-card CTA
+- `MUSIC_BED` - Path to an audio file looped under the speech (empty = off)
+
+See `reels-clips-automator/.env.example` for all video-editing options with
+defaults, and `docs/VIDEO_EDITING_IMPROVEMENT_PLAN.md` +
+`docs/VIRAL_SELECTION_IMPROVEMENT_PLAN.md` for the design behind them.
 
 ### Postiz Setup
 Add to your Postiz docker-compose.yml backend service:
