@@ -258,13 +258,40 @@ class TestTeaserCommandBuilders:
 
         assert "fontsize=64" in hook_filter
         assert "fontcolor=white" in hook_filter
-        assert "x=(w-tw)/2" in hook_filter
-        assert "y=(h-th)/2" in hook_filter
+        # One centered drawtext per wrapped line
+        assert hook_filter.count("x=(w-tw)/2") == 2
         assert f"fontfile={reelsfy.OVERLAY_FONTFILE}" in hook_filter
         # Black border/outline around the text
         assert "bordercolor=black" in hook_filter
-        # Text is uppercased
-        assert "THIS CHANGED EVERYTHING" in hook_filter
+        # Text is uppercased and wrapped so each line fits the frame
+        assert "THIS CHANGED" in hook_filter
+        assert "EVERYTHING" in hook_filter
+
+    def test_wrap_hook_text_splits_long_sentences(self):
+        lines = reelsfy.wrap_hook_text(
+            "THIS ONE SMALL CHANGE MADE EVERYTHING DIFFERENT"
+        )
+
+        assert all(len(line) <= reelsfy.HOOK_TEXT_MAX_LINE_CHARS for line in lines)
+        assert len(lines) >= 3
+
+    def test_wrap_hook_text_never_returns_empty(self):
+        assert reelsfy.wrap_hook_text("SINGLE") == ["SINGLE"]
+        assert reelsfy.wrap_hook_text("") == []
+
+    def test_drawtext_lines_fit_frame_width(self):
+        # Worst case: every line at max chars must stay inside 1080 px
+        # (fontsize 64 uppercase ≈ 40 px/char → 18 chars ≈ 720 px).
+        hook_filter = reelsfy.build_hook_drawtext_filter(
+            "this is a very long hook sentence that keeps going on"
+        )
+        drawtext_texts = [
+            part for part in hook_filter.split("drawtext=text='")
+            if part
+        ]
+        for part in drawtext_texts:
+            line = part[: part.index("'")]
+            assert len(line) <= reelsfy.HOOK_TEXT_MAX_LINE_CHARS
 
     def test_sanitize_hook_text_strips_apostrophes(self):
         sanitized = reelsfy.sanitize_hook_text("Don't stop")

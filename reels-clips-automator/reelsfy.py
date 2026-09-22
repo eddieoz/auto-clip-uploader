@@ -4150,7 +4150,10 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Karaoke,{font},58,{ASS_PRIMARY_COLOR},&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,60,60,250,1
+# MarginV 600 on the 1920 px-tall PlayRes puts the caption block in the
+# upper part of the bottom half (below the frame middle), clear of the
+# platform UI that covers the bottom ~250 px.
+Style: Karaoke,{font},58,{ASS_PRIMARY_COLOR},&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,60,60,600,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -4289,6 +4292,10 @@ def build_overlay_filters(date_text, title_text, input_label="0:v"):
 HOOK_TEASER_MIN_DURATION = 1.5
 HOOK_TEASER_MAX_DURATION = 6.0
 HOOK_TEASER_FONT_SIZE = 64
+# drawtext cannot wrap text, so long hooks must be pre-split into lines that
+# fit the 1080 px frame (fontsize 64 uppercase ≈ 40 px/char).
+HOOK_TEXT_MAX_LINE_CHARS = 18
+HOOK_TEXT_LINE_SPACING = 14
 HOOK_TEASER_RAW_FILE = "hook-teaser-raw.mp4"
 HOOK_TEASER_CROPPED_FILE = "hook-teaser.mp4"
 HOOK_TEASER_OUTPUT_FILE = "hook-teaser.mp4"
@@ -4342,14 +4349,42 @@ def sanitize_hook_text(text):
     return text
 
 
+def wrap_hook_text(text, max_chars=HOOK_TEXT_MAX_LINE_CHARS):
+    """Word-wrap hook text into lines that fit the frame width.
+
+    drawtext renders a single line per filter and has no wrapping, so an
+    unsplit hook sentence overflows the 1080 px frame. Returns a list of
+    lines (never empty while text is non-empty).
+    """
+    lines = []
+    for word in str(text).split():
+        if lines and len(lines[-1]) + 1 + len(word) <= max_chars:
+            lines[-1] += " " + word
+        else:
+            lines.append(word)
+    return lines
+
+
 def build_hook_drawtext_filter(hook_text):
-    """Burned hook text: large white with black border, dead-center."""
+    """Burned hook text: large white with black border, dead-center.
+
+    The text is word-wrapped into fixed-width lines burned as one centered
+    drawtext per line, stacked vertically around the frame middle.
+    """
     text = sanitize_hook_text(hook_text)
-    return (
-        f"drawtext=text='{text}':fontfile={OVERLAY_FONTFILE}:"
-        f"fontsize={HOOK_TEASER_FONT_SIZE}:fontcolor=white:"
-        "borderw=3:bordercolor=black:x=(w-tw)/2:y=(h-th)/2"
-    )
+    lines = wrap_hook_text(text)
+    line_height = HOOK_TEASER_FONT_SIZE + HOOK_TEXT_LINE_SPACING
+    total_height = len(lines) * line_height - HOOK_TEXT_LINE_SPACING
+    block_top = (1920 - total_height) // 2
+    filters = []
+    for i, line in enumerate(lines):
+        filters.append(
+            f"drawtext=text='{line}':fontfile={OVERLAY_FONTFILE}:"
+            f"fontsize={HOOK_TEASER_FONT_SIZE}:fontcolor=white:"
+            f"borderw=3:bordercolor=black:x=(w-tw)/2:"
+            f"y={block_top + i * line_height}"
+        )
+    return ",".join(filters)
 
 
 def build_teaser_cut_command(hook_start, hook_end):

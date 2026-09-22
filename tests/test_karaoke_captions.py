@@ -4,7 +4,7 @@ Story 4 (P1.2b): Karaoke ASS captions + transcript reuse.
 Covers:
 1. build_karaoke_ass - pure builder producing a complete ASS document:
    - PlayRes header (1080x1920) so Fontsize is predictable
-   - exact style values (Fontsize=58, Alignment=2, MarginV=250, Outline=3, ...)
+   - exact style values (Fontsize=58, Alignment=2, MarginV=600, Outline=3, ...)
    - word grouping in lines of at most 3 words with punctuation breaks
    - current-word highlight override + base/word Dialogue pairs
    - ASS escaping ({/}) and ASS timestamp format (H:MM:SS.cc)
@@ -100,7 +100,8 @@ class TestBuilderHeader:
         doc = reelsfy.build_karaoke_ass(_words("hello", "world"))
         style = _style_fields(doc)
         # Fontsize=58, white primary, black outline, Outline=3, Shadow=1,
-        # BorderStyle=1, Alignment=2 (bottom-center), MarginV=250, L/R=60
+        # BorderStyle=1, Alignment=2 (bottom-center), MarginV=600 (upper
+        # part of the bottom half, below the frame middle), L/R=60
         assert style["Fontsize"] == "58"
         assert style["PrimaryColour"] == "&H00FFFFFF"
         assert style["OutlineColour"] == "&H00000000"
@@ -108,7 +109,7 @@ class TestBuilderHeader:
         assert style["Shadow"] == "1"
         assert style["BorderStyle"] == "1"
         assert style["Alignment"] == "2"
-        assert style["MarginV"] == "250"
+        assert style["MarginV"] == "600"
         assert style["MarginL"] == "60"
         assert style["MarginR"] == "60"
         # Bold always set
