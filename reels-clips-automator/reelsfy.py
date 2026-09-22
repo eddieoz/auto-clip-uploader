@@ -773,13 +773,11 @@ PIP_BADGE_MARGIN_RATIO = 0.03       # badge distance from the frame edges
 
 # PiP badge stabilization: the Haar detector jitters its box every frame, so the
 # badge EMA is strong (90% previous / 10% new) with a generous dead-zone, the
-# crop SIZE is EMA-smoothed too (box-scale jitter would pulse the badge), and the
-# crop is only RE-TAKEN when the smoothed center drifted beyond a fraction of the
-# badge size — between recenters the badge content is held, so jitter cannot
-# shake it.
+# crop SIZE is EMA-smoothed too (box-scale jitter would pulse the badge). The
+# badge is cropped LIVE from every frame at the smoothed center — the EMA +
+# dead-zone absorb detector jitter without freezing the face into stills.
 PIP_BADGE_SMOOTHING_FACTOR = 0.9    # badge EMA: 90% previous / 10% new
 PIP_BADGE_MOVEMENT_THRESHOLD = 15   # detector jitter (px) ignored by the EMA
-PIP_BADGE_RECENTER_RATIO = 0.12     # re-crop only after drifting > 12% of badge size
 
 # Deterministic variety schedule: alternate PiP -> screen-zoom on ~5 s
 # boundaries (fixed pattern, PiP first).
@@ -1038,23 +1036,6 @@ def smooth_badge_side(prev_side, raw_side, smoothing_factor=PIP_BADGE_SMOOTHING_
     if prev_side is None:
         return raw_side
     return int(prev_side * smoothing_factor + raw_side * (1 - smoothing_factor))
-
-
-def should_recenter_badge(badge_center, held_badge_center, badge_side,
-                          recenter_ratio=PIP_BADGE_RECENTER_RATIO):
-    """
-    True only when there is no held crop yet, or the smoothed center drifted
-    beyond recenter_ratio of the badge size. Between recenters the badge crop
-    is held unchanged, so per-frame detector jitter cannot shake the badge.
-    """
-    if badge_center is None:
-        return False
-    if held_badge_center is None:
-        return True
-    dx = badge_center[0] - held_badge_center[0]
-    dy = badge_center[1] - held_badge_center[1]
-    threshold = max(int(badge_side or 0), 1) * recenter_ratio
-    return (dx * dx + dy * dy) ** 0.5 > threshold
 
 
 def render_pip_frame(frame, screen_region, face_box, face_center, push_scale=1.0,
@@ -1357,7 +1338,6 @@ def generate_short(
         last_badge = None            # held badge crop for detection misses
         prev_badge_center = None     # EMA-smoothed badge center
         prev_badge_side = None       # EMA-smoothed badge crop size
-        held_badge_center = None     # center used for the currently held crop
         prev_zoom_gray = None        # previous gray frame for motion energy
         prev_zoom_center = None      # EMA-smoothed screen-zoom center
         prev_screencast_mode = None  # for mode-switch debug prints
@@ -1484,21 +1464,14 @@ def generate_short(
                         badge_side = smooth_badge_side(prev_badge_side, raw_side)
                         prev_badge_side = badge_side
 
-                        # Re-crop only on real movement: between recenters the
-                        # badge content is held, freezing detector jitter.
-                        if should_recenter_badge(badge_center, held_badge_center, badge_side):
-                            held_badge_center = badge_center
-                            render_face_box = face_box
-                            render_face_center = badge_center
-                        else:
-                            render_face_box = None
-                            render_face_center = None
-
+                        # Live crop every frame at the smoothed center: the
+                        # EMA + dead-zone absorb detector jitter, while the
+                        # badge content stays real video (no frozen hold).
                         rendered, badge_crop = render_pip_frame(
                             frame,
                             screen_region,
-                            render_face_box,
-                            render_face_center,
+                            face_box,
+                            badge_center,
                             push_scale=push_scale,
                             last_badge=last_badge,
                             face_side=badge_side,

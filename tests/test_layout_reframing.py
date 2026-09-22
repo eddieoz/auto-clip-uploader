@@ -457,7 +457,9 @@ class TestScreenZoom:
 
 
 # ---------------------------------------------------------------------------
-# 3. Badge stabilization (user feedback: badge content shook every frame)
+# 3. Badge stabilization (user feedback: badge content shook every frame;
+#    a later hold-based fix froze the face into stills, so the badge is now
+#    cropped LIVE every frame and jitter is absorbed by the EMA only)
 # ---------------------------------------------------------------------------
 
 
@@ -472,19 +474,11 @@ class TestBadgeStabilization:
     def test_smooth_badge_side_keeps_prev_on_miss(self):
         assert reelsfy.smooth_badge_side(310, None) == 310
 
-    def test_should_recenter_true_when_nothing_held(self):
-        assert reelsfy.should_recenter_badge((500, 200), None, 320)
-
-    def test_should_recenter_false_for_small_jitter(self):
-        # Jitter below 12% of the badge size is frozen out
-        assert not reelsfy.should_recenter_badge((505, 203), (500, 200), 320)
-
-    def test_should_recenter_true_on_real_movement(self):
-        # 100 px drift is far beyond 12% of a 320 px badge
-        assert reelsfy.should_recenter_badge((600, 200), (500, 200), 320)
-
-    def test_should_recenter_false_when_center_none(self):
-        assert not reelsfy.should_recenter_badge(None, (500, 200), 320)
+    def test_no_hold_based_freeze_exists(self):
+        # The badge must never freeze between recenters: rendering is live
+        # every frame, so the hold helper and its constant stay removed.
+        assert not hasattr(reelsfy, "should_recenter_badge")
+        assert not hasattr(reelsfy, "PIP_BADGE_RECENTER_RATIO")
 
     def test_render_pip_frame_face_side_override(self):
         frame = make_screencast_frame()
@@ -502,10 +496,24 @@ class TestBadgeStabilization:
         )
         assert badge_b.shape[0] == 500
 
+    def test_render_pip_frame_crops_live_content_per_center(self):
+        # Cropping at a different smoothed center yields different badge
+        # content — the face is live video, not a held still.
+        frame = make_screencast_frame()
+        region = reelsfy.screen_region_from_median_box(SC_FACE, FRAME_SHAPE)
+        _, badge_a = reelsfy.render_pip_frame(
+            frame, region, SC_FACE, (900, 180), push_scale=1.0,
+            face_side=400,
+        )
+        _, badge_b = reelsfy.render_pip_frame(
+            frame, region, SC_FACE, (1000, 180), push_scale=1.0,
+            face_side=400,
+        )
+        assert not np.array_equal(badge_a, badge_b)
+
     def test_stabilization_constants_binding(self):
         assert reelsfy.PIP_BADGE_SMOOTHING_FACTOR == 0.9
         assert reelsfy.PIP_BADGE_MOVEMENT_THRESHOLD == 15
-        assert 0.0 < reelsfy.PIP_BADGE_RECENTER_RATIO < 0.5
 
 
 # ---------------------------------------------------------------------------
