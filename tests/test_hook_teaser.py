@@ -770,6 +770,44 @@ class TestTeaserRepeatsFirstCaptionHelper:
         assert reelsfy.teaser_repeats_first_caption("We need", short) is False
         assert reelsfy.teaser_repeats_first_caption("We set", short) is True
 
+    def test_formulaic_opening_bigram_is_not_a_repeat(self):
+        # Screencast captions open with formulaic bigrams ("so today", "in
+        # this video"). A genuinely different teaser that happens to open with
+        # the same two words must NOT be dropped: the shared prefix has to
+        # cover a substantial fraction of the shorter side.
+        words = [
+            {"word": "So", "start": 0.0, "end": 0.3},
+            {"word": "today", "start": 0.3, "end": 0.6},
+            {"word": "we", "start": 0.6, "end": 0.7},
+            {"word": "ship", "start": 0.7, "end": 1.0},
+            {"word": "the", "start": 1.0, "end": 1.1},
+            {"word": "pipeline.", "start": 1.1, "end": 1.6},
+        ]
+        assert (
+            reelsfy.teaser_repeats_first_caption(
+                "So today the retry limit shipped", words
+            )
+            is False
+        )
+        # A teaser that really does restate the opening still trips.
+        assert (
+            reelsfy.teaser_repeats_first_caption("So today we ship the", words)
+            is True
+        )
+
+    def test_punctuation_only_opening_does_not_fake_a_match(self):
+        # "…" and "--" normalize to empty tokens; two of them aligned at
+        # positions 0 and 1 must not count as two shared words.
+        punct_only = [
+            {"word": "…", "start": 0.0, "end": 0.2},
+            {"word": "--", "start": 0.2, "end": 0.5},
+        ]
+        assert reelsfy.teaser_repeats_first_caption("… --", punct_only) is False
+        assert (
+            reelsfy.teaser_repeats_first_caption("… -- but the build broke", punct_only)
+            is False
+        )
+
 
 class TestPublishHookDedupGuard:
     """B4: the publish step refuses a teaser that repeats the clip opening."""
@@ -883,6 +921,30 @@ class TestPublishHookDedupGuard:
 
         teaser_mock.assert_not_called()
         assemble_mock.assert_not_called()
+
+    def test_teaser_sharing_only_a_formulaic_bigram_still_assembles(self):
+        # The caption net must not silently drop a fine teaser just because
+        # the clip opens with the same formulaic bigram.
+        words = [
+            {"word": "So", "start": 0.0, "end": 0.3},
+            {"word": "today", "start": 0.3, "end": 0.6},
+            {"word": "we", "start": 0.6, "end": 0.7},
+            {"word": "ship", "start": 0.7, "end": 1.0},
+            {"word": "the", "start": 1.0, "end": 1.1},
+            {"word": "pipeline.", "start": 1.1, "end": 1.6},
+        ]
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(20.0, 23.0, "So today the retry limit shipped"),
+            clip_start_time=0.0,
+            subtitle_words=words,
+        )
+
+        teaser_mock.assert_called_once_with(20.0, 23.0, "So today the retry limit shipped")
+        assert (
+            generate_subtitle_mock.call_args.kwargs.get("main_output_path")
+            == "tmp/hook-main.mp4"
+        )
+        assemble_mock.assert_called_once()
 
     def test_clip_start_time_none_keeps_the_legacy_teaser(self):
         # Guard inert: a hook at the clip opening is still published.

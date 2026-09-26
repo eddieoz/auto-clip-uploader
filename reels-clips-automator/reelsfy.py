@@ -4814,6 +4814,12 @@ HOOK_DUPLICATE_GUARD_SECONDS = 5.0
 # shared leading words is also the width of the short exact-match case the
 # net replaced, so nothing that used to be caught is lost.
 HOOK_CAPTION_MIN_MATCH_WORDS = 2
+# The floor alone is not enough: screencast captions open with formulaic
+# bigrams ("so today", "in this video", "welcome back"), so a genuinely
+# different teaser can open with the same two words by coincidence. A real
+# repeat restates the opening, so its shared prefix covers most of the shorter
+# of the two sequences; a coincidental bigram collision does not.
+HOOK_CAPTION_MIN_MATCH_COVERAGE = 0.6
 # Per-word punctuation stripped when the caption net compares words; the
 # sentence normalizer above only strips the very end of the text.
 _CAPTION_PUNCTUATION = ".,!?;:…\"'’-()"
@@ -5174,11 +5180,20 @@ def opening_caption_prefix(subtitle_words, guard=HOOK_DUPLICATE_GUARD_SECONDS):
 
 
 def _comparable_word_list(text):
-    """Normalized text as a list of words, punctuation stripped per word."""
+    """Normalized text as a list of words, punctuation stripped per word.
+
+    Tokens that normalize away entirely (punctuation-only, e.g. "…" or "--")
+    are dropped: left in, two of them aligned at positions 0 and 1 would
+    compare equal and fake a two-word match.
+    """
     normalized = _normalize_comparable_text(text)
     if not normalized:
         return []
-    return [word.strip(_CAPTION_PUNCTUATION) for word in normalized.split()]
+    return [
+        stripped
+        for stripped in (word.strip(_CAPTION_PUNCTUATION) for word in normalized.split())
+        if stripped
+    ]
 
 
 def teaser_repeats_first_caption(hook_text, subtitle_words):
@@ -5203,11 +5218,17 @@ def teaser_repeats_first_caption(hook_text, subtitle_words):
         opening's first word, never anywhere in the window. A hook that
         merely repeats a later sentence ("Then it broke.") is not the
         opening and must not trip the net.
-      * that word floor is what makes it "substantial": a hook sharing a
+      * that word floor is only the absolute minimum; a hook sharing a
         single leading word with the opening is coincidental phrasing, not a
         repetition of the opening. Two is the floor because the exact-match
         rule this replaces fired on two-word openings, so nothing that used
         to be caught is lost.
+      * on top of the floor, the shared prefix must cover at least
+        HOOK_CAPTION_MIN_MATCH_COVERAGE of the SHORTER of the two sequences.
+        Screencast captions open with formulaic bigrams ("so today", "in
+        this video"), so two shared words alone no longer mean a repeat — a
+        real restatement of the opening covers most of the shorter side, a
+        coincidental bigram collision does not.
 
     Pure; never raises.
     """
@@ -5223,7 +5244,10 @@ def teaser_repeats_first_caption(hook_text, subtitle_words):
             if hook_word != caption_word:
                 break
             shared += 1
-        return shared >= HOOK_CAPTION_MIN_MATCH_WORDS
+        shorter = min(len(hook_words), len(caption_words))
+        return shared >= HOOK_CAPTION_MIN_MATCH_WORDS and (
+            shared / shorter >= HOOK_CAPTION_MIN_MATCH_COVERAGE
+        )
     except Exception:
         return False
 
