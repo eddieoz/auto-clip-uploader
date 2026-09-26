@@ -139,6 +139,29 @@ def _llm_client_replying_with(text):
     return mock_openai
 
 
+def _capture_prompt(monkeypatch):
+    """Return the user prompt built with TOPIC_BOUNDARY_LLM=true.
+
+    Uses the same mock-capture pattern as the other prompt tests: the
+    OpenAI client is replaced and the request's messages are recorded, so
+    no network access happens.
+    """
+    captured = {}
+
+    def _capture(model, messages, n, stop):
+        captured["messages"] = messages
+        response = MagicMock()
+        response.choices[0].message.content = "3"
+        return response
+
+    mock_openai = MagicMock()
+    mock_openai.OpenAI.return_value.chat.completions.create.side_effect = _capture
+    monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "true")
+    with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
+        reelsfy.resolve_topic_start_cue("srt content", _make_segments())
+    return captured["messages"][-1]["content"]
+
+
 def _resolve_with_reply(monkeypatch, reply, segments=None):
     """Run resolve_topic_start_cue with the LLM pinned to `reply`.
 
@@ -345,6 +368,29 @@ class TestResolveTopicStartCue:
         user_content = captured["messages"][-1]["content"]
         assert "topic_complete" in user_content
         assert "earlier_start_cue" in user_content
+
+    # --- Story B3: prompt steers hooks away from the first sentence ---
+
+    def test_prompt_forbids_first_sentence_and_prefers_mid_topic(
+        self, monkeypatch
+    ):
+        # The clip OPENS with the final topic's first sentence, so a hook
+        # proposed there merely repeats the opening. The prompt must forbid
+        # that and point the model at engaging mid-topic sentences.
+        user_content = _capture_prompt(monkeypatch)
+        assert "MUST NOT be the first sentence of the final topic" in user_content
+        assert "mid-topic" in user_content
+
+    def test_steering_sits_in_the_hook_candidates_bullet(self, monkeypatch):
+        # One coherent rule set, not the constraint split off elsewhere.
+        user_content = _capture_prompt(monkeypatch)
+        bullet = next(
+            line
+            for line in user_content.splitlines()
+            if line.startswith('- "hook_candidates"')
+        )
+        assert "MUST NOT be the first sentence of the final topic" in bullet
+        assert "mid-topic" in bullet
 
     def test_gate_off_returns_legacy_none(self, monkeypatch):
         segments = _make_segments()
