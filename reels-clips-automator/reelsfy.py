@@ -2647,6 +2647,16 @@ def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments
     top-ranked candidate tends to sit. With no survivor the teaser is simply
     skipped. Malformed candidates are skipped, never raising. Returns
     {"hook_start_time", "hook_end_time", "hook_text"} (SRT + text) or None.
+
+    B2: surviving candidates are PREFERRED when they land in the middle band
+    of the window — from window_start + HOOK_MID_BAND_START_FRACTION to
+    window_start + HOOK_MID_BAND_END_FRACTION of its duration, inclusive.
+    A teaser at the very start leads with a truncated thought and one at the
+    very end pre-empts the payoff; a mid-clip teaser adds information
+    instead. This is a preference, not a filter: with no mid-band survivor
+    the first survivor in the LLM's ranking order is returned, exactly as
+    before B2. Both tiers keep the ranking order, so "first" always means
+    first in the candidate list.
     """
     try:
         if not isinstance(candidates, list) or not segments:
@@ -2655,6 +2665,12 @@ def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments
         window_end = _srt_like_to_seconds(window_end_srt)
         if window_start is None or window_end is None or window_end <= window_start:
             return None
+        # Invariants of the window, computed once (B2) rather than per candidate.
+        window_duration = window_end - window_start
+        guard_end = window_start + HOOK_DUPLICATE_GUARD_SECONDS
+        band_start = window_start + HOOK_MID_BAND_START_FRACTION * window_duration
+        band_end = window_start + HOOK_MID_BAND_END_FRACTION * window_duration
+        first_survivor = None
         for candidate in candidates:
             try:
                 if not isinstance(candidate, dict):
@@ -2686,19 +2702,24 @@ def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments
                     or duration > HOOK_TEASER_MAX_DURATION + 1e-9
                 ):
                     continue
-                guard_end = window_start + HOOK_DUPLICATE_GUARD_SECONDS
                 if span_start < guard_end - 1e-9:
                     continue
-                return {
+                survivor = {
                     "hook_start_time": _segment_start_srt(segments[cue_start - 1])
                     or format_timestamp(span_start),
                     "hook_end_time": _segment_end_srt(segments[cue_end - 1])
                     or format_timestamp(span_end),
                     "hook_text": text.strip(),
                 }
+                # B2: the first mid-band survivor wins outright; an edge
+                # survivor is only kept as the fallback.
+                if band_start - 1e-9 <= span_start <= band_end + 1e-9:
+                    return survivor
+                if first_survivor is None:
+                    first_survivor = survivor
             except Exception:
                 continue
-        return None
+        return first_survivor
     except Exception as e:
         print(f"Hook candidate selection failed ({e}); keeping the hook optional")
         return None
@@ -4782,6 +4803,13 @@ HOOK_TEASER_MAX_DURATION = 6.0
 # overlapping this opening span of the resolved window is rejected; the clip
 # then simply publishes without a teaser.
 HOOK_DUPLICATE_GUARD_SECONDS = 5.0
+# Story B2: among candidates that already survive every check, prefer the ones
+# landing in the middle of the clip — not in the first 20% (leads with a
+# truncated thought) nor the last 10% (pre-empts the payoff). A teaser from the
+# middle is complementary instead of repetitive. This is a preference, not a
+# filter: an edge candidate is still used when no mid-band one exists.
+HOOK_MID_BAND_START_FRACTION = 0.20
+HOOK_MID_BAND_END_FRACTION = 0.90
 HOOK_TEASER_FONT_SIZE = 64
 # drawtext cannot wrap text, so long hooks must be pre-split into lines that
 # fit the 1080 px frame (fontsize 64 uppercase ≈ 40 px/char).

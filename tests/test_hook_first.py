@@ -577,9 +577,9 @@ class TestOpeningDuplicateGuard:
             is None
         )
 
-    def test_span_overlapping_the_guard_rejected(self):
-        # Cue 2 (28-33 s) starts inside the 25-30 s guard and runs past it:
-        # overlap is what disqualifies it, not merely starting inside.
+    def test_span_straddling_the_guard_end_rejected(self):
+        # Cue 2 (28-33 s) starts inside the 25-30 s guard and runs past its
+        # end: overlap is what disqualifies it, not merely starting inside.
         candidates = [_candidate(2, 2, "Straddling sentence")]
 
         assert (
@@ -609,6 +609,161 @@ class TestOpeningDuplicateGuard:
 
     def test_guard_constant_is_five_seconds(self):
         assert reelsfy.HOOK_DUPLICATE_GUARD_SECONDS == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Story B2: the mid-band preference — a teaser that lands in the middle of
+# the clip adds information, while one at either edge leads with a truncated
+# thought or pre-empts the payoff. This is a PREFERENCE, not a filter.
+# ---------------------------------------------------------------------------
+
+
+# B2 cue layout: the resolved window is 25-85 s (60 s long), so the opening
+# duplicate guard covers 25-30 s and the mid band covers 37-79 s
+# (20%..90% of the window duration).
+#   cue 1: 25-28  (inside the opening guard — rejected)
+#   cue 2: 31-34  (10% of the window; past the guard, before the mid band)
+#   cue 3: 52-55  (45% of the window; inside the mid band)
+#   cue 4: 60-63  (58% of the window; inside the mid band)
+#   cue 5: 80-83  (92% of the window; inside the last 10%)
+#   cue 6: 37-40  (exactly on the mid-band start boundary)
+B2_WINDOW_START_SRT = "00:00:25,000"
+B2_WINDOW_END_SRT = "00:01:25,000"
+
+BAND_CUES = [
+    _cue(25.0, 28.0, "Opening sentence"),
+    _cue(31.0, 34.0, "Early edge hook"),
+    _cue(52.0, 55.0, "Mid hook"),
+    _cue(60.0, 63.0, "Second mid hook"),
+    _cue(80.0, 83.0, "Late edge hook"),
+    _cue(37.0, 40.0, "Boundary hook"),
+]
+
+
+def _expected(cue, text):
+    return {
+        "hook_start_time": reelsfy.format_timestamp(cue["start_time"]),
+        "hook_end_time": reelsfy.format_timestamp(cue["end_time"]),
+        "hook_text": text,
+    }
+
+
+class TestMidBandPreference:
+    """Survivors inside the mid band are preferred; edges still win when
+    nothing else is available, in the LLM's original ranking order."""
+
+    def test_mid_band_candidate_preferred_over_earlier_edge_candidate(self):
+        # Cue 2 sits at ~10% of the window, cue 3 at ~45%. Cue 2 is listed
+        # first (better LLM rank) but the mid-band teaser is preferred.
+        candidates = [
+            _candidate(2, 2, "Early edge hook"),
+            _candidate(3, 3, "Mid hook"),
+        ]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == _expected(BAND_CUES[2], "Mid hook")
+
+    def test_mid_band_candidate_preferred_over_later_edge_candidate(self):
+        # Cue 5 sits in the last 10% and is listed first.
+        candidates = [
+            _candidate(5, 5, "Late edge hook"),
+            _candidate(3, 3, "Mid hook"),
+        ]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == _expected(BAND_CUES[2], "Mid hook")
+
+    def test_single_early_edge_candidate_still_selected(self):
+        # Preference, not a filter: with no mid-band survivor the edge
+        # candidate is returned exactly as before B2.
+        candidates = [_candidate(2, 2, "Early edge hook")]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == _expected(BAND_CUES[1], "Early edge hook")
+
+    def test_single_late_edge_candidate_still_selected(self):
+        candidates = [_candidate(5, 5, "Late edge hook")]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == _expected(BAND_CUES[4], "Late edge hook")
+
+    def test_first_of_two_mid_band_candidates_wins(self):
+        # Within the preferred tier the LLM's ranking order is preserved —
+        # "first" is list order, not timestamp or shortest span.
+        candidates = [
+            _candidate(3, 3, "Mid hook"),
+            _candidate(4, 4, "Second mid hook"),
+        ]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == _expected(BAND_CUES[2], "Mid hook")
+
+    def test_candidate_exactly_on_band_start_boundary_is_inside(self):
+        # Cue 6 starts at 37 s == window_start + 20% of the window, exactly.
+        candidates = [
+            _candidate(2, 2, "Early edge hook"),
+            _candidate(6, 6, "Boundary hook"),
+        ]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == _expected(BAND_CUES[5], "Boundary hook")
+
+    def test_edge_only_ranking_is_byte_identical_to_pre_b2_order(self):
+        # Every survivor is an edge candidate: the answer is the first in the
+        # LLM's order, with the same SRT strings and hook_text as before B2.
+        candidates = [
+            _candidate(5, 5, "Late edge hook"),
+            _candidate(2, 2, "Early edge hook"),
+        ]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+        )
+
+        assert selected == {
+            "hook_start_time": "00:01:20,000",
+            "hook_end_time": "00:01:23,000",
+            "hook_text": "Late edge hook",
+        }
+
+    def test_empty_candidates_return_none(self):
+        assert (
+            reelsfy.select_hook_candidate(
+                [], B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+            )
+            is None
+        )
+
+    def test_all_malformed_candidates_return_none(self):
+        candidates = [None, 42, "not a dict", {"cue_start": 3, "cue_end": 3}]
+        assert (
+            reelsfy.select_hook_candidate(
+                candidates, B2_WINDOW_START_SRT, B2_WINDOW_END_SRT, BAND_CUES
+            )
+            is None
+        )
+
+    def test_mid_band_fractions_are_twenty_and_ninety_percent(self):
+        assert reelsfy.HOOK_MID_BAND_START_FRACTION == 0.20
+        assert reelsfy.HOOK_MID_BAND_END_FRACTION == 0.90
 
 
 # ---------------------------------------------------------------------------
