@@ -236,11 +236,11 @@ Scenario: Teaser would repeat the opening
 
 Shipped as commit `4728e95`: `resolve_end_card_enabled` now defaults to `false` (`END_CARD_ENABLED=true` opts in), `.env.example` and tests updated. Keep this story in the EPIC for traceability.
 
-### Story C2 — Diagnose the Instagram freeze (1 pt)
+### Story C2 — Diagnose the Instagram freeze (1 pt) ✅ DONE
 
-Reproduce the assembly locally and identify the exact incompatibility. Working hypothesis (R7): `-c copy` concat across three independently encoded streams (different SPS/PPS, timebase, or edit lists) — desktop players bridge the discontinuity, Instagram's transcoder stalls on the last main frames and drops the end card.
+Shipped as commit `docs(C2)`. The R7 hypothesis was **partly wrong**, and the real trigger is narrower and much cheaper to fix than R7 implied. Full findings are in the [Theme C findings appendix](#theme-c-findings-c2) at the bottom of this file. The reproduction is `reels-clips-automator/tools/probe_end_card_assembly.py` (run with `--unpinned-end-card` to reproduce, without it to verify a fix), and `tests/test_end_card_assembly.py` pins the diagnosis as characterization tests that C3 inverts.
 
-**TDD:** characterization test capturing current piece parameters via `ffprobe` (codec/profile/timebase per piece) as a fixture doc in this file — the fix story asserts against it.
+**One line:** `build_end_card_command()` never sets `-r`, so the end card encodes at 25 fps / time_base `1/12800` while every other piece is 30 fps / `1/15360`; `concat -c copy` then *succeeds* and squeezes the end card's 38 frames into a 2.5 ms window on the main clip's last frames, which desktop players render as an invisible flash and Instagram's transcoder stalls on.
 
 **BDD:**
 ```gherkin
@@ -251,14 +251,17 @@ Scenario: Root cause is identified and written down
   And the reproduction command is recorded
 ```
 
-**Files:** `docs/tasks/EPIC-content-complete-engaging-clips.md` (findings appendix), throwaway probe script.
+**Files:** `docs/tasks/EPIC-content-complete-engaging-clips.md` (findings appendix), `reels-clips-automator/tools/probe_end_card_assembly.py`, `tests/test_end_card_assembly.py`.
 
 ### Story C3 — Fix the assembly so the end card survives Instagram (1 pt)
 
-Based on C2's finding, rework `assemble_hook_teaser_final` so the assembled file is a single continuous stream: either (a) one `filter_complex` concat + NVENC re-encode pass, or (b) end card/teaser generated with byte-compatible encoder settings and proper timebase. Audio is never re-mastered (invariant). Verify with `ffprobe`: final duration ≈ sum of pieces, single video parameter set across boundaries.
+**Decided in C2's appendix** (laya-validated): strategy **(B)** — make every assembly piece byte-compatible in frame rate, video timescale and audio rate, and keep the existing `-c copy` concat. Measured at 0 outcome strength for the alternative and near-zero cost, versus a full re-encode pass per publish. The characterization assertions in `tests/test_end_card_assembly.py` are the ones this story inverts.
 
-**TDD (write first):**
-- `tests/test_polish.py` / `tests/test_hook_teaser.py` additions: the assembly command for the enabled path is the fixed strategy (e.g., single re-encode concat); ladder fallbacks preserved; mastering invariant asserts still pass.
+Work left: pin `-r 30` / `-video_track_timescale 15360` on the end card, the same timescale on the teaser and main burns, and `-ar 48000 -ac 2` on the music-bed rung (the one burn that omits the audio pin — see the appendix's secondary hazard). Ladder fallbacks and the mastering invariant stay as they are.
+
+**TDD (write first):** invert the characterization assertions in `tests/test_end_card_assembly.py`; keep `tests/test_polish.py`'s end-card and ladder tests green.
+
+
 
 **BDD:**
 ```gherkin
@@ -321,8 +324,8 @@ Scenario: Epic closes green
 | B3 prompt steering ✅ | B | 1 | done (`06c3c7c`) |
 | B4 publish-level dedup guard ✅ | B | 1 | done (`9305f3f`, +`1e7e81c`, `0d79d55`) |
 | C1 disable end card ✅ | C | 1 | done (`4728e95`) |
-| C2 diagnose Instagram freeze | C | 1 | — |
-| C3 fix assembly | C | 1 | C2 |
+| C2 diagnose Instagram freeze ✅ | C | 1 | done |
+| C3 fix assembly | C | 1 | C2 — decided: matched encoder settings (B) |
 | C4 re-enable decision | C | 1 | C3, user |
 | D1 regression + docs | D | 1 | A1-A5, B1-B4, C3 |
 
@@ -352,7 +355,9 @@ Notes for whoever tunes this next:
   there is no corpus. They were chosen so the cheap direction is "don't drop a good teaser".
   They are the first knobs to revisit if teasers feel too eager or too shy.
 
-Parallelizable now: C2.
+**Theme C is diagnosed.** C2 replaced the R7 hypothesis with a measured root cause: a
+missing `-r` on the end card, not SPS divergence. See the appendix at the bottom of this file for
+the ffprobe tables, the reproduction, the two strategies compared, and the laya validation.
 
 ### Deferred follow-ups (Theme B, non-blocking)
 
@@ -364,3 +369,112 @@ Parallelizable now: C2.
   vacuous — they are the ones that catch a revert — but they will fail on a harmless retune.
 - Separate ticket: 7 test modules fail to import (`filter_transcript_by_timestamps` and friends),
   so the full suite needs `--continue-on-collection-errors` to reproduce its baseline.
+
+---
+
+## Theme C findings (C2)
+
+The Instagram freeze reproduced locally. **R7's hypothesis was partly wrong**, and the real
+trigger is narrower — and far cheaper to fix — than R7 implied.
+
+### What the pieces actually are
+
+`ffprobe` on a reproduction built from the real command strings (4 s teaser + 40 s main + 1.5 s
+end card, ffmpeg 6.1.1, NVENC):
+
+| piece | codec / profile | fps | time_base | has_b_frames | refs | audio |
+|---|---|---|---|---|---|---|
+| teaser | h264 High | **30/1** | **1/15360** | 2 | 1 | aac LC 48000 2ch |
+| main | h264 High | **30/1** | **1/15360** | 2 | 1 | aac LC 48000 2ch |
+| end card | h264 High | **25/1** | **1/12800** | 2 | 1 | aac LC 48000 2ch |
+
+R7 said "three independently encoded streams (different SPS/PPS, timebase, or edit lists)". The
+SPS/PPS part is wrong: all three are h264 High, yuv420p, 1080x1920, `refs=1`, `has_b_frames=2`.
+The **timebase** part is right, and it is the whole story.
+
+### Root cause
+
+`build_end_card_command()` never sets `-r`. Its input is a `color` lavfi source, which defaults
+to **25 fps**, and NVENC then picks a **1/12800** track timescale. Every other piece gets its
+frame rate from `generate_short`'s hardcoded `-r 30` (`build_pipe_ffmpeg_command`), giving
+30 fps / 1/15360. `-video_track_timescale` appears nowhere in `reelsfy.py`, so nothing reconciles
+them.
+
+`assemble_hook_teaser_final` then concatenates with `concat -c copy`, and **that succeeds** —
+rc=0, no warning, a perfectly valid-looking file. The concat demuxer rescales the mismatched
+piece, and the end card's 38 frames land as a cluster spanning **2.5 milliseconds** (pts
+43.98776 → 43.99017) on top of the main clip's final frames, which already occupy that exact
+range. The video track reports **44.100 s** while the container claims **45.635 s** — the last
+1.5 s of video is unaccounted for.
+
+That is the freeze. A desktop player draws the main clip's last frame and shows a 2.5 ms flash,
+which is imperceptible — which is exactly why local testing looked fine and why the bug survived
+as "the end card is not showing". Instagram's transcoder cannot render a 2.5 ms frame cluster
+and stalls on the last main frame it can decode.
+
+### Reproduction
+
+```bash
+# reproduces the bug (4 findings, exit 1)
+python3 reels-clips-automator/tools/probe_end_card_assembly.py --unpinned-end-card
+# verifies a fix (0 findings, exit 0)
+python3 reels-clips-automator/tools/probe_end_card_assembly.py
+```
+
+The tool rebuilds the three pieces with `reelsfy`'s own encoder settings, concatenates them the
+way the publish path does, and reports boundary health. It is a diagnostic, not part of the
+publish path; re-run it after any encoder change and for C4's A/B.
+
+Measured findings in the unfixed state:
+
+```
+- end card is 25/1 fps but the published track is 30/1 fps
+- end card time_base 1/12800 != published 1/15360
+- end card occupies 0.100s in the published file but is 1.520s long - the frames collapsed
+- video track lasts 44.100s but the container claims 45.635s
+```
+
+### Strategy decision (laya-validated)
+
+Put to `laya_predict` with the measurements above, the constraints, and both candidate designs:
+
+| | (B) matched encoder settings, keep `-c copy` | (A) `filter_complex` concat + re-encode |
+|---|---|---|
+| video duration | 45.633 | 45.633 |
+| container duration | 45.654 | 45.633 |
+| last frame pts | 45.621 | 45.600 |
+| keyframes | 7, **IDR at both boundaries** (4.121, 44.121) | 6, uniform 8.33 s GOP, **no IDR at boundaries** |
+| cost per publish | **none** — the end card was already encoded | one extra full NVENC pass over the whole clip |
+| audio | **byte-copied**; the mastering-once invariant is structural | re-encoded (plain AAC, not re-mastered) — a second generation loss |
+
+laya chose **(B)** (0.38 against 0.23 for A and 0.30 for "both"), judged the residual risk of
+that choice low, and named **audio** as the pitfall a careful engineer would still get wrong.
+The BDD in C3 says "one continuous video stream"; B delivers one *track* with continuous
+timestamps and IDRs at both boundaries, which is the more transcoder-friendly shape of the two
+(A's boundaries fall mid-GOP). B is also the only option that leaves the existing three-rung
+ladder intact underneath it and costs nothing per publish.
+
+### Secondary hazard (the pitfall)
+
+laya's audio warning is not hypothetical. The music-bed rung of `generate_subtitle` is the one
+burn that emits `-c:a aac -b:a 192k` **without** `-ar 48000`, so its output carries the source's
+rate — 44100 for a typical capture — while the end card is 48000. Measured consequence:
+`concat -c copy` does **not** fail. It adopts the first stream's parameters for the whole file
+and emits a container **0.40 s longer** than the sum of the pieces. A silent A/V desync that no
+rung in the ladder ever sees, because nothing errored. The existing rung-3 comment already
+suspected a sample-rate mismatch here without knowing it was silent.
+
+Note also that pinning the timescale alone stops the frame collapse but leaves a 25 fps segment
+inside a 30 fps track — a variable-frame-rate track, which is the other shape a social
+transcoder can stall on. Both `-r 30` and the timescale need pinning.
+
+### What C3 has to do
+
+1. `build_end_card_command`: add `-r 30` and `-video_track_timescale 15360`.
+2. The teaser and main burns: add `-video_track_timescale 15360` so all three share one
+   timescale.
+3. The music-bed rung: add `-ar 48000 -ac 2`.
+4. Leave the ladder and the mastering invariant alone.
+
+Then invert the characterization assertions in `tests/test_end_card_assembly.py` and re-run the
+probe without `--unpinned-end-card`.
