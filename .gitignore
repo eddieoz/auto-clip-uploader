@@ -101,7 +101,7 @@ GEMINI.md
 reels-clips-automator/weights
 reels-clips-automator/fonts/noto-sans-font.zip
 tasks/tasks.md
-tasks/
+/tasks/
 tests/
 test*
 input/*
