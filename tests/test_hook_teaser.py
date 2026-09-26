@@ -657,6 +657,230 @@ class TestPublishSegmentWithOptionalTeaser:
         )
 
 
+class TestTeaserDuplicatesClipOpeningHelper:
+    """B4: the pure overlap helper (reuses HOOK_DUPLICATE_GUARD_SECONDS)."""
+
+    def test_hook_at_the_clip_opening_is_a_duplicate(self):
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, 0.0, 3.0) is True
+
+    def test_hook_entirely_before_the_clip_is_not_a_duplicate(self):
+        # A teaser that ends before the clip even starts cannot replay it.
+        assert reelsfy.teaser_duplicates_clip_opening(10.0, 4.0, 9.5) is False
+
+    def test_hook_far_inside_the_clip_is_not_a_duplicate(self):
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, 20.0, 23.0) is False
+
+    def test_hook_starting_exactly_at_the_guard_edge_is_not_a_duplicate(self):
+        # clip_start + HOOK_DUPLICATE_GUARD_SECONDS is just OUTSIDE the guard.
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, 5.0, 8.0) is False
+
+    def test_hook_straddling_the_guard_edge_is_a_duplicate(self):
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, 3.0, 9.0) is True
+
+    def test_guard_argument_overrides_the_default(self):
+        # guard=2 s keeps the 0-3 s hook inside the opening...
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, 0.0, 3.0, guard=2.0) is True
+        # ...and a 12-15 s hook only clears a 10 s opening.
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, 12.0, 15.0, guard=10.0) is False
+
+    def test_none_clip_start_means_no_overlap_check(self):
+        # The inert case: no clip start -> never a duplicate (legacy callers).
+        assert reelsfy.teaser_duplicates_clip_opening(None, 0.0, 3.0) is False
+
+    def test_unparseable_times_are_not_a_duplicate(self):
+        assert reelsfy.teaser_duplicates_clip_opening("nope", 0.0, 3.0) is False
+        assert reelsfy.teaser_duplicates_clip_opening(0.0, "nope", None) is False
+
+
+class TestTeaserRepeatsFirstCaptionHelper:
+    """B4: the tolerant caption-sentence comparison (second net)."""
+
+    WORDS = [
+        {"word": "This", "start": 0.0, "end": 0.4},
+        {"word": "changed", "start": 0.4, "end": 0.9},
+        {"word": "everything.", "start": 0.9, "end": 1.6},
+        {"word": "Then", "start": 1.6, "end": 1.8},
+        {"word": "it", "start": 1.8, "end": 2.0},
+        {"word": "broke.", "start": 2.0, "end": 2.4},
+    ]
+
+    def test_matching_text_is_a_repeat(self):
+        assert (
+            reelsfy.teaser_repeats_first_caption("This changed everything.", self.WORDS)
+            is True
+        )
+
+    def test_casing_and_trailing_punctuation_are_normalized(self):
+        assert (
+            reelsfy.teaser_repeats_first_caption("this CHANGED everything!!!", self.WORDS)
+            is True
+        )
+
+    def test_different_text_is_not_a_repeat(self):
+        assert (
+            reelsfy.teaser_repeats_first_caption("A totally different line", self.WORDS)
+            is False
+        )
+
+    def test_no_caption_words_is_inert(self):
+        assert reelsfy.teaser_repeats_first_caption("This changed everything.", []) is False
+        assert reelsfy.teaser_repeats_first_caption("This changed everything.", None) is False
+
+    def test_empty_hook_text_is_inert(self):
+        assert reelsfy.teaser_repeats_first_caption("", self.WORDS) is False
+        assert reelsfy.teaser_repeats_first_caption(None, self.WORDS) is False
+
+    def test_sentence_after_the_opening_is_not_a_repeat(self):
+        # Only the FIRST sentence counts; "Then it broke." must not trip it.
+        assert reelsfy.teaser_repeats_first_caption("Then it broke.", self.WORDS) is False
+
+
+class TestPublishHookDedupGuard:
+    """B4: the publish step refuses a teaser that repeats the clip opening."""
+
+    def _run(
+        self,
+        hook,
+        clip_start_time,
+        subtitle_words=None,
+        assemble_return=True,
+        end_card_enabled="false",
+    ):
+        """Run publish_segment_with_optional_teaser with the teaser helpers
+        mocked. Returns (teaser_mock, generate_subtitle_mock, assemble_mock)."""
+        teaser_mock = MagicMock(return_value="tmp/hook-teaser.mp4")
+        generate_subtitle_mock = MagicMock(side_effect=[True, True])
+        assemble_mock = MagicMock(return_value=assemble_return)
+
+        with patch.object(
+            reelsfy, "generate_subtitle", generate_subtitle_mock
+        ), patch.object(
+            reelsfy, "generate_hook_teaser", teaser_mock
+        ), patch.object(
+            reelsfy, "assemble_hook_teaser_final", assemble_mock
+        ), patch.object(
+            reelsfy, "generate_end_card", MagicMock(return_value="tmp/end-card.mp4")
+        ), patch.dict(
+            os.environ, {"END_CARD_ENABLED": end_card_enabled}
+        ), patch(
+            "os.path.exists", return_value=True
+        ), patch(
+            "os.path.getsize", return_value=64
+        ):
+            reelsfy.publish_segment_with_optional_teaser(
+                "final-test_cropped000.mp4",
+                "vid",
+                "/out",
+                video_title="Title",
+                subtitle_words=subtitle_words if subtitle_words is not None else SAMPLE_WORDS,
+                hook=hook,
+                clip_start_time=clip_start_time,
+            )
+
+        return teaser_mock, generate_subtitle_mock, assemble_mock
+
+    def _is_direct_publish_call(self, call):
+        args = call.args
+        kwargs = call.kwargs
+        return (
+            args[:3] == ("final-test_cropped000.mp4", "vid", "/out")
+            and not kwargs.get("main_output_path")
+            and kwargs.get("video_title") == "Title"
+        )
+
+    def test_teaser_at_the_clip_opening_is_skipped(self):
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(0.0, 3.0, "A teaser"),
+            clip_start_time=0.0,
+        )
+
+        teaser_mock.assert_not_called()
+        assert generate_subtitle_mock.call_count == 1
+        assert self._is_direct_publish_call(generate_subtitle_mock.call_args)
+        assemble_mock.assert_not_called()
+
+    def test_teaser_overlapping_only_the_first_five_seconds_is_skipped(self):
+        # 3 s into a clip that starts at 100 s: still inside the guard.
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(103.0, 106.0, "A teaser"),
+            clip_start_time=100.0,
+        )
+
+        teaser_mock.assert_not_called()
+        assert generate_subtitle_mock.call_count == 1
+        assert self._is_direct_publish_call(generate_subtitle_mock.call_args)
+        assemble_mock.assert_not_called()
+
+    def test_non_overlapping_teaser_still_assembles(self):
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(20.0, 23.0, "A teaser"),
+            clip_start_time=0.0,
+        )
+
+        teaser_mock.assert_called_once_with(20.0, 23.0, "A teaser")
+        assert generate_subtitle_mock.call_count == 1
+        assert (
+            generate_subtitle_mock.call_args.kwargs.get("main_output_path")
+            == "tmp/hook-main.mp4"
+        )
+        assemble_mock.assert_called_once()
+
+    def test_non_overlapping_teaser_with_matching_text_is_skipped(self):
+        # Timings shifted (jump cuts) but the words did not: second net.
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(20.0, 23.0, "hello world"),
+            clip_start_time=0.0,
+            subtitle_words=SAMPLE_WORDS,
+        )
+
+        teaser_mock.assert_not_called()
+        assert generate_subtitle_mock.call_count == 1
+        assert self._is_direct_publish_call(generate_subtitle_mock.call_args)
+        assemble_mock.assert_not_called()
+
+    def test_matching_text_with_other_casing_and_punctuation_is_skipped(self):
+        teaser_mock, _, assemble_mock = self._run(
+            hook=(20.0, 23.0, "HELLO   World!"),
+            clip_start_time=0.0,
+            subtitle_words=SAMPLE_WORDS,
+        )
+
+        teaser_mock.assert_not_called()
+        assemble_mock.assert_not_called()
+
+    def test_clip_start_time_none_keeps_the_legacy_teaser(self):
+        # Guard inert: a hook at the clip opening is still published.
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(0.0, 3.0, "A teaser"),
+            clip_start_time=None,
+        )
+
+        teaser_mock.assert_called_once_with(0.0, 3.0, "A teaser")
+        assert (
+            generate_subtitle_mock.call_args.kwargs.get("main_output_path")
+            == "tmp/hook-main.mp4"
+        )
+        assemble_mock.assert_called_once()
+
+    def test_skipped_teaser_keeps_the_end_card_path(self):
+        # With the end card ON, a skipped teaser must behave exactly like the
+        # no-teaser case: burn to tmp/ and assemble main + end card.
+        teaser_mock, generate_subtitle_mock, assemble_mock = self._run(
+            hook=(0.0, 3.0, "A teaser"),
+            clip_start_time=0.0,
+            end_card_enabled="true",
+        )
+
+        teaser_mock.assert_not_called()
+        assert generate_subtitle_mock.call_count == 1
+        assert (
+            generate_subtitle_mock.call_args.kwargs.get("main_output_path")
+            == "tmp/hook-main.mp4"
+        )
+        assemble_mock.assert_called_once()
+        assert assemble_mock.call_args.kwargs.get("end_card_path") == "tmp/end-card.mp4"
+
+
 class TestNoTeaserPathByteIdentical:
     """Requirement 3.7: no hook fields -> exactly today's behavior."""
 

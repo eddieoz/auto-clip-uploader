@@ -4368,6 +4368,8 @@ def __main__():
             # above (before generate_short) for the thumbnail text; every
             # teaser failure mode ends in the direct publish, so the segment
             # is never left without a published file.
+            # B4: the clip's own start time is handed over so the publish
+            # step can refuse a teaser that would replay the clip opening.
             publish_segment_with_optional_teaser(
                 final_output_name,
                 video_id,
@@ -4375,6 +4377,7 @@ def __main__():
                 video_title=args.video_title,
                 subtitle_words=subtitle_words,
                 hook=hook,
+                clip_start_time=segment["start_time"],
             )
             print(f"Segment {i+1} processing complete")
         except Exception as e:
@@ -4802,6 +4805,9 @@ HOOK_TEASER_MAX_DURATION = 6.0
 # from the clip's own first seconds plays the same words twice. Any candidate
 # overlapping this opening span of the resolved window is rejected; the clip
 # then simply publishes without a teaser.
+# then simply publishes without a teaser.
+# Story B4: the publish step re-uses this SAME span as its defense-in-depth
+# check, so the two layers can never drift apart.
 HOOK_DUPLICATE_GUARD_SECONDS = 5.0
 # Story B2: among candidates that already survive every check, prefer the ones
 # landing in the middle of the clip — not in the first 20% (leads with a
@@ -5086,6 +5092,95 @@ def assemble_hook_teaser_final(
         return False
 
 
+def teaser_duplicates_clip_opening(
+    clip_start, hook_start, hook_end, guard=HOOK_DUPLICATE_GUARD_SECONDS
+):
+    """True when the teaser span replays the clip's own first `guard` seconds.
+
+    B4, defense in depth for the selection-layer guard (B1): the teaser is
+    prepended to the clip, so a teaser overlapping the clip's opening plays
+    the first words the viewer is about to hear, twice. The teaser range and
+    the clip's opening [clip_start, clip_start + guard) must therefore
+    intersect; a hook starting exactly at clip_start + guard is already
+    outside the opening span and is NOT a duplicate.
+
+    Pure; never raises. An unusable clip_start (None, or an unparseable
+    timestamp) means the overlap cannot be evaluated, so the check reports
+    "not a duplicate" and the caller behaves exactly as it did before B4.
+    """
+    try:
+        clip_start_s = _srt_like_to_seconds(clip_start)
+        hook_start_s = _srt_like_to_seconds(hook_start)
+        hook_end_s = _srt_like_to_seconds(hook_end)
+        if clip_start_s is None or hook_start_s is None or hook_end_s is None:
+            return False
+        if hook_end_s <= hook_start_s:
+            return False
+        opening_end = clip_start_s + guard
+        return hook_start_s < opening_end - 1e-9 and hook_end_s > clip_start_s + 1e-9
+    except Exception:
+        return False
+
+
+def _normalize_comparable_text(text):
+    """Lowercase, collapse whitespace, strip trailing sentence punctuation."""
+    collapsed = " ".join(str(text or "").split()).strip().lower()
+    return collapsed.rstrip(".,!?;:…\"'")
+
+
+def first_caption_sentence(subtitle_words):
+    """The clip's first caption sentence, normalized (pure; "" when unknown).
+
+    Reads the karaoke word list (clip-relative seconds) and joins words in
+    order until one carries a sentence terminator — the same terminator rule
+    the selection layer uses (_first_sentence_ends_complete). Only words
+    inside the first HOOK_DUPLICATE_GUARD_SECONDS are considered: that is the
+    span the guard protects, so a sentence running past it cannot be compared
+    and the check stays inert. Returns "" when there are no usable words, so
+    the caller can treat "unknown" as "no match".
+    """
+    try:
+        if not isinstance(subtitle_words, list) or not subtitle_words:
+            return ""
+        parts = []
+        for word in subtitle_words:
+            if not isinstance(word, dict):
+                continue
+            text = str(word.get("word") or "").strip()
+            if not text:
+                continue
+            start = word.get("start")
+            if isinstance(start, (int, float)) and not isinstance(start, bool):
+                if start >= HOOK_DUPLICATE_GUARD_SECONDS:
+                    break
+            parts.append(text)
+            if _first_sentence_ends_complete(text):
+                break
+        return _normalize_comparable_text(" ".join(parts))
+    except Exception:
+        return ""
+
+
+def teaser_repeats_first_caption(hook_text, subtitle_words):
+    """True when the hook text IS the clip's own first caption sentence.
+
+    B4's second net for the case where timings shifted between selection and
+    publish (e.g. jump cuts) but the words did not. Tolerant by design: both
+    sides are normalized (lowercased, whitespace collapsed, trailing
+    punctuation stripped) and a match only counts when both are non-empty,
+    so a missing caption list or a missing hook text leaves the check inert.
+    Pure; never raises.
+    """
+    try:
+        hook_normalized = _normalize_comparable_text(hook_text)
+        caption_normalized = first_caption_sentence(subtitle_words)
+        if not hook_normalized or not caption_normalized:
+            return False
+        return hook_normalized == caption_normalized
+    except Exception:
+        return False
+
+
 def publish_segment_with_optional_teaser(
     final_output_name,
     video_id,
@@ -5093,6 +5188,7 @@ def publish_segment_with_optional_teaser(
     video_title=None,
     subtitle_words=None,
     hook=None,
+    clip_start_time=None,
 ):
     """Publish one segment, prepending the hook teaser when hook is valid.
 
@@ -5102,6 +5198,15 @@ def publish_segment_with_optional_teaser(
     teaser generation failure, missing burned main file, and — as the last
     fallback — teaser assembly failure, so the segment never ends without
     a published file.
+
+    clip_start_time is the main clip's own start time (any SRT-like or float
+    value) and is B4's only new input. It defaults to None, which leaves the
+    teaser path byte-identical to pre-B4 for every existing caller. When it
+    is supplied, a teaser that would replay the clip's opening — by
+    overlapping its first HOOK_DUPLICATE_GUARD_SECONDS, or by repeating its
+    first caption sentence verbatim — is skipped before anything is
+    generated, and the segment falls through to the ordinary publish path
+    (direct publish, or the end-card assembly when the end card is on).
     """
     direct_publish_kwargs = {
         "video_title": video_title,
@@ -5121,12 +5226,29 @@ def publish_segment_with_optional_teaser(
     teaser_path = None
     if hook:
         hook_start, hook_end, hook_text = hook
-        print(f"Hook teaser: {hook_start:.2f}s-{hook_end:.2f}s '{hook_text}'")
-        teaser_path = generate_hook_teaser(hook_start, hook_end, hook_text)
-        if teaser_path:
-            main_output_path = f"tmp/{HOOK_TEASER_MAIN_OUTPUT_FILE}"
+        # B4: refuse a teaser that would repeat the clip's own opening. Both
+        # checks are pure and the skip is not an error: no teaser file, no
+        # burned main for the teaser, straight to the publish path below.
+        if teaser_duplicates_clip_opening(
+            clip_start_time, hook_start, hook_end
+        ):
+            print(
+                f"Hook teaser: {hook_start:.2f}s-{hook_end:.2f}s overlaps the "
+                f"clip's first {HOOK_DUPLICATE_GUARD_SECONDS:.0f}s; publishing "
+                "without teaser"
+            )
+        elif teaser_repeats_first_caption(hook_text, subtitle_words):
+            print(
+                f"Hook teaser: '{hook_text}' repeats the clip's opening "
+                "caption; publishing without teaser"
+            )
         else:
-            print("Hook teaser: generation failed; publishing without teaser")
+            print(f"Hook teaser: {hook_start:.2f}s-{hook_end:.2f}s '{hook_text}'")
+            teaser_path = generate_hook_teaser(hook_start, hook_end, hook_text)
+            if teaser_path:
+                main_output_path = f"tmp/{HOOK_TEASER_MAIN_OUTPUT_FILE}"
+            else:
+                print("Hook teaser: generation failed; publishing without teaser")
 
     if not main_output_path and not end_card_path:
         generate_subtitle(
