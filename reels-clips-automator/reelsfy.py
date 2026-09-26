@@ -4544,13 +4544,23 @@ def build_music_bed_audio_filters():
 
 
 def resolve_end_card_enabled():
-    """P3.2 gate: END_CARD_ENABLED defaults to "false" (the concat assembly
-    freezes before the end card on Instagram); only the literal "true"
-    (any case) enables it."""
-    enabled_raw = os.getenv('END_CARD_ENABLED', 'false').lower().strip()
+    """P3.2 gate. Default "true" as of Story C4.
+
+    It was default-off only as an interim mitigation: the assembly froze
+    before the end card on Instagram. That cause is fixed (Story C3) — the
+    end card was the one piece that never declared a frame rate, so concat
+    -c copy collapsed it into 2.5 ms on the main clip's last frames, which
+    a desktop player showed as an invisible flash and a social transcoder
+    stalled on. Measured on real capture after the fix, the end card
+    occupies its full 1.5 s and every parameter matches the main clip.
+
+    Set END_CARD_ENABLED=false to opt out; the end card is a CTA, so it is
+    a product decision as much as a technical one, and this is the one-line
+    revert if it does not earn its place."""
+    enabled_raw = os.getenv('END_CARD_ENABLED', 'true').lower().strip()
     enabled = enabled_raw == 'true'
     if not enabled:
-        print("End card disabled (END_CARD_ENABLED!=true); publishing without it")
+        print("End card disabled (END_CARD_ENABLED=false); publishing without it")
     return enabled
 
 

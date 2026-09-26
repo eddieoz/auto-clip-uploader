@@ -89,7 +89,8 @@ python reelsfy.py --file /path/to/video.mp4 --upscale --enhance --thumb
 - `CAPTION_FONT_FAMILY` / `CAPTION_HIGHLIGHT_COLOR` - Karaoke caption styling
 - `FRAMING_MODE` - Screencast framing: `auto`, `pip`, `screen_zoom`, `closeup`
 - `VIDEO_GRADE` / `VIDEO_LUT` - Visual grade and optional .cube LUT
-- `END_CARD_ENABLED` / `END_CARD_TEXT` / `END_CARD_COLOR` - End-card CTA
+- `END_CARD_ENABLED` / `END_CARD_TEXT` / `END_CARD_COLOR` - End-card CTA, on by
+  default (`END_CARD_ENABLED=false` opts out)
 - `MUSIC_BED` - Path to an audio file looped under the speech (empty = off)
 
 See `reels-clips-automator/.env.example` for all video-editing options with

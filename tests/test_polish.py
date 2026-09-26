@@ -457,8 +457,8 @@ class TestAssembleHookTeaserFinalEndCard:
 
 
 class TestPublishSegmentEndCard:
-    """P3.2: end card is opt-in (END_CARD_ENABLED=true); the default-off
-    path is byte-identical legacy."""
+    """P3.2 + C4: the end card is ON by default (END_CARD_ENABLED=false opts
+    out); the disabled path is byte-identical legacy."""
 
     def _run(
         self,
@@ -470,8 +470,11 @@ class TestPublishSegmentEndCard:
         generate_subtitle_side_effect=None,
     ):
         _clear_polish_env(monkeypatch)
-        if end_card_enabled:
-            monkeypatch.setenv("END_CARD_ENABLED", "true")
+        # Set the gate explicitly in both directions: since C4 the default is
+        # on, so a test that means "off" has to say so rather than inherit it.
+        monkeypatch.setenv(
+            "END_CARD_ENABLED", "true" if end_card_enabled else "false"
+        )
 
         generate_subtitle_mock = MagicMock(
             side_effect=generate_subtitle_side_effect or [True, True]
@@ -502,6 +505,23 @@ class TestPublishSegmentEndCard:
             )
 
         return generate_subtitle_mock, assemble_mock, end_card_mock
+
+    def test_end_card_is_on_by_default(self, monkeypatch):
+        """C4 flipped the default back on.
+
+        It was off only as an interim mitigation for the assembly freeze,
+        which C3 fixed at the source: the end card was the one piece that
+        never declared a frame rate, so concat -c copy collapsed it into
+        2.5 ms on the main clip's last frames.
+        """
+        monkeypatch.delenv("END_CARD_ENABLED", raising=False)
+
+        assert reelsfy.resolve_end_card_enabled() is True
+
+    def test_end_card_explicit_false_opts_out(self, monkeypatch):
+        monkeypatch.setenv("END_CARD_ENABLED", "false")
+
+        assert reelsfy.resolve_end_card_enabled() is False
 
     def test_end_card_enabled_no_hook_assembles_main_plus_end_card(self, monkeypatch):
         generate_subtitle_mock, assemble_mock, end_card_mock = self._run(

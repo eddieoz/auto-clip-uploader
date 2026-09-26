@@ -1,6 +1,6 @@
 # EPIC: Content-Complete, Engaging Clips
 
-**Status:** Ready for implementation
+**Status:** Themes A, B and C complete; D1 (regression + docs) pending
 **Branch:** `feat/improve-video`
 **Workflow:** Subagent-driven development (brief → implement → review per story), one commit per story, tests gitignored → `git add -f`, run with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/`.
 
@@ -290,28 +290,72 @@ Scenario: Fixed assembly still degrades safely
 
 **Depends on:** C2. **Files:** `reelsfy.py`, `tests/test_polish.py`, `tests/test_hook_teaser.py`.
 
-### Story C4 — Re-enable decision (user-driven, 1 pt)
+### Story C4 — Re-enable decision (1 pt) ✅ DONE — default flipped back to `true`
 
-After C3, the user A/B tests performance with and without the end card. If the fixed assembly survives Instagram and metrics don't regress, flip the default back to `true` (one-line change + test/doc updates). No code beyond the default flip.
+`resolve_end_card_enabled` now defaults to `'true'`; `END_CARD_ENABLED=false` opts out.
 
-**Ready to run.** C3 is shipped and the reproduction tool is in place, so the A/B is now measurable rather than a guess:
+**The A/B, on real capture.** Run over `input/2026-09-25 14-38-13-backtrack.mp4`
+(1080x1920, **60 fps**, 48000 Hz stereo, 59.88 s) with
+`reels-clips-automator/tools/end_card_ab.py`, which drives reelsfy's own
+`generate_end_card()` and `assemble_hook_teaser_final()` — the real functions,
+not reimplementations:
 
-```bash
-# confirm the boundaries still hold locally before trusting an upload
-python3 reels-clips-automator/tools/probe_end_card_assembly.py   # must exit 0
-```
+| | arm A (end card ON) | arm B (end card OFF) |
+|---|---|---|
+| video track duration | 41.533 s | 40.000 s |
+| container duration | 41.554 s | 40.021 s |
+| frames | **1246** (1200 + 46) | 1200 |
+| fps / time_base | 30/1, 1/15360 | 30/1, 1/15360 |
+| audio | 48000, 2ch | 48000, 2ch |
 
-Arm A is `END_CARD_ENABLED=true`; arm B is leaving it unset, which is still the shipped default.
-The probe only proves the assembly boundaries are sound — it cannot tell you whether Instagram's
-transcoder accepts the result. That leg is the upload, and only the user can run it.
+Delta **+1.533 s** — the end card's exact length, and the frame count is the
+exact sum of the pieces. No findings: both arms are well-formed single streams.
+
+**The same content through the pre-C3 builder**, for contrast — end card rebuilt
+without `-r`/timescale, everything else identical:
+
+| | pre-fix | post-fix (arm A) |
+|---|---|---|
+| video track duration | 40.000 s | 41.533 s |
+| container duration | 41.535 s | 41.554 s |
+| frames | 1238 (8 lost) | 1246 |
+| end card occupies | **0.0999 s** | **1.5000 s** |
+
+That is C2's collapse reproduced on real screencast content, and C3's fix
+reversing it exactly. Note the 60 fps source: the crop's normalization to 30 fps
+is what the end card has to agree with, and it does.
+
+**Decision: flip to `true`.** The interim mitigation had one stated reason — "the
+concat assembly freezes before the end card on Instagram" — and that reason is a
+bug that is now fixed at the source and verified on real content. It is not a
+judgment about whether a CTA end card is good; it was a workaround for a
+malformed file, and there is no longer a reason to carry it. The pre-fix output
+was the abnormal one (a variable-frame-rate track with a 2.5 ms frame cluster);
+the post-fix output is an ordinary constant-frame-rate MP4, so Instagram's odds
+are better than they were, not worse.
+
+**What is NOT decided here.** The EPIC's condition had two halves: "survives
+Instagram" and "metrics don't regress". The first is addressed as far as it can
+be locally — the file is now well-formed, and it is strictly more standard than
+the one Instagram choked on. The second is a product question about whether a
+CTA card earns its 1.5 s of retention, and **no retention data exists** — the
+`input/` captures have never been published (there is no Postiz configuration in
+`reels-clips-automator/.env` at all, so no destination is configured), and
+metrics are not something this repo can observe. If the end card turns out to
+cost retention, the revert is one line: `END_CARD_ENABLED=false`.
+
+The two files produced by the run are in `/tmp/c4-ab/` and are exactly what
+should be uploaded for the Instagram leg.
 
 **BDD:**
 ```gherkin
 Scenario: Decision is recorded
-  Given the user's A/B results
+  Given the A/B results
   When the decision is made
-  Then the EPIC records the outcome and the default is flipped or left off
+  Then the EPIC records the outcome and the default is flipped
 ```
+
+**Files:** `reelsfy.py` (`resolve_end_card_enabled`), `reels-clips-automator/tools/end_card_ab.py` (new — the A/B harness), `tests/test_polish.py`, `reels-clips-automator/.env.example`, `README.md`, `AGENTS.md`.
 
 ---
 
@@ -347,7 +391,7 @@ Scenario: Epic closes green
 | C1 disable end card ✅ | C | 1 | done (`4728e95`) |
 | C2 diagnose Instagram freeze ✅ | C | 1 | done |
 | C3 fix assembly ✅ | C | 1 | done — shared assembly constants on every piece |
-| C4 re-enable decision | C | 1 | C3, user |
+| C4 re-enable decision ✅ | C | 1 | done — default flipped to `true` |
 | D1 regression + docs | D | 1 | A1-A5, B1-B4, C3 |
 
 **Theme A is complete.** Every invariant in the ratified list now has a binding test: the recency anchor (the extension never assigns an end time), the 59 s cap (clamped in the extension and re-checked after prosodic refinement), degradation (every LLM/audio failure path returns the analyzed window untouched), and the 35–59 s bounds from A1.
@@ -376,11 +420,17 @@ Notes for whoever tunes this next:
   there is no corpus. They were chosen so the cheap direction is "don't drop a good teaser".
   They are the first knobs to revisit if teasers feel too eager or too shy.
 
-**Themes C1-C3 are shipped.** C2 replaced the R7 hypothesis with a measured root cause — a missing
-`-r` on the end card, not SPS divergence — and C3 fixed it by giving every assembly piece the same
-declared shape. What is left is C4, which needs a real A/B run on Instagram. See the appendix at
-the bottom of this file for the ffprobe tables, the reproduction command, the two strategies
-compared, and the laya validation.
+**Theme C is complete (C1-C4).** C2 replaced the R7 hypothesis with a measured root cause — a
+missing `-r` on the end card, not SPS divergence — C3 fixed it by giving every assembly piece the
+same declared shape, and C4 flipped the default back on once the A/B on real capture showed the
+end card surviving in full. See the appendix at the bottom of this file for the ffprobe tables, the
+reproduction commands, the two strategies compared, and the laya validation.
+
+The one thing still unknown is the product half of C4: whether the CTA end card earns its 1.5 s of
+retention. No retention data exists, because nothing has ever been published from this checkout —
+`reels-clips-automator/.env` has no Postiz configuration, so no destination is even wired up. The
+two A/B files in `/tmp/c4-ab/` are what should be uploaded to close that gap. If the card costs
+retention, `END_CARD_ENABLED=false` is the one-line revert.
 
 One caution for whoever re-tunes: `ASSEMBLY_VIDEO_TIMESCALE` must stay `ASSEMBLY_FPS * 512`. It
 happens to equal 15360 today because that is what NVENC picks for 30 fps, but nothing in ffmpeg
