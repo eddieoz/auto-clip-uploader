@@ -152,9 +152,9 @@ Details worth knowing before tuning against this signal:
 
 ## Theme B — Non-duplicative, mid-video hook (R6)
 
-### Story B1 — Anti-duplication rule in hook selection (1 pt)
+### Story B1 — Anti-duplication rule in hook selection ✅ DONE
 
-`select_hook_candidate` rejects candidates whose cue span **overlaps the first ~5 s of the resolved window** — returning such a hook is what duplicates the opening. If no candidate survives, return None (teaser is skipped; degradation invariant).
+Shipped as commit `6778f3e`. `HOOK_DUPLICATE_GUARD_SECONDS = 5.0` — a candidate whose cue span starts before `window_start + 5s` is rejected; no survivor → `None` (teaser skipped, degradation intact). A cue span is contiguous and starts at `span_start`, so start-based rejection is exactly overlap-based rejection; a candidate starting exactly at `window_start + 5.0` survives.
 
 **TDD (write first):**
 - `tests/test_hook_first.py` additions: candidate at window start+1 s is rejected; candidate at window start+10 s is selected; no surviving candidate → None; existing ordering tests updated.
@@ -174,9 +174,9 @@ Scenario: Mid-window candidate wins
 
 **Files:** `reelsfy.py` (`select_hook_candidate` ~2520), `tests/test_hook_first.py`.
 
-### Story B2 — Prefer mid-window hook candidates (1 pt)
+### Story B2 — Prefer mid-window hook candidates ✅ DONE
 
-Among valid candidates, prefer ones in the **middle band** of the window (not within the first 20% nor the last 10%) — an engaging moment mid-clip makes the teaser complementary instead of repetitive. Pure preference, same None-degradation.
+Shipped as commit `bd41559`. Bands `HOOK_MID_BAND_START_FRACTION = 0.20` / `HOOK_MID_BAND_END_FRACTION = 0.90` (inclusive, epsilon-widened to match the neighbouring comparisons). The loop body and check order are unchanged: the first survivor in LLM order is kept as a fallback, and the first **mid-band** survivor is returned when one exists — so the behavior is byte-identical whenever no mid-band candidate exists. The 90% upper bound is near-inert given the containment and 1.5-6 s duration caps; it is kept because the brief specifies it and it costs nothing.
 
 **TDD (write first):** ordering tests — two valid candidates, the mid-band one wins even if listed second; single edge candidate still selected; empty list → None.
 
@@ -190,9 +190,9 @@ Scenario: Mid-band candidate outranks an early one
 
 **Depends on:** B1 (so "valid" already excludes opening-duplicates). **Files:** `reelsfy.py`, `tests/test_hook_first.py`.
 
-### Story B3 — Boundary prompt steers away from the first sentence (1 pt)
+### Story B3 — Boundary prompt steers away from the first sentence ✅ DONE
 
-The `resolve_topic_start_cue` prompt instructs: hook candidates must NOT be the first sentence of the final topic; prefer an engaging sentence mid-topic. Soft steering (validation still clamps deterministically).
+Shipped as commit `06c3c7c`. One clause appended to the existing `hook_candidates` bullet in the `resolve_topic_start_cue` prompt: candidates must not be the final topic's first sentence, prefer an engaging mid-topic sentence. Prose only — the JSON reply contract, `_parse_boundary_reply` and every failure path are untouched, and gate-off stays byte-identical (the early return precedes prompt construction). The enforcing layer remains B1/B2.
 
 **TDD (write first):** prompt-content test in `tests/test_topic_boundary.py` (instruction present; legacy mode prompt unchanged).
 
@@ -206,9 +206,14 @@ Scenario: LLM is told where hooks may live
 
 **Files:** `reelsfy.py` (~2319), `tests/test_topic_boundary.py`.
 
-### Story B4 — Publish-level dedup guard (1 pt)
+### Story B4 — Publish-level dedup guard ✅ DONE
 
-Defense in depth: before assembling, if the teaser time range overlaps the main clip's first 5 s (or `hook_text` equals the first caption sentence), skip the teaser and publish the main clip only. Catches cases the selection layer missed.
+Shipped as commit `9305f3f`, hardened by `1e7e81c` and `0d79d55`. `publish_segment_with_optional_teaser` gains a `clip_start_time=None` keyword, populated at the single production call site with `segment["start_time"]` and converted through `_srt_like_to_seconds` (segment dicts are dual-shape: `start_time_srt` and/or `start_time`). Two nets, either of which skips the teaser to the existing direct-publish path:
+
+- **Time overlap** — `teaser_duplicates_clip_opening`, reusing `HOOK_DUPLICATE_GUARD_SECONDS`. Inert when `clip_start_time` is `None` (legacy callers only; production always passes it). This is the **stronger** of the two when the clip start was clamped later than the resolved window start, which is exactly the residual B1 misses.
+- **Caption text** — `teaser_repeats_first_caption`, running regardless. The original terminator-delimited exact-sentence form was found to be **largely inert in production**: `_first_sentence_ends_complete`'s documented bias runs toward "complete" on decimals and abbreviations, which screencast content hits constantly, so the extracted "sentence" was usually a fragment. It now compares the caption words inside the first 5 s of the clip (time-windowed, terminator-free), requiring a common leading prefix of ≥ 2 words (`HOOK_CAPTION_MIN_MATCH_WORDS`) covering ≥ 60% of the shorter sequence (`HOOK_CAPTION_MIN_MATCH_COVERAGE`) — the coverage half is what stops a formulaic bigram ("so today", "in this video") from dropping a good teaser. Anchored at the opening's first word, so free containment is not used and a sentence appearing later in the clip is still not a repeat. Punctuation-only tokens are filtered.
+
+Invariants: skipping leaves `teaser_path`/`main_output_path` as `None`, so `generate_hook_teaser` is never called and **no second burn** is added (mastering-once holds); the end card is built before the hook block, so the end-card-on + skip case falls into the pre-existing branch.
 
 **TDD (write first):**
 - `tests/test_hook_teaser.py` additions: overlapping hook → `generate_hook_teaser` not called, direct publish; non-overlapping hook → current assembly.
@@ -302,7 +307,7 @@ Scenario: Epic closes green
 
 ---
 
-## Story index (13 pts total; A and C1 done)
+## Story index (13 pts total; A, B and C1 done)
 
 | Story | Theme | Pt | Depends on |
 |-------|-------|----|------------|
@@ -311,10 +316,10 @@ Scenario: Epic closes green
 | A3 completeness in boundary pass ✅ | A | 1 | done (`e3acda0`) |
 | A4 apply start extension ✅ | A | 1 | done (`13aa524`) |
 | A5 completeness observability ✅ | A | 1 | done (`e79045f`) |
-| B1 anti-duplication rule | B | 1 | — |
-| B2 prefer mid-window hooks | B | 1 | B1 |
-| B3 prompt steering | B | 1 | — |
-| B4 publish-level dedup guard | B | 1 | — |
+| B1 anti-duplication rule ✅ | B | 1 | done (`6778f3e`) |
+| B2 prefer mid-window hooks ✅ | B | 1 | B1 — done (`bd41559`) |
+| B3 prompt steering ✅ | B | 1 | done (`06c3c7c`) |
+| B4 publish-level dedup guard ✅ | B | 1 | done (`9305f3f`, +`1e7e81c`, `0d79d55`) |
 | C1 disable end card ✅ | C | 1 | done (`4728e95`) |
 | C2 diagnose Instagram freeze | C | 1 | — |
 | C3 fix assembly | C | 1 | C2 |
@@ -323,4 +328,39 @@ Scenario: Epic closes green
 
 **Theme A is complete.** Every invariant in the ratified list now has a binding test: the recency anchor (the extension never assigns an end time), the 59 s cap (clamped in the extension and re-checked after prosodic refinement), degradation (every LLM/audio failure path returns the analyzed window untouched), and the 35–59 s bounds from A1.
 
-Parallelizable now: B1, B3, B4, C2.
+**Theme B is complete.** The duplication hole R6 described is closed at three layers — deterministic
+rejection in the selection layer (B1), a mid-window preference so the teaser lands where it is
+complementary (B2), model steering so it aims there in the first place (B3), and a publish-time
+guard that catches whatever survives (B4). A final whole-theme review verified all six ratified
+invariants hold across the four stories, and two follow-up fix waves hardened B4's caption net
+after review showed it would rarely fire on real screencast content.
+
+Notes for whoever tunes this next:
+- The 5 s guard is defined **once** (`HOOK_DUPLICATE_GUARD_SECONDS`) and shared by the selection
+  and publish layers. There is no second 5.0 literal, and the B3 prompt deliberately speaks in
+  sentences rather than seconds so it cannot drift.
+- The two nets answer different questions. The **time** net is the strong one: it compares
+  against the clip's *actual* start, which `validate_segment_against_window` may have clamped
+  later than the resolved window start — the case B1 alone misses. The **caption** net is the
+  fallback for when timings shifted but the words did not; it is deliberately conservative and
+  will sometimes miss rather than drop a good teaser.
+- Coordinate spaces differ by design and each comparison stays inside one of them: the selection
+  layer and the time net work in **source-video seconds**, while the caption net works in
+  **clip-relative** seconds (the caption words are already clip-relative). Do not compare across
+  them.
+- The caption net's thresholds (`2` words, `60%` coverage) are unmeasured against real captions —
+  there is no corpus. They were chosen so the cheap direction is "don't drop a good teaser".
+  They are the first knobs to revisit if teasers feel too eager or too shy.
+
+Parallelizable now: C2.
+
+### Deferred follow-ups (Theme B, non-blocking)
+
+- `HOOK_DUPLICATE_GUARD_SECONDS` and the three hook-selection constants are the only editing
+  knobs in this file that are **not** env-gated, unlike the rest of `reels-clips-automator/.env.example`.
+- `opening_caption_prefix` assumes the caption word list is sorted by start time; that is
+  undocumented and unverified against the jump-cut remapper.
+- Several tests pin constant values and the B3 prompt's literal English wording. They are not
+  vacuous — they are the ones that catch a revert — but they will fail on a harmless retune.
+- Separate ticket: 7 test modules fail to import (`filter_transcript_by_timestamps` and friends),
+  so the full suite needs `--continue-on-collection-errors` to reproduce its baseline.
