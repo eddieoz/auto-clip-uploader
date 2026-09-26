@@ -380,6 +380,20 @@ class TestParseBoundaryReply:
 # ---------------------------------------------------------------------------
 
 
+# Story B1 cue layout: the resolved window is 25-60 s, so the opening
+# duplicate guard covers 25-30 s.
+#   cue 1: 25-28  (inside the opening guard — the topic's first sentence)
+#   cue 2: 28-33  (starts inside the guard, runs past it)
+#   cue 3: 35-40  (entirely past the guard — selectable)
+#   cue 4: 45-60  (tail)
+OPENING_CUES = [
+    _cue(25.0, 28.0, "Opening sentence"),
+    _cue(28.0, 33.0, "Straddling sentence"),
+    _cue(35.0, 40.0, "Mid-window hook"),
+    _cue(45.0, 60.0, NO_PUNCT),
+]
+
+
 class TestSelectHookCandidate:
     """First candidate inside the snapped window with a 1.5-6 s span."""
 
@@ -512,6 +526,89 @@ class TestSelectHookCandidate:
             )
             is None
         )
+
+
+# ---------------------------------------------------------------------------
+# Story B1: the opening guard — a teaser that repeats the clip's first
+# seconds is a bug, not a hook. Only the opening is guarded; every other
+# check keeps its current behaviour.
+# ---------------------------------------------------------------------------
+
+
+class TestOpeningDuplicateGuard:
+    """Candidates overlapping the first ~5 s of the window are rejected."""
+
+    def test_candidate_inside_opening_guard_rejected(self):
+        # Cue 1 spans window_start+0.5 s .. window_start+3 s.
+        candidates = [_candidate(1, 1, "Opening sentence")]
+
+        assert (
+            reelsfy.select_hook_candidate(
+                candidates, WINDOW_START_SRT, WINDOW_END_SRT, OPENING_CUES
+            )
+            is None
+        )
+
+    def test_candidate_starting_past_the_guard_selected(self):
+        # Cue 3 (35-40 s) starts ~10 s after the window start.
+        candidates = [_candidate(3, 3, "Mid-window hook")]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, WINDOW_START_SRT, WINDOW_END_SRT, OPENING_CUES
+        )
+
+        assert selected == {
+            "hook_start_time": "00:00:35,000",
+            "hook_end_time": "00:00:40,000",
+            "hook_text": "Mid-window hook",
+        }
+
+    def test_only_guarded_candidate_returns_none(self):
+        # Degradation invariant: no survivor → no teaser, never an error.
+        candidates = [
+            _candidate(1, 1, "Opening sentence"),
+            _candidate(2, 2, "Straddling sentence"),
+        ]
+
+        assert (
+            reelsfy.select_hook_candidate(
+                candidates, WINDOW_START_SRT, WINDOW_END_SRT, OPENING_CUES
+            )
+            is None
+        )
+
+    def test_span_overlapping_the_guard_rejected(self):
+        # Cue 2 (28-33 s) starts inside the 25-30 s guard and runs past it:
+        # overlap is what disqualifies it, not merely starting inside.
+        candidates = [_candidate(2, 2, "Straddling sentence")]
+
+        assert (
+            reelsfy.select_hook_candidate(
+                candidates, WINDOW_START_SRT, WINDOW_END_SRT, OPENING_CUES
+            )
+            is None
+        )
+
+    def test_guarded_candidate_skipped_for_a_later_survivor(self):
+        # Ranking order is preserved: the guarded candidate is skipped, the
+        # next survivor is returned unchanged.
+        candidates = [
+            _candidate(1, 1, "Opening sentence"),
+            _candidate(3, 3, "Mid-window hook"),
+        ]
+
+        selected = reelsfy.select_hook_candidate(
+            candidates, WINDOW_START_SRT, WINDOW_END_SRT, OPENING_CUES
+        )
+
+        assert selected == {
+            "hook_start_time": "00:00:35,000",
+            "hook_end_time": "00:00:40,000",
+            "hook_text": "Mid-window hook",
+        }
+
+    def test_guard_constant_is_five_seconds(self):
+        assert reelsfy.HOOK_DUPLICATE_GUARD_SECONDS == 5.0
 
 
 # ---------------------------------------------------------------------------

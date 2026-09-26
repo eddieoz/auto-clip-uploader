@@ -2637,8 +2637,15 @@ def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments
     walks `segments`. A candidate survives when its span (start of cue_start
     to end of cue_end) falls inside [window_start_srt, window_end_srt] and
     spans HOOK_TEASER_MIN_DURATION..HOOK_TEASER_MAX_DURATION seconds. The
-    model ranks the candidates, so the FIRST survivor wins. Malformed
-    candidates are skipped, never raising. Returns
+    model ranks the candidates, so the FIRST survivor wins.
+
+    B1: a candidate overlapping the first HOOK_DUPLICATE_GUARD_SECONDS of
+    the resolved window is rejected even though it passes every other check.
+    The teaser is prepended to the clip, so a candidate drawn from the clip's
+    own opening replays the first sentence the viewer is about to hear; the
+    window starts at the topic start, which is exactly where the LLM's
+    top-ranked candidate tends to sit. With no survivor the teaser is simply
+    skipped. Malformed candidates are skipped, never raising. Returns
     {"hook_start_time", "hook_end_time", "hook_text"} (SRT + text) or None.
     """
     try:
@@ -2678,6 +2685,9 @@ def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments
                     duration < HOOK_TEASER_MIN_DURATION - 1e-9
                     or duration > HOOK_TEASER_MAX_DURATION + 1e-9
                 ):
+                    continue
+                guard_end = window_start + HOOK_DUPLICATE_GUARD_SECONDS
+                if span_start < guard_end - 1e-9:
                     continue
                 return {
                     "hook_start_time": _segment_start_srt(segments[cue_start - 1])
@@ -4767,6 +4777,11 @@ def build_overlay_filters(date_text, title_text, input_label="0:v"):
 
 HOOK_TEASER_MIN_DURATION = 1.5
 HOOK_TEASER_MAX_DURATION = 6.0
+# Story B1: the cold-open teaser is prepended to the clip, so a teaser taken
+# from the clip's own first seconds plays the same words twice. Any candidate
+# overlapping this opening span of the resolved window is rejected; the clip
+# then simply publishes without a teaser.
+HOOK_DUPLICATE_GUARD_SECONDS = 5.0
 HOOK_TEASER_FONT_SIZE = 64
 # drawtext cannot wrap text, so long hooks must be pre-split into lines that
 # fit the 1080 px frame (fontsize 64 uppercase ≈ 40 px/char).
