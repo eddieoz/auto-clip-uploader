@@ -2438,6 +2438,67 @@ def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments
     return optimized_segment, trimmed_supporting
 
 
+def extend_window_to_earlier_topic_start(
+    earlier_start_cue, optimized_segment, supporting_segments, segments, max_duration=59.0
+):
+    """Move the optimized window start EARLIER to the reported earlier cue.
+
+    Sibling of ``trim_window_to_topic_start``, moving in the opposite
+    direction: when the boundary LLM pass says the final topic is
+    incomplete, the earlier cue it names is where the topic actually
+    begins, so the clip must carry that context.
+
+    The end time and concluding topic are untouched — the recency anchor
+    (the final topic still concludes near the capture's end) is preserved.
+    The window never grows past ``max_duration``: because the end stays
+    anchored, a start that would breach the cap is clamped to
+    ``end - max_duration``. A cue that does not start strictly before the
+    current window start leaves the window unchanged. A cue that would start
+    before the capture start is floored to 0.0 s. Because the extension
+    only ever GROWS the window (the start moves earlier, the end never
+    moves), it never drops a supporting segment: every segment that is still
+    on the list is inside the new, larger window, so the list is returned
+    unchanged.
+    Returns the (optimized, supporting) pair.
+    """
+    if not isinstance(earlier_start_cue, int) or isinstance(earlier_start_cue, bool):
+        return optimized_segment, supporting_segments
+    if not (1 <= earlier_start_cue <= len(segments)):
+        return optimized_segment, supporting_segments
+
+    cue = segments[earlier_start_cue - 1]
+    cue_seconds = _segment_start_seconds(cue)
+    window_seconds = _srt_like_to_seconds(optimized_segment.get('start_time'))
+    end_seconds = _srt_like_to_seconds(optimized_segment.get('end_time'))
+    if cue_seconds is None or window_seconds is None or end_seconds is None:
+        print("Topic boundary LLM: could not compare cue/window timestamps; keeping window unchanged")
+        return optimized_segment, supporting_segments
+    if cue_seconds >= window_seconds:
+        print(f"Topic boundary LLM: earlier cue {earlier_start_cue} does not start before the window start; keeping window unchanged")
+        return optimized_segment, supporting_segments
+
+    new_start_seconds = max(0.0, cue_seconds)
+    floored = new_start_seconds != cue_seconds
+    capped = end_seconds - new_start_seconds > max_duration
+    if capped:
+        new_start_seconds = max(0.0, end_seconds - max_duration)
+        print(
+            f"Topic boundary extend: earlier cue {earlier_start_cue} would exceed the "
+            f"{max_duration:.0f}s cap; clamping the window start to {end_seconds - max_duration:.1f}s"
+        )
+
+    previous_start = optimized_segment.get('start_time')
+    optimized_segment['start_time'] = (
+        _segment_start_srt(cue)
+        if not (capped or floored)
+        else format_timestamp(round(new_start_seconds, 3))
+    )
+    optimized_segment['duration'] = end_seconds - new_start_seconds
+
+    print(f"✂️ Topic boundary extend: window start {previous_start} → {optimized_segment['start_time']} (earlier cue {earlier_start_cue})")
+    return optimized_segment, supporting_segments
+
+
 def _cue_bounds(cue):
     """(start, end) float seconds of a TopicAnalyzer cue dict, or (None, None).
 
@@ -2721,16 +2782,21 @@ def validate_segment_against_window(
         return segment, [f"S4 validation failed ({e}); leaving segment unchanged"]
 
 
-def refine_window_start_with_pause(window, audio_path, min_start_srt=None, neighborhood=1.5):
+def refine_window_start_with_pause(
+    window, audio_path, min_start_srt=None, neighborhood=1.5, max_duration=None
+):
     """S3: prosodic refinement of the text-snapped START point (never raises).
 
     Builds an EnhancedAudioAnalyzer for `audio_path` and asks
     detect_natural_boundaries for pauses inside a ±`neighborhood` window
     around the current start; the nearest pause becomes the new start,
     still respecting `min_start_srt` (None = the pause must simply stay
-    within the neighborhood). Audio load/analysis failures degrade to the
-    text-only snapped window. Keep it cheap: only the neighborhood matters
-    (a <=90 s capture)."""
+    within the neighborhood). The nearest pause can lie BEFORE the current
+    start, so when `max_duration` is given, a pause that would push the
+    start earlier than ``end - max_duration`` is rejected: the hard clip cap
+    binds the whole chain, not just this function's caller. Audio
+    load/analysis failures degrade to the text-only snapped window. Keep it
+    cheap: only the neighborhood matters (a <=90 s capture)."""
     try:
         if not isinstance(window, dict):
             return window
@@ -2754,6 +2820,13 @@ def refine_window_start_with_pause(window, audio_path, min_start_srt=None, neigh
             return window
 
         min_start_seconds = _srt_like_to_seconds(min_start_srt) if min_start_srt is not None else None
+        # Hard cap: a pause here would make the window longer than
+        # `max_duration`, so it is not a candidate at all.
+        cap_start_seconds = (
+            end_seconds - max_duration
+            if isinstance(max_duration, (int, float)) and not isinstance(max_duration, bool)
+            else None
+        )
         candidates = []
         for pause in pauses:
             try:
@@ -2763,6 +2836,8 @@ def refine_window_start_with_pause(window, audio_path, min_start_srt=None, neigh
             if absolute < lo or absolute > hi:
                 continue
             if min_start_seconds is not None and absolute < min_start_seconds:
+                continue
+            if cap_start_seconds is not None and absolute < cap_start_seconds:
                 continue
             candidates.append(absolute)
         if not candidates:
@@ -2902,13 +2977,15 @@ def generate_viral(
         # of the previous topic. Resolve where the final topic begins and trim
         # the window start to that cue; any failure keeps the window exactly
         # as analyzed above. The end time (recency anchor) is untouched.
-        # S3: the same pass also reports when the topic is incomplete and an
-        # earlier cue where it begins. Story A3 only REPORTS that signal —
-        # the window extension that consumes it is A4, so nothing below reads
-        # `earlier_start_cue` yet.
+        # S3: the same pass also reports when the topic is incomplete and the
+        # earlier cue where it actually begins. That cue extends the window
+        # start backwards so the clip carries the full topic context; the end
+        # stays anchored and the extension is bounded by `max_duration`. The
+        # completeness verdict itself is bound to `topic_complete` and read by
+        # nobody yet: A5 logs it for completeness observability.
         # S5: it also proposes hook candidates inside the final topic;
         # selection against the snapped window happens below.
-        cue_index, _topic_complete, earlier_start_cue, hook_candidates = (
+        cue_index, topic_complete, earlier_start_cue, hook_candidates = (
             resolve_topic_start_cue(transcript_content, topic_analysis['segments'])
         )
         if cue_index is not None:
@@ -2918,6 +2995,16 @@ def generate_viral(
                 supporting_segments,
                 topic_analysis['segments'],
             )
+        if earlier_start_cue is not None:
+            optimized_segment, supporting_segments = (
+                extend_window_to_earlier_topic_start(
+                    earlier_start_cue,
+                    optimized_segment,
+                    supporting_segments,
+                    topic_analysis['segments'],
+                    max_duration=max_duration,
+                )
+            )
 
         # S3: refine the trimmed window to sentence/pause boundaries. The
         # former content-centric prompt built here was dead code (the
@@ -2925,13 +3012,22 @@ def generate_viral(
         # lives on as the resolved-window section injected into that live
         # prompt: lead with the concluding topic, keep the narrative
         # complete, and respect the resolved start/end boundaries.
+        #
+        # The snap floor must come from whichever cue ended up OWNING the
+        # window start: the earlier cue when the extension above applied,
+        # otherwise the trimmed cue. Using the trimmed cue's start here
+        # would let the snapper drag the start forward again and silently
+        # undo the extension.
         min_start_srt = None
+        start_owner_cue = earlier_start_cue if earlier_start_cue is not None else cue_index
         if (
-            isinstance(cue_index, int)
-            and not isinstance(cue_index, bool)
-            and 1 <= cue_index <= len(topic_analysis['segments'])
+            isinstance(start_owner_cue, int)
+            and not isinstance(start_owner_cue, bool)
+            and 1 <= start_owner_cue <= len(topic_analysis['segments'])
         ):
-            min_start_srt = _segment_start_srt(topic_analysis['segments'][cue_index - 1])
+            min_start_srt = _segment_start_srt(
+                topic_analysis['segments'][start_owner_cue - 1]
+            )
         optimized_segment = snap_window_to_boundaries(
             optimized_segment,
             topic_analysis['segments'],
@@ -2939,7 +3035,10 @@ def generate_viral(
             min_duration=min_duration,
         )
         optimized_segment = refine_window_start_with_pause(
-            optimized_segment, audio_path, min_start_srt=min_start_srt
+            optimized_segment,
+            audio_path,
+            min_start_srt=min_start_srt,
+            max_duration=max_duration,
         )
 
     else:
