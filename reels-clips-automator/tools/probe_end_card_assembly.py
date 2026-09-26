@@ -23,7 +23,6 @@ import argparse
 import ast
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -37,39 +36,54 @@ REELSFY = os.path.join(HERE, os.pardir, "reelsfy.py")
 # but they are read as text, not by importing reelsfy, which would drag in
 # the whole transcription stack (librosa/numba) for four integers.
 def pipeline_constants():
-    """Pull the assembly constants out of reelsfy.py's source."""
-    source = open(REELSFY, encoding="utf-8").read()
+    """Pull the assembly constants out of reelsfy.py's source.
 
-    def missing(name):
-        raise SystemExit(
-            f"{name} not found in {REELSFY}; the probe needs updating"
-        )
+    Parsed with `ast`, not regex. A `^NAME = ...` regex with re.MULTILINE
+    also matches text INSIDE a docstring or comment block sitting at column
+    0, so a changelog note quoting "ASSEMBLY_FPS = 25" would silently
+    poison the probe with a wrong-but-plausible value — and the probe would
+    still exit 0, which is the worst way for it to fail. `ast.parse` only
+    sees real assignments, so that class of shadowing cannot happen.
+    """
+    source = open(REELSFY, encoding="utf-8").read()
+    tree = ast.parse(source, filename=REELSFY)
+
+    # Only module-level assignments. A constant redefined inside a function
+    # or class is not the pipeline default we are asserting against.
+    assigned = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                assigned[target.id] = node.value
 
     def grab(name):
-        match = re.search(rf"^{name} = (.+)$", source, re.MULTILINE)
-        if not match:
-            missing(name)
-        return ast.literal_eval(match.group(1))
-
-    def grab_quoted(name):
-        match = re.search(rf'^{name} = "(.+)"$', source, re.MULTILINE)
-        if not match:
-            missing(name)
-        return match.group(1)
+        if name not in assigned:
+            raise SystemExit(
+                f"{name} not found as a module-level assignment in "
+                f"{REELSFY}; the probe needs updating"
+            )
+        try:
+            return ast.literal_eval(assigned[name])
+        except ValueError:
+            raise SystemExit(
+                f"{name} in {REELSFY} is no longer a plain literal "
+                f"(line {assigned[name].lineno}); the probe needs updating"
+            )
 
     def grab_wrapped(name):
-        """A string constant the author wrapped across lines, e.g.
+        """A string constant the author wrapped across lines.
 
-            NAME = (
-                "the value"
-            )
+        `ast.literal_eval` handles the parenthesised form directly; this
+        exists only to name the failure usefully.
         """
-        match = re.search(
-            rf'^{name} = \(\s*"[^"]*"\s*\)', source, re.MULTILINE
-        )
-        if not match:
-            missing(name)
-        return re.search(r'"([^"]*)"', match.group(0)).group(1)
+        if name not in assigned:
+            raise SystemExit(
+                f"{name} not found as a module-level assignment in "
+                f"{REELSFY}; the probe needs updating"
+            )
+        return grab(name)
 
     return {
         "fps": grab("ASSEMBLY_FPS"),
@@ -77,7 +91,7 @@ def pipeline_constants():
         "audio_rate": grab("ASSEMBLY_AUDIO_RATE"),
         "audio_channels": grab("ASSEMBLY_AUDIO_CHANNELS"),
         "mastering": grab_wrapped("AUDIO_MASTERING_FILTER"),
-        "font": grab_quoted("OVERLAY_FONTFILE"),
+        "font": grab_wrapped("OVERLAY_FONTFILE"),
     }
 
 
@@ -159,10 +173,19 @@ def burn(input_path, out, label, text):
 def build_end_card(out, pin_rate=True):
     """The end card, the way build_end_card_command() builds it.
 
-    `pin_rate` toggles the C3 fix: build_end_card_command() has no -r, so the
-    lavfi color source defaults to 25 fps with a 1/12800 timebase, while every
-    other piece is 30 fps / 1/15360 (the frame rate and timescale the
-    pipeline pins in reelsfy.ASSEMBLY_FPS / ASSEMBLY_VIDEO_TIMESCALE).
+    `pin_rate=False` reproduces the PRE-C3 state, which is what
+    --unpinned-end-card is for: build_end_card_command() used to omit -r, so
+    the lavfi color source defaulted to 25 fps with a 1/12800 timebase while
+    every other piece is 30 fps / 1/15360 (the values the pipeline pins in
+    reelsfy.ASSEMBLY_FPS / ASSEMBLY_VIDEO_TIMESCALE). C3 fixed that in the
+    real builder; this flag keeps the broken shape available to prove the
+    probe still catches it.
+
+    Note this is a hand-rolled copy of the command, not a call into
+    reelsfy.py — the constants are read live from its source, but the
+    command shape is not. The test suite is what guards the real builder
+    (see tests/test_end_card_assembly.py); use end_card_ab.py when you want
+    the actual reelsfy functions driven end to end.
     """
     args = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-hwaccel", "cuda",
@@ -213,15 +236,34 @@ def probe(path):
     }
 
 
-def last_frames_pts(path, count=40):
-    """Presentation timestamps of the final `count` video frames."""
+def all_frames_pts(path):
+    """Presentation timestamps of every video frame, in decode order.
+
+    Used to locate the end card by frame count rather than by keyframe:
+    see the occupancy check in assess().
+    """
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
         capture_output=True, text=True,
     )
     pts = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    return [float(v) for v in pts[-count:]]
+    return [float(v) for v in pts if v != "N/A"]
+
+
+def all_frames_pts(path):
+    """Presentation timestamps of every video frame, in decode order.
+
+    Used to locate the end card by frame count rather than by keyframe:
+    see the occupancy check in assess().
+    """
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    pts = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    return [float(v) for v in pts if v != "N/A"]
 
 
 def keyframes(path):
@@ -233,11 +275,18 @@ def keyframes(path):
     return [float(line) for line in out.stdout.split() if line]
 
 
-def assess(pieces, published, sum_expected, published_path):
-    """Turn the measurements into pass/fail findings."""
+def assess(pieces, published, raw_sum, published_path):
+    """Turn the measurements into pass/fail findings.
+
+    `raw_sum` is the plain sum of the three piece durations, NOT a max()ed
+    value: the gap between that sum and the published container is exactly
+    the silent desync signal, and taking a max() over it would collapse a
+    0.121s discrepancy down to noise before anything looks at it.
+    """
     findings = []
     v = published["video"]
     end_card = pieces["end-card.mp4"]
+    expected_end_card = end_card["video"]["duration"]
 
     if end_card["video"]["fps"] != v["fps"]:
         findings.append(
@@ -250,20 +299,41 @@ def assess(pieces, published, sum_expected, published_path):
             f"published {v['time_base']}"
         )
 
-    # The end card's share of the output, measured from its first frame: the
-    # last IDR keyframe that starts the end card, through the final frame.
-    # This is the number that collapses to milliseconds when the bug is live.
-    keys = keyframes(published_path)
-    tail = last_frames_pts(published_path)
-    if keys and tail:
-        actual_end_card = max(tail) - keys[-1]
-        expected_end_card = end_card["video"]["duration"]
-        if abs(actual_end_card - expected_end_card) > 0.2:
-            findings.append(
-                f"end card occupies {actual_end_card:.3f}s in the published "
-                f"file but is {expected_end_card:.3f}s long - the frames "
-                "collapsed onto the main clip's last frames"
-            )
+    # The end card's share of the output, located by FRAME COUNT rather than
+    # by keyframes. The earlier version took the last IDR as the boundary,
+    # which only works while the end card holds exactly one — a healthy card
+    # with a tuned GOP was reported as collapsed. Guessing a keyframe
+    # "near" the expected start is no better: in the collapsed case every
+    # end-card frame is on top of the main clip's last frames, so any
+    # deadline heuristic reports a meaningless span instead of the
+    # 100 ms the end card really occupies.
+    #
+    # The end card is the last `end_card_frames` frames of the published
+    # file, so the boundary is frame [total - end_card_frames] and the
+    # occupancy is last_pts - that_pts. Exact, and immune to GOP structure.
+    pts = all_frames_pts(published_path)
+    end_card_frames = end_card["video"].get("nb_frames")
+    if pts and end_card_frames:
+        boundary_index = len(pts) - int(end_card_frames) - 1
+        if 0 <= boundary_index < len(pts) - 1:
+            actual_end_card = pts[-1] - pts[boundary_index]
+            if actual_end_card < 0:
+                # Not a formatting quirk: a negative span means the end
+                # card's frames do not come after the main clip's last frame
+                # at all — they sit on top of it. That inversion IS the
+                # collapse, so say so rather than printing a negative length.
+                findings.append(
+                    f"end card frames are interleaved with the main clip's "
+                    f"last frames (span {actual_end_card:.3f}s where "
+                    f"{expected_end_card:.3f}s was expected) - the frames "
+                    "collapsed onto the main clip's last frames"
+                )
+            elif abs(actual_end_card - expected_end_card) > 0.2:
+                findings.append(
+                    f"end card occupies {actual_end_card:.3f}s in the "
+                    f"published file but is {expected_end_card:.3f}s long - "
+                    "the frames collapsed onto the main clip's last frames"
+                )
 
     track_vs_container = abs(
         v["duration"] - published["container_duration"]
@@ -274,11 +344,32 @@ def assess(pieces, published, sum_expected, published_path):
             f"{published['container_duration']:.3f}s"
         )
 
-    rates = {name: p["audio"]["sample_rate"] for name, p in pieces.items()}
-    if len(set(rates.values())) > 1:
+    # The sum-vs-container gap: the signature of concat adopting one piece's
+    # audio parameters and desyncing the rest. This compares the published
+    # file against the pieces, so it can actually fire.
+    desync = published["container_duration"] - raw_sum
+    if abs(desync) > 0.2:
         findings.append(
-            f"audio sample rates differ across the pieces: {rates} - the "
-            "concat silently adopts the first one and desyncs"
+            f"published container is {desync:+.3f}s off the sum of the "
+            f"pieces ({raw_sum:.3f}s) - the concat adopted mismatched "
+            "stream parameters and desynced"
+        )
+
+    # Audio shape: the published file must match the main clip it was built
+    # from. Comparing the probe's own three pieces to each other was
+    # vacuous - it builds them all with the same constant and could never
+    # disagree with itself.
+    main_audio = pieces["main.mp4"]["audio"]
+    pub_audio = published["audio"]
+    if pub_audio["sample_rate"] != main_audio["sample_rate"]:
+        findings.append(
+            f"published audio is {pub_audio['sample_rate']} but the main "
+            f"piece is {main_audio['sample_rate']} - silent desync risk"
+        )
+    if pub_audio["channels"] != main_audio["channels"]:
+        findings.append(
+            f"published audio has {pub_audio['channels']} channels but the "
+            f"main piece has {main_audio['channels']}"
         )
 
     return findings
@@ -331,20 +422,23 @@ def main():
         }
         published = probe(paths["published.mp4"])
 
-        sum_expected = sum(p["video"]["duration"] for p in pieces.values())
-        sum_expected = max(sum_expected, published["container_duration"])
+        # The PLAIN sum. Taking a max() with the container duration here
+        # silently hid the one number worth watching: how far the published
+        # file is from the sum of what went into it. Both are reported.
+        raw_sum = sum(p["video"]["duration"] for p in pieces.values())
+        track_sum_delta = published["video"]["duration"] - raw_sum
+        container_sum_delta = published["container_duration"] - raw_sum
 
         report = {
             "pieces": pieces,
             "published": published,
-            "sum_of_piece_durations": sum_expected,
-            "duration_error": abs(
-                published["video"]["duration"] - sum_expected
-            ),
+            "sum_of_piece_durations": raw_sum,
+            "video_track_minus_sum": round(track_sum_delta, 3),
+            "container_minus_sum": round(container_sum_delta, 3),
         }
         print(json.dumps(report, indent=2))
 
-        findings = assess(pieces, published, sum_expected,
+        findings = assess(pieces, published, raw_sum,
                           paths["published.mp4"])
         print()
         if findings:

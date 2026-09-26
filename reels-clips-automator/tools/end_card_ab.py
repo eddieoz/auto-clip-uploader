@@ -143,14 +143,21 @@ def build_end_card(out):
 
 
 def assemble(teaser, main, end_card, published, workdir):
-    """Assemble with reelsfy's real ladder."""
+    """Assemble with reelsfy's real ladder.
+
+    `published` is resolved to an absolute path BEFORE the chdir: ffmpeg
+    runs with reelsfy.py's directory as cwd, so resolving it inside the
+    chdir would anchor a relative --out to the repository and the file would
+    land somewhere the caller never looks.
+    """
+    published_abs = os.path.abspath(published)
     cwd = os.getcwd()
     os.chdir(REELSFY_DIR)
     try:
         if not os.path.isdir("tmp"):
             os.makedirs("tmp", exist_ok=True)
         ok = REELSFY.assemble_hook_teaser_final(
-            teaser, main, os.path.abspath(published),
+            teaser, main, published_abs,
             concat_list_path=os.path.join(workdir, "concat.txt"),
             end_card_path=end_card,
         )
@@ -158,7 +165,7 @@ def assemble(teaser, main, end_card, published, workdir):
         os.chdir(cwd)
     if not ok:
         raise RuntimeError("assemble_hook_teaser_final() returned False")
-    return published
+    return published_abs
 
 
 def run_arm(label, source, outdir, seconds, workdir):
@@ -182,16 +189,34 @@ def run_arm(label, source, outdir, seconds, workdir):
 
 
 def compare(arm_a, main_a, card_a, arm_b, main_b):
-    """The C4 question: does the end card survive, and does it break the file?"""
+    """The C4 question: does the end card survive, and does it break the file?
+
+    Each arm is checked against ITS OWN main piece. An earlier version
+    compared both arms to a single main probe and guarded the fps check
+    with `and name == "A"`, which silently discarded every B result; the
+    per-arm pairing below makes that class of mistake impossible.
+    """
     findings = []
     if card_a is None:
         return ["arm A produced no end card - the A/B did not happen"]
-    for name, piece in (("A", arm_a), ("B", arm_b)):
-        if piece["fps"] != main_b["fps"] and name == "A":
+
+    for name, piece, main in (("A", arm_a, main_a), ("B", arm_b, main_b)):
+        if piece["fps"] != main["fps"]:
             findings.append(
-                f"arm A is {piece['fps']} fps but the main piece is "
-                f"{main_b['fps']} fps"
+                f"arm {name} is {piece['fps']} fps but its main piece is "
+                f"{main['fps']} fps"
             )
+        if piece["audio_rate"] != main["audio_rate"]:
+            findings.append(
+                f"arm {name} audio is {piece['audio_rate']} but its main "
+                f"piece is {main['audio_rate']} - silent desync risk"
+            )
+        if abs(piece["video_duration"] - piece["container_duration"]) > 0.5:
+            findings.append(
+                f"arm {name} video track lasts {piece['video_duration']}s but "
+                f"the container claims {piece['container_duration']}s"
+            )
+
     if arm_a["time_base"] != arm_b["time_base"]:
         findings.append(
             f"arm A time_base {arm_a['time_base']} != arm B "
@@ -202,17 +227,6 @@ def compare(arm_a, main_a, card_a, arm_b, main_b):
             f"arm A is only {arm_a['video_duration'] - arm_b['video_duration']:+.3f}s "
             f"longer than arm B; the 1.5s end card did not survive"
         )
-    if abs(arm_a["video_duration"] - arm_a["container_duration"]) > 0.5:
-        findings.append(
-            f"arm A video track lasts {arm_a['video_duration']}s but the "
-            f"container claims {arm_a['container_duration']}s"
-        )
-    for name, piece in (("A", arm_a), ("B", arm_b)):
-        if piece["audio_rate"] != main_b["audio_rate"]:
-            findings.append(
-                f"arm {name} audio is {piece['audio_rate']} but the main "
-                f"piece is {main_b['audio_rate']} - silent desync risk"
-            )
     return findings
 
 
@@ -240,14 +254,18 @@ def main():
         print("  " + json.dumps(
             {k: v for k, v in probe(args.source).items() if k != "keyframes"}
         ))
-        arm_a, path_a, main_probe, card_probe = run_arm(
+        arm_a, path_a, main_a, card_probe = run_arm(
             "A (end card ON)", args.source, args.out, args.seconds, workdir
         )
-        arm_b, path_b, _, _ = run_arm(
+        arm_b, path_b, main_b, _ = run_arm(
             "B (end card OFF)", args.source, args.out, args.seconds, workdir
         )
 
-        findings = compare(arm_a, main_probe, card_probe, arm_b, main_probe)
+        # Each arm against its OWN main piece. Previously both were passed
+        # the same probe and arm B's was discarded outright, so the
+        # comparison would have gone stale the moment the arms built their
+        # main piece differently.
+        findings = compare(arm_a, main_a, card_probe, arm_b, main_b)
 
         report = {
             "source": args.source,
