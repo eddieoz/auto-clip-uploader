@@ -2163,6 +2163,18 @@ def _segment_start_seconds(segment):
     return _srt_like_to_seconds(value)
 
 
+def _segment_end_seconds(segment):
+    """Numeric end (float seconds) of a segment dict, or None."""
+    if not isinstance(segment, dict):
+        return None
+    value = segment.get('end_time')
+    if value is None:
+        value = segment.get('end_time_srt')
+    if value is None:
+        value = segment.get('end')
+    return _srt_like_to_seconds(value)
+
+
 def _segment_end_srt(segment):
     """Pick a printable end timestamp for a cue entry.
 
@@ -2797,6 +2809,21 @@ def generate_viral(
             f"DEBUG: Segment {i}: keys={list(seg.keys())}, has_text={seg.get('text', 'MISSING')}"
         )
 
+    # Capture-length guard: the OBS replay buffer bounds how much topic context
+    # exists. If the capture is shorter than the minimum clip window plus margin,
+    # the clip will feel truncated — raise the OBS replay buffer (90 s default).
+    if segments:
+        capture_start = _segment_start_seconds(segments[0])
+        capture_end = _segment_end_seconds(segments[-1])
+        if capture_start is not None and capture_end is not None:
+            capture_span = capture_end - capture_start
+            if capture_span < min_duration + 10.0:
+                print(
+                    f"⚠️ Capture span {capture_span:.0f}s is shorter than the "
+                    f"minimum clip window ({min_duration:.0f}s) + margin — the clip "
+                    f"may be truncated. Check the OBS replay buffer length."
+                )
+
     # Then generate viral segments
     json_template = build_segment_json_template()
 
@@ -3046,9 +3073,9 @@ def generate_viral(
         ]
     )
 
-    prompt = f"""Given the following video transcript and audio analysis results, analyze each part for potential virality and identify the single most viral segment of maximum 59 seconds.
+    prompt = f"""Given the following video transcript and audio analysis results, analyze each part for potential virality and identify the single most viral segment of maximum {max_duration} seconds.
 The segment should be complete with the full explanation for the audience to comprehend the entire information or message of the segment,
-and have a minimum of {min_duration} seconds and maximum of 59 seconds in duration.
+and have a minimum of {min_duration} seconds and maximum of {max_duration} seconds in duration.
 
 Do not select a segment with partial or incomplete information.
 
@@ -3410,14 +3437,14 @@ def __main__():
     parser.add_argument(
         "--min-duration",
         type=float,
-        default=1.0,
-        help="Minimum duration in seconds for viral segments (default: 1.0)",
+        default=35.0,
+        help="Minimum duration in seconds for viral segments (default: 35.0)",
     )
     parser.add_argument(
         "--max-duration",
         type=float,
-        default=120.0,
-        help="Maximum duration in seconds for viral segments (default: 120.0)",
+        default=59.0,
+        help="Maximum duration in seconds for viral segments (default: 59.0)",
     )
     parser.add_argument("--job-id", required=False, help="Job ID for organization")
     parser.add_argument(

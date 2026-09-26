@@ -96,6 +96,23 @@ See `reels-clips-automator/.env.example` for all video-editing options with
 defaults, and `docs/VIDEO_EDITING_IMPROVEMENT_PLAN.md` +
 `docs/VIRAL_SELECTION_IMPROVEMENT_PLAN.md` for the design behind them.
 
+### OBS Replay Buffer (capture length)
+
+Clips are built from an **OBS replay buffer of 90 seconds**. This is the single
+most important capture setting for clip quality:
+
+- A clip can be at most **59 seconds** (the YouTube hard cap), so the buffer must
+  hold at least that much — plus margin — for the segment selector to find a
+  complete, engaging topic.
+- The final topic *concludes at the end* of the capture (recency anchor). The
+  buffer's **start bounds how much topic context is available**: too short and the
+  clip is cut off mid-topic, leaving it feeling incomplete. 90 s gives the selector
+  room to extend a clip's start earlier when the LLM says the topic began before the
+  heuristic window.
+- If clips feel truncated or the LLM keeps returning the minimum duration, raise the
+  OBS replay buffer (or ensure OBS actually captures the full 90 s) before tuning
+  anything else.
+
 ### Postiz Setup
 Add to your Postiz docker-compose.yml backend service:
 ```yaml
