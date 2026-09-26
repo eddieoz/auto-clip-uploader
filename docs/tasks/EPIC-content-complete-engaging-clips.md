@@ -97,9 +97,15 @@ Scenario: LLM says the topic starts earlier than the heuristic cue
 
 **Files:** `reelsfy.py` (`resolve_topic_start_cue` prompt ~2319, `_parse_boundary_reply`), `tests/test_topic_boundary.py`.
 
-### Story A4 — Apply start extension to the resolved window (1 pt)
+### Story A4 — Apply start extension to the resolved window ✅ DONE
 
-`trim_window_to_topic_start` (or a sibling) may **move the window start earlier** to `earlier_start_cue` when the parsed result says the topic is incomplete — clamped to cue 0 and to the 59 s max reach (the resulting window duration must never exceed `max_duration`; within the 90 s capture the END stays anchored, so extending the start is bounded by the cap).
+Shipped as commit `13aa524`. `extend_window_to_earlier_topic_start` is a sibling of `trim_window_to_topic_start` (the two directions of start movement stay separately named and testable). It **moves the window start earlier** to `earlier_start_cue` when the parsed result says the topic is incomplete, clamped to the capture start (`max(0.0, …)`) and to the 59 s max reach — because the END stays anchored, an extension that would breach the cap is clamped to `end − max_duration`. Supporting segments are returned **unchanged**: the extension only grows the window, so it must never drop any.
+
+Two invariants were tightened during review:
+- `min_start_srt` is a **floor** for `snap_window_to_boundaries` / `refine_window_start_with_pause`, so it is taken from whichever cue owns the window start after the extension — otherwise the snapper silently undoes the extension.
+- `refine_window_start_with_pause` picks the nearest pause in ±1.5 s with no lower bound and could push the start *earlier*, breaching the 59 s cap for a window sitting exactly at it. It now takes a `max_duration` and rejects candidates below `end − max_duration` (default `None`, inert for other callers).
+
+Byte-identity is pinned by a golden resolved-window prompt section genuinely captured from a pre-A4 worktree, not hand-written to match current output.
 
 **TDD (write first):**
 - `tests/test_boundary_snap.py` additions: extension moves start earlier and recomputes duration; never extends beyond capture start; never changes end; never produces a window longer than `max_duration` (59 s) — extension is clamped by the cap; when `topic_complete=true` or no earlier cue, window is byte-identical to today.
@@ -120,11 +126,11 @@ Scenario: Complete topic is untouched
 
 **Depends on:** A3. **Files:** `reelsfy.py`, `tests/test_boundary_snap.py`.
 
-### Story A5 — Completeness observability (1 pt)
+### Story A5 — Completeness observability ✅ DONE (1 pt)
 
-After selection, log one structured line: capture span, resolved window, chosen duration, `topic_complete`, and whether the first caption sentence is grammatically complete. This is the feedback signal for tuning A1-A4.
+Shipped as commit `4c892d3`. After selection, `build_selection_summary(...)` — a **pure** function returning a dict — is printed as one strictly-parseable `SELECTION_SUMMARY {…}` line, so the run log can be scraped to tune A1-A4. It changes no behavior. At least one line is emitted per run, including when the LLM returns no segments.
 
-**TDD (write first):** unit test on the log builder (pure function returning the dict/string).
+**TDD (write first):** unit test on the log builder (pure function returning the dict), plus wiring tests through the existing `_run_generate_viral` harness.
 
 **BDD:**
 ```gherkin
@@ -134,7 +140,13 @@ Scenario: Selection reports its own completeness
   Then it contains capture_span, resolved_window, duration and topic_complete
 ```
 
-**Files:** `reelsfy.py`, new small test file.
+**Files:** `reelsfy.py`, `tests/test_selection_summary.py`.
+
+Details worth knowing before tuning against this signal:
+- Cues inside the window are selected by **overlap**, not containment — `snap_window_to_boundaries` can land the start mid-cue, and the cue owning the start begins before the window.
+- The first-sentence rule is the simple heuristic, and it is **biased toward `complete`**: decimals (`3.14`), `e.g.` and ellipses read as sentence ends. The bias is documented in-code and characterized by tests, because this metric is what A1–A4 get tuned against.
+- Non-finite values (`nan`/`inf`, reachable via `_srt_like_to_seconds("nan")`) degrade to `null` so the marker line is always strictly parseable — Python's lenient `json.loads` accepts `NaN`, so a `jq`/`JSON.parse` consumer would otherwise have been the only one to notice.
+- `capture_span` and `topic_complete` were only bound inside conditional blocks; both are now seeded to `None` so the fallback path cannot `NameError`.
 
 ---
 
@@ -290,15 +302,15 @@ Scenario: Epic closes green
 
 ---
 
-## Story index (13 pts total; C1 done)
+## Story index (13 pts total; A and C1 done)
 
 | Story | Theme | Pt | Depends on |
 |-------|-------|----|------------|
-| A1 unify duration bounds | A | 1 | — |
+| A1 unify duration bounds ✅ | A | 1 | done (`5146779`) |
 | A2 OBS buffer doc + warn ✅ | A | 1 | done (`18c9600`) |
-| A3 completeness in boundary pass ✅ | A | 1 | done |
-| A4 apply start extension | A | 1 | A3 |
-| A5 completeness observability | A | 1 | A4 |
+| A3 completeness in boundary pass ✅ | A | 1 | done (`e3acda0`) |
+| A4 apply start extension ✅ | A | 1 | done (`13aa524`) |
+| A5 completeness observability ✅ | A | 1 | done (`4c892d3`) |
 | B1 anti-duplication rule | B | 1 | — |
 | B2 prefer mid-window hooks | B | 1 | B1 |
 | B3 prompt steering | B | 1 | — |
@@ -309,4 +321,6 @@ Scenario: Epic closes green
 | C4 re-enable decision | C | 1 | C3, user |
 | D1 regression + docs | D | 1 | A1-A5, B1-B4, C3 |
 
-Parallelizable now: A1, A2, A3, B1, B3, B4, C2.
+**Theme A is complete.** Every invariant in the ratified list now has a binding test: the recency anchor (the extension never assigns an end time), the 59 s cap (clamped in the extension and re-checked after prosodic refinement), degradation (every LLM/audio failure path returns the analyzed window untouched), and the 35–59 s bounds from A1.
+
+Parallelizable now: B1, B3, B4, C2.
