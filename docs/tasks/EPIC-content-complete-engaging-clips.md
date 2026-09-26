@@ -339,13 +339,36 @@ Instagram" and "metrics don't regress". The first is addressed as far as it can
 be locally — the file is now well-formed, and it is strictly more standard than
 the one Instagram choked on. The second is a product question about whether a
 CTA card earns its 1.5 s of retention, and **no retention data exists** — the
-`input/` captures have never been published (there is no Postiz configuration in
-`reels-clips-automator/.env` at all, so no destination is configured), and
-metrics are not something this repo can observe. If the end card turns out to
+metrics cannot be read in an automated session — they need 24-72h — so the upload and the
+read are both the user's to run. The publisher *is* fully configured: `POSTIZ_ENDPOINT`,
+`POSTIZ_API_KEY` and `POSTIZ_INSTAGRAM_CHANNEL_ID` are all set in the **root** `.env`
+(not `reels-clips-automator/.env`, which has no publishing config at all). Publishing is
+one call: `PostizPublisher(output_directory, source_link).publish()`, and the pipeline
+reaches it through `publish_queue.json` via `monitor.py`. If the end card turns out to
 cost retention, the revert is one line: `END_CARD_ENABLED=false`.
 
-The two files produced by the run are in `/tmp/c4-ab/` and are exactly what
-should be uploaded for the Instagram leg.
+### Running the Instagram leg
+
+Regenerate them in ~2 minutes rather than committing ~100 MB of video to git — the
+A/B is reproducible from the tool:
+
+```bash
+python3 reels-clips-automator/tools/end_card_ab.py \
+    "input/2026-09-25 14-38-13-backtrack.mp4" --out /tmp/c4-final
+# -> c4-arm-A.mp4 (end card ON, 41.533s), c4-arm-B.mp4 (OFF, 40.000s),
+#    c4-ab-report.json. Exit 0 means both arms are well-formed.
+```
+
+Publishing is one call — `PostizPublisher(output_directory, source_link).publish()` in
+`social_media_publisher/publisher.py`, which uploads then posts and returns the
+workflow result. The pipeline normally reaches it through `publish_queue.json` via
+`monitor.py`, so a one-off means calling the publisher directly on a directory
+holding just the arm you want to post.
+
+Check, in order: that the arm-A reel **renders the end card** end-to-end on
+Instagram (this is the C2/C3 bug, and it is the part that was previously
+unprovable locally), then arm A vs arm B **retention after 24-72h**. Only the
+second is a product judgment about the CTA.
 
 **BDD:**
 ```gherkin
@@ -427,9 +450,11 @@ end card surviving in full. See the appendix at the bottom of this file for the 
 reproduction commands, the two strategies compared, and the laya validation.
 
 The one thing still unknown is the product half of C4: whether the CTA end card earns its 1.5 s of
-retention. No retention data exists, because nothing has ever been published from this checkout —
-`reels-clips-automator/.env` has no Postiz configuration, so no destination is even wired up. The
-two A/B files in `/tmp/c4-ab/` are what should be uploaded to close that gap. If the card costs
+retention. No retention data exists yet, and none can be gathered in an automated session — the
+numbers need 24-72h to mean anything, and reading them is a judgement about the audience, not
+something this repo can observe. **The upload was deliberately not performed:** it posts public
+video to a live Instagram account irreversibly, and the user chose to run it themselves. The two
+A/B files (regenerate with `tools/end_card_ab.py`, see C4) are what should be uploaded to close the gap. If the card costs
 retention, `END_CARD_ENABLED=false` is the one-line revert.
 
 One caution for whoever re-tunes: `ASSEMBLY_VIDEO_TIMESCALE` must stay `ASSEMBLY_FPS * 512`. It
