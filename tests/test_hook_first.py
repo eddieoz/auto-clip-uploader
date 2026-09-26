@@ -577,9 +577,10 @@ class TestOpeningDuplicateGuard:
             is None
         )
 
-    def test_span_straddling_the_guard_end_rejected(self):
+    def test_candidate_starting_inside_the_guard_rejected(self):
         # Cue 2 (28-33 s) starts inside the 25-30 s guard and runs past its
-        # end: overlap is what disqualifies it, not merely starting inside.
+        # end. What this pins is the START: a candidate beginning inside the
+        # opening span is rejected, whatever it does afterwards.
         candidates = [_candidate(2, 2, "Straddling sentence")]
 
         assert (

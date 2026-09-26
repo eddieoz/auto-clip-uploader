@@ -4805,10 +4805,18 @@ HOOK_TEASER_MAX_DURATION = 6.0
 # from the clip's own first seconds plays the same words twice. Any candidate
 # overlapping this opening span of the resolved window is rejected; the clip
 # then simply publishes without a teaser.
-# then simply publishes without a teaser.
 # Story B4: the publish step re-uses this SAME span as its defense-in-depth
 # check, so the two layers can never drift apart.
 HOOK_DUPLICATE_GUARD_SECONDS = 5.0
+# B4's caption net: how many leading words a hook must share with the clip's
+# opening before the teaser counts as a repeat. A false match here drops a
+# fine teaser, so the floor is set above a single coincidental word; two
+# shared leading words is also the width of the short exact-match case the
+# net replaced, so nothing that used to be caught is lost.
+HOOK_CAPTION_MIN_MATCH_WORDS = 2
+# Per-word punctuation stripped when the caption net compares words; the
+# sentence normalizer above only strips the very end of the text.
+_CAPTION_PUNCTUATION = ".,!?;:…\"'’-()"
 # Story B2: among candidates that already survive every check, prefer the ones
 # landing in the middle of the clip — not in the first 20% (leads with a
 # truncated thought) nor the last 10% (pre-empts the payoff). A teaser from the
@@ -5128,16 +5136,22 @@ def _normalize_comparable_text(text):
     return collapsed.rstrip(".,!?;:…\"'")
 
 
-def first_caption_sentence(subtitle_words):
-    """The clip's first caption sentence, normalized (pure; "" when unknown).
+def opening_caption_prefix(subtitle_words, guard=HOOK_DUPLICATE_GUARD_SECONDS):
+    """The clip's opening words, normalized (pure; "" when unknown).
 
-    Reads the karaoke word list (clip-relative seconds) and joins words in
-    order until one carries a sentence terminator — the same terminator rule
-    the selection layer uses (_first_sentence_ends_complete). Only words
-    inside the first HOOK_DUPLICATE_GUARD_SECONDS are considered: that is the
-    span the guard protects, so a sentence running past it cannot be compared
-    and the check stays inert. Returns "" when there are no usable words, so
-    the caller can treat "unknown" as "no match".
+    Reads the karaoke word list (clip-relative seconds) and joins every word
+    that starts inside the first `guard` seconds, in order. The window is
+    TIME-based, not sentence-based: a terminator-delimited "first sentence"
+    is unusable on real content here, because _first_sentence_ends_complete is
+    biased toward reporting "complete" on decimals, abbreviations and
+    ellipses, and screencast captions are full of numbers — the extract would
+    be a fragment ("we set version 2.") that can never equal a hook text. A
+    time window also removes the second weakness of the old rule: an opening
+    sentence running past 5 s used to make the check inert.
+    Words without a usable numeric start are kept (unknown position, not
+    known-outside); the scan stops at the first word at or past `guard`.
+    Returns "" when there are no usable words, so the caller can treat
+    "unknown" as "no match".
     """
     try:
         if not isinstance(subtitle_words, list) or not subtitle_words:
@@ -5151,32 +5165,65 @@ def first_caption_sentence(subtitle_words):
                 continue
             start = word.get("start")
             if isinstance(start, (int, float)) and not isinstance(start, bool):
-                if start >= HOOK_DUPLICATE_GUARD_SECONDS:
+                if start >= guard:
                     break
             parts.append(text)
-            if _first_sentence_ends_complete(text):
-                break
         return _normalize_comparable_text(" ".join(parts))
     except Exception:
         return ""
 
 
+def _comparable_word_list(text):
+    """Normalized text as a list of words, punctuation stripped per word."""
+    normalized = _normalize_comparable_text(text)
+    if not normalized:
+        return []
+    return [word.strip(_CAPTION_PUNCTUATION) for word in normalized.split()]
+
+
 def teaser_repeats_first_caption(hook_text, subtitle_words):
-    """True when the hook text IS the clip's own first caption sentence.
+    """True when the hook text restates the clip's own opening words.
 
     B4's second net for the case where timings shifted between selection and
-    publish (e.g. jump cuts) but the words did not. Tolerant by design: both
-    sides are normalized (lowercased, whitespace collapsed, trailing
-    punctuation stripped) and a match only counts when both are non-empty,
-    so a missing caption list or a missing hook text leaves the check inert.
+    publish (e.g. jump cuts) but the words did not. This is the case B1's
+    timing net cannot see: a hook cut from the MIDDLE of the clip does not
+    overlap the opening span, yet it can still replay the clip's first words.
+
+    Both sides are normalized (lowercased, whitespace collapsed, punctuation
+    stripped) and a match only counts when both are non-empty, so a missing
+    caption list or a missing hook text leaves the check inert.
+
+    OVERLAP RULE (deliberately conservative, because a false match is the
+    expensive direction — it drops a teaser that was fine, while a false miss
+    only lets through the repetition this net exists to stop):
+
+      * the two word sequences must share a COMMON PREFIX of at least
+        HOOK_CAPTION_MIN_MATCH_WORDS words — one side may be a longer
+        version of the other, but the overlap is always anchored at the
+        opening's first word, never anywhere in the window. A hook that
+        merely repeats a later sentence ("Then it broke.") is not the
+        opening and must not trip the net.
+      * that word floor is what makes it "substantial": a hook sharing a
+        single leading word with the opening is coincidental phrasing, not a
+        repetition of the opening. Two is the floor because the exact-match
+        rule this replaces fired on two-word openings, so nothing that used
+        to be caught is lost.
+
     Pure; never raises.
     """
     try:
-        hook_normalized = _normalize_comparable_text(hook_text)
-        caption_normalized = first_caption_sentence(subtitle_words)
-        if not hook_normalized or not caption_normalized:
+        hook_words = _comparable_word_list(hook_text)
+        caption_words = _comparable_word_list(
+            opening_caption_prefix(subtitle_words)
+        )
+        if not hook_words or not caption_words:
             return False
-        return hook_normalized == caption_normalized
+        shared = 0
+        for hook_word, caption_word in zip(hook_words, caption_words):
+            if hook_word != caption_word:
+                break
+            shared += 1
+        return shared >= HOOK_CAPTION_MIN_MATCH_WORDS
     except Exception:
         return False
 
@@ -5201,12 +5248,14 @@ def publish_segment_with_optional_teaser(
 
     clip_start_time is the main clip's own start time (any SRT-like or float
     value) and is B4's only new input. It defaults to None, which leaves the
-    teaser path byte-identical to pre-B4 for every existing caller. When it
-    is supplied, a teaser that would replay the clip's opening — by
-    overlapping its first HOOK_DUPLICATE_GUARD_SECONDS, or by repeating its
-    first caption sentence verbatim — is skipped before anything is
-    generated, and the segment falls through to the ordinary publish path
-    (direct publish, or the end-card assembly when the end card is on).
+    overlap check — and therefore the teaser's timing — byte-identical to
+    pre-B4 for every existing caller; the caption net below runs whatever
+    this is, since it only needs subtitle_words. A teaser that would replay
+    the clip's opening — by overlapping its first
+    HOOK_DUPLICATE_GUARD_SECONDS, or by restating its opening words — is
+    skipped before anything is generated, and the segment falls through to
+    the ordinary publish path (direct publish, or the end-card assembly when
+    the end card is on).
     """
     direct_publish_kwargs = {
         "video_title": video_title,
@@ -5226,6 +5275,16 @@ def publish_segment_with_optional_teaser(
     teaser_path = None
     if hook:
         hook_start, hook_end, hook_text = hook
+        # Print via the seconds helper so an unexpected hook field shape
+        # cannot turn the skip message into a raise (both predicates are
+        # documented as never raising).
+        _hook_start_s = _srt_like_to_seconds(hook_start)
+        _hook_end_s = _srt_like_to_seconds(hook_end)
+        hook_span_log = (
+            f"{_hook_start_s:.2f}s-{_hook_end_s:.2f}s"
+            if _hook_start_s is not None and _hook_end_s is not None
+            else f"{hook_start}-{hook_end}"
+        )
         # B4: refuse a teaser that would repeat the clip's own opening. Both
         # checks are pure and the skip is not an error: no teaser file, no
         # burned main for the teaser, straight to the publish path below.
@@ -5233,7 +5292,7 @@ def publish_segment_with_optional_teaser(
             clip_start_time, hook_start, hook_end
         ):
             print(
-                f"Hook teaser: {hook_start:.2f}s-{hook_end:.2f}s overlaps the "
+                f"Hook teaser: {hook_span_log} overlaps the "
                 f"clip's first {HOOK_DUPLICATE_GUARD_SECONDS:.0f}s; publishing "
                 "without teaser"
             )
@@ -5243,7 +5302,7 @@ def publish_segment_with_optional_teaser(
                 "caption; publishing without teaser"
             )
         else:
-            print(f"Hook teaser: {hook_start:.2f}s-{hook_end:.2f}s '{hook_text}'")
+            print(f"Hook teaser: {hook_span_log} '{hook_text}'")
             teaser_path = generate_hook_teaser(hook_start, hook_end, hook_text)
             if teaser_path:
                 main_output_path = f"tmp/{HOOK_TEASER_MAIN_OUTPUT_FILE}"

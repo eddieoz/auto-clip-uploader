@@ -731,8 +731,44 @@ class TestTeaserRepeatsFirstCaptionHelper:
         assert reelsfy.teaser_repeats_first_caption(None, self.WORDS) is False
 
     def test_sentence_after_the_opening_is_not_a_repeat(self):
-        # Only the FIRST sentence counts; "Then it broke." must not trip it.
+        # The later sentence is INSIDE the 5 s window but does not open it, so
+        # the match is anchored at the start of the window, not anywhere in it.
         assert reelsfy.teaser_repeats_first_caption("Then it broke.", self.WORDS) is False
+
+    def test_hook_repeating_the_opening_words_in_pieces_is_a_repeat(self):
+        # Real screencast captions rarely carry a terminator on the opening
+        # line ("we set version 2." -> fragment), so a terminator-delimited
+        # sentence can never equal a hook that restates the opening mid-clip.
+        # The net is time-based: any hook sharing the opening's first words
+        # counts, no terminal punctuation required on either side.
+        punct_less = [
+            {"word": "we", "start": 0.0, "end": 0.2},
+            {"word": "set", "start": 0.2, "end": 0.5},
+            {"word": "the", "start": 0.5, "end": 0.7},
+            {"word": "version", "start": 0.7, "end": 1.1},
+            {"word": "number", "start": 1.1, "end": 1.6},
+            {"word": "two", "start": 1.6, "end": 1.9},
+            {"word": "and", "start": 30.0, "end": 30.2},
+            {"word": "moved", "start": 30.2, "end": 30.6},
+        ]
+        assert (
+            reelsfy.teaser_repeats_first_caption("We set the version number", punct_less)
+            is True
+        )
+        # A different mid-clip teaser that shares nothing with the opening stays.
+        assert reelsfy.teaser_repeats_first_caption("A totally different line", punct_less) is False
+
+    def test_one_word_overlap_is_not_enough(self):
+        # Conservative floor: a single shared leading word is coincidental
+        # phrasing, and a false match costs a teaser that was fine.
+        short = [
+            {"word": "we", "start": 0.0, "end": 0.2},
+            {"word": "set", "start": 0.2, "end": 0.5},
+            {"word": "the", "start": 0.5, "end": 0.7},
+            {"word": "version", "start": 0.7, "end": 1.1},
+        ]
+        assert reelsfy.teaser_repeats_first_caption("We need", short) is False
+        assert reelsfy.teaser_repeats_first_caption("We set", short) is True
 
 
 class TestPublishHookDedupGuard:
