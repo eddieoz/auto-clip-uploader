@@ -20,24 +20,87 @@ future CI check.
 """
 
 import argparse
+import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
-# The settings under test. These mirror reelsfy.py; when you change one
-# there, change it here too or the probe stops describing the real pipeline.
+HERE = os.path.dirname(os.path.abspath(__file__))
+REELSFY = os.path.join(HERE, os.pardir, "reelsfy.py")
+
+# The settings under test. They are READ OUT OF reelsfy.py rather than
+# repeated here, so the probe cannot drift away from the pipeline it checks —
+# but they are read as text, not by importing reelsfy, which would drag in
+# the whole transcription stack (librosa/numba) for four integers.
+def pipeline_constants():
+    """Pull the assembly constants out of reelsfy.py's source."""
+    source = open(REELSFY, encoding="utf-8").read()
+
+    def missing(name):
+        raise SystemExit(
+            f"{name} not found in {REELSFY}; the probe needs updating"
+        )
+
+    def grab(name):
+        match = re.search(rf"^{name} = (.+)$", source, re.MULTILINE)
+        if not match:
+            missing(name)
+        return ast.literal_eval(match.group(1))
+
+    def grab_quoted(name):
+        match = re.search(rf'^{name} = "(.+)"$', source, re.MULTILINE)
+        if not match:
+            missing(name)
+        return match.group(1)
+
+    def grab_wrapped(name):
+        """A string constant the author wrapped across lines, e.g.
+
+            NAME = (
+                "the value"
+            )
+        """
+        match = re.search(
+            rf'^{name} = \(\s*"[^"]*"\s*\)', source, re.MULTILINE
+        )
+        if not match:
+            missing(name)
+        return re.search(r'"([^"]*)"', match.group(0)).group(1)
+
+    return {
+        "fps": grab("ASSEMBLY_FPS"),
+        "timescale": grab("ASSEMBLY_VIDEO_TIMESCALE"),
+        "audio_rate": grab("ASSEMBLY_AUDIO_RATE"),
+        "audio_channels": grab("ASSEMBLY_AUDIO_CHANNELS"),
+        "mastering": grab_wrapped("AUDIO_MASTERING_FILTER"),
+        "font": grab_quoted("OVERLAY_FONTFILE"),
+    }
+
+
+CONST = pipeline_constants()
+# Bound to locals: this module must import on Python 3.9, where an
+# f-string cannot nest CONST["x"] inside its own double quotes.
+FPS = CONST["fps"]
+TIMESCALE = CONST["timescale"]
+AUDIO_RATE = CONST["audio_rate"]
+AUDIO_CHANNELS = CONST["audio_channels"]
+MASTERING = CONST["mastering"]
+FONT = CONST["font"]
 NVENC = [
     "-c:v", "h264_nvenc", "-profile:v", "high", "-rc:v", "vbr",
     "-qp", "18", "-b:v", "10000k", "-maxrate:v", "12000k",
     "-bufsize:v", "15000k", "-pix_fmt", "yuv420p",
 ]
-FONT = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
+# Every piece the pipeline encodes pins the timescale, so the probe must too:
+# otherwise changing ASSEMBLY_VIDEO_TIMESCALE in reelsfy.py would leave this
+# tool reporting "healthy" while the real assembly broke.
+TIMESCALE_ARGS = ["-video_track_timescale", str(TIMESCALE)]
 TEASER_SECONDS = 4
 MAIN_SECONDS = 40
-FPS = 30
 
 
 def run(args):
@@ -56,21 +119,23 @@ def build_source(path):
     run([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", f"testsrc2=s=1920x1080:r={FPS}:d=90",
-        "-f", "lavfi", "-i", f"sine=frequency=300:r=48000:d=90",
+        "-f", "lavfi", "-i", f"sine=frequency=300:r={AUDIO_RATE}:d=90",
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", path,
+        "-c:a", "aac", "-ar", str(AUDIO_RATE),
+        "-ac", str(AUDIO_CHANNELS), "-shortest", path,
     ])
 
 
 def build_cropped(source, out, seconds):
-    """The 9:16 crop, the way generate_short does it (note the -r 30)."""
+    """The 9:16 crop, the way generate_short does it (note the pinned -r)."""
     run([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", source, "-t", str(seconds),
         "-vf", "crop=608:1080:656:0,scale=1080:1920,setsar=1",
-        "-r", str(FPS), "-pix_fmt", "yuv420p", *NVENC,
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-shortest", out,
+        "-r", str(FPS), "-pix_fmt", "yuv420p", *NVENC, *TIMESCALE_ARGS,
+        "-c:a", "aac", "-b:a", "192k",
+        "-ar", str(AUDIO_RATE),
+        "-ac", str(AUDIO_CHANNELS), "-shortest", out,
     ])
 
 
@@ -83,10 +148,11 @@ def burn(input_path, out, label, text):
         f"drawtext=text='{text}':expansion=none:fontfile={FONT}:fontsize=64:"
         "fontcolor=white:borderw=3:bordercolor=black:"
         f"x=(w-tw)/2:y=(h-th)/2:{label}",
-        "-af", "loudnorm=I=-14:LRA=11:tp=-1.5,"
-               "acompressor=threshold=0.05:ratio=3:makeup=1.2",
-        *NVENC, "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-video_track_timescale", "15360", out,
+        "-af", MASTERING,
+        *NVENC, "-r", str(FPS), *TIMESCALE_ARGS,
+        "-c:a", "aac", "-b:a", "192k",
+        "-ar", str(AUDIO_RATE),
+        "-ac", str(AUDIO_CHANNELS), out,
     ])
 
 
@@ -95,7 +161,8 @@ def build_end_card(out, pin_rate=True):
 
     `pin_rate` toggles the C3 fix: build_end_card_command() has no -r, so the
     lavfi color source defaults to 25 fps with a 1/12800 timebase, while every
-    other piece is 30 fps / 1/15360.
+    other piece is 30 fps / 1/15360 (the frame rate and timescale the
+    pipeline pins in reelsfy.ASSEMBLY_FPS / ASSEMBLY_VIDEO_TIMESCALE).
     """
     args = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-hwaccel", "cuda",
@@ -103,14 +170,15 @@ def build_end_card(out, pin_rate=True):
         "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
     ]
     if pin_rate:
-        args += ["-r", str(FPS), "-video_track_timescale", "15360"]
+        args += ["-r", str(FPS), *TIMESCALE_ARGS]
     args += [
         "-vf",
         f"drawtext=text='Segue para mais!':expansion=none:fontfile={FONT}:"
         "fontsize=64:fontcolor=white:borderw=3:bordercolor=black:"
         "x=(w-tw)/2:y=(h-th)/2,fade=t=in:st=0:d=0.4",
-        *NVENC, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-shortest", out,
+        *NVENC, "-c:a", "aac", "-b:a", "192k",
+        "-ar", str(AUDIO_RATE),
+        "-ac", str(AUDIO_CHANNELS), "-shortest", out,
     ]
     run(args)
 

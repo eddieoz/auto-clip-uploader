@@ -59,47 +59,108 @@ sys.modules["transcription_service"] = MagicMock()
 reelsfy = pytest.importorskip("reelsfy")
 
 
-class TestEndCardFrameRateDiagnosis:
-    """The measured root cause: the end card is the only piece without -r."""
+class TestEndCardFrameRateFix:
+    """C3: every assembly piece carries the same frame rate and timescale.
 
-    def test_end_card_command_pins_no_frame_rate(self, monkeypatch):
-        """DIAGNOSIS (pre-C3): no -r, so the lavfi color source is 25 fps.
+    The freeze came from one piece not declaring what the others inherited.
+    All three now pin both, from constants that cannot drift apart.
+    """
 
-        Every other concat piece inherits `-r 30` from generate_short. The
-        end card alone defaults, and that alone collapses the assembly.
-        """
+    def test_end_card_command_pins_the_shared_frame_rate(self, monkeypatch):
         monkeypatch.delenv("END_CARD_ENABLED", raising=False)
         monkeypatch.setenv("END_CARD_TEXT", "Subscribe")
 
         command = reelsfy.build_end_card_command()
 
-        assert " -r " not in f" {command} "
-        assert "-r 30" not in command
+        assert f"-r {reelsfy.ASSEMBLY_FPS}" in command
+        assert (
+            f"-video_track_timescale {reelsfy.ASSEMBLY_VIDEO_TIMESCALE}"
+            in command
+        )
 
-    def test_the_other_pieces_do_pin_the_frame_rate(self):
-        """The mismatch only exists because of the asymmetry.
+    def test_teaser_burn_pins_the_shared_timescale(self):
+        command = reelsfy.build_teaser_burn_command("hook text")
 
-        build_pipe_ffmpeg_command is the single-pass 9:16 crop that produces
-        both the teaser and the main clip, and it normalizes to 30 fps.
+        assert (
+            f"-video_track_timescale {reelsfy.ASSEMBLY_VIDEO_TIMESCALE}"
+            in command
+        )
+
+    def test_the_crop_pins_the_shared_frame_rate(self):
+        """generate_short's crop is where the 30 fps normalization lives.
+
+        This is not only an intermediate: with no overlays, generate_subtitle
+        stream-copies it straight into the published path, so its parameters
+        would otherwise reach the assembly verbatim.
         """
-        source = inspect.getsource(reelsfy.build_pipe_ffmpeg_command)
+        command = reelsfy.build_pipe_ffmpeg_command("in.mp4", "out.mp4", 60)
 
-        assert "-r 30" in source
+        assert f"-r {reelsfy.ASSEMBLY_FPS}" in command
+        assert (
+            f"-video_track_timescale {reelsfy.ASSEMBLY_VIDEO_TIMESCALE}"
+            in command
+        )
+        assert f"-ar {reelsfy.ASSEMBLY_AUDIO_RATE}" in command
 
-    def test_no_piece_pins_a_video_timescale(self):
-        """DIAGNOSIS (pre-C3): -video_track_timescale appears nowhere.
+    def test_every_burn_pins_the_shared_timescale(self):
+        """No assembly piece may be left to pick its own timescale.
 
-        This is why the end card lands on 1/12800 while everything else is
-        1/15360 — the encoder picks the timescale per input, and the concat
-        demuxer then rescales the mismatched piece.
+        Checked on the BUILT commands, so this fails when a pin is actually
+        removed rather than when the source is re-wrapped.
+        """
+        pin = f"-video_track_timescale {reelsfy.ASSEMBLY_VIDEO_TIMESCALE}"
+
+        assert pin in reelsfy.build_end_card_command()
+        assert pin in reelsfy.build_teaser_burn_command("hook")
+        assert pin in reelsfy.build_pipe_ffmpeg_command("i.mp4", "o.mp4", 60)
+
+    def test_the_legacy_merge_path_also_declares_the_shared_shape(self):
+        """The fallback chain is the one a reviewer almost missed.
+
+        When the single-pass pipe encoder fails, generate_short falls back to
+        a cv2 mp4v write plus this merge, and the result is the SAME
+        tmp/final-* file both burns read. So its parameters reach the concat
+        whenever the no-overlay `-c copy` rung is taken — it must pin the
+        frame rate, timescale, pixel format and audio rate like every other
+        piece, or the original freeze comes back on the fallback path only.
+        """
+        source = inspect.getsource(reelsfy.generate_short)
+
+        assert f"-r {{ASSEMBLY_FPS}}" in source
+        assert f"-video_track_timescale {{ASSEMBLY_VIDEO_TIMESCALE}}" in source
+        assert "-pix_fmt yuv420p" in source
+        assert f"-ar {{ASSEMBLY_AUDIO_RATE}}" in source
+        assert f"-ac {{ASSEMBLY_AUDIO_CHANNELS}}" in source
+
+    def test_teaser_burn_pins_the_frame_rate_too(self):
+        """A timescale alone is not enough: the teaser must not inherit a
+        60 fps input from the legacy crop path."""
+        command = reelsfy.build_teaser_burn_command("hook")
+
+        assert f"-r {reelsfy.ASSEMBLY_FPS}" in command
+
+    def test_shared_constants_are_defined_once(self):
+        """The B1 lesson applies here: one definition, shared, so a retune
+        cannot leave two pieces disagreeing again. Asserted on the VALUE,
+        never a literal, so this test does not become a second source of
+        truth for 30 and 15360.
         """
         source = (REELSFY_DIR / "reelsfy.py").read_text(encoding="utf-8")
 
-        assert "-video_track_timescale" not in source
+        for name in ("ASSEMBLY_FPS", "ASSEMBLY_VIDEO_TIMESCALE",
+                     "ASSEMBLY_AUDIO_RATE", "ASSEMBLY_AUDIO_CHANNELS"):
+            assert source.count(f"\n{name} = ") == 1, f"{name} defined twice"
+        # 15360 = 30 * 512, which is what NVENC picks for 30 fps; pin it so a
+        # change of ASSEMBLY_FPS cannot silently leave the timescale behind.
+        assert reelsfy.ASSEMBLY_VIDEO_TIMESCALE == reelsfy.ASSEMBLY_FPS * 512
 
 
-class TestConcatStrategyDiagnosis:
-    """`-c copy` across the pieces is what turns the mismatch silent."""
+class TestConcatStrategyUnchanged:
+    """C3 deliberately keeps the -c copy concat and the ladder.
+
+    The fix is in the pieces, not the concat. Re-encoding the whole clip per
+    publish would cost a full NVENC pass and put the boundaries mid-GOP.
+    """
 
     def test_primary_rung_is_stream_copy(self):
         command = reelsfy.build_teaser_concat_command("list.txt", "out.mp4")
@@ -121,31 +182,57 @@ class TestConcatStrategyDiagnosis:
         assert reelsfy.AUDIO_MASTERING_FILTER not in full
 
 
-class TestAudioParameterDiagnosis:
-    """The secondary hazard: mismatched AAC rates fail silently, not loudly."""
+class TestAudioParameterFix:
+    """C3: no piece may inherit its rate from the source.
 
-    def test_music_bed_rung_omits_the_sample_rate_pin(self):
-        """DIAGNOSIS (pre-C3): the music-bed rung is the one burn that does
-        not pin -ar, so its output carries the source's rate (44100 for a
-        typical capture) while the end card is 48000.
+    The music-bed rung was the one burn that omitted -ar, so its output was
+    44100 against the end card's 48000. `concat -c copy` does not fail on
+    that - it adopts the first stream's parameters and emits a container
+    longer than the sum of the pieces. A silent desync.
+    """
 
-        Measured consequence: `concat -c copy` does NOT fail. It adopts the
-        first stream's parameters for the whole file and emits a container
-        0.40 s longer than the sum of the pieces - a silent A/V desync that
-        no rung in the ladder ever sees, because nothing errored.
+    def test_music_bed_rung_pins_the_shared_audio_rate(self):
+        """The one burn that used to emit bare `-c:a aac -b:a 192k`.
+
+        The command is built inline, so the invariant is checked on the
+        source: the rung must interpolate the shared constants instead of
+        carrying a rate literal of its own. Written as a word-level check so
+        re-wrapping the f-string does not break a passing build.
         """
         source = inspect.getsource(reelsfy.generate_subtitle)
 
         assert "-c:a aac -b:a 192k" in source
-        # build_audio_filter_args (which does pin -ar 48000) is the other rung.
-        assert "-ar 48000" in reelsfy.build_audio_filter_args()
+        assert "ASSEMBLY_AUDIO_RATE" in source
+        assert "ASSEMBLY_AUDIO_CHANNELS" in source
+        # no rate literal anywhere in the rung that could drift from the
+        # shared constant
+        assert "-ar 48000" not in source
+        assert "-ar 44100" not in source
 
-    def test_end_card_audio_is_pinned(self):
-        """The end card was always correct on the audio side."""
+    def test_build_audio_filter_args_uses_the_shared_rate(self):
+        args = reelsfy.build_audio_filter_args()
+
+        assert f"-ar {reelsfy.ASSEMBLY_AUDIO_RATE}" in args
+        assert f"-ac {reelsfy.ASSEMBLY_AUDIO_CHANNELS}" in args
+
+    def test_end_card_audio_matches(self):
         command = reelsfy.build_end_card_command()
 
-        assert "-ar 48000" in command
-        assert "-ac 2" in command
+        assert f"-ar {reelsfy.ASSEMBLY_AUDIO_RATE}" in command
+        assert f"-ac {reelsfy.ASSEMBLY_AUDIO_CHANNELS}" in command
+
+    def test_mastering_is_still_applied_exactly_once(self):
+        """The invariant the whole design protects: the assembly must never
+        re-master, and the end card is silent-sourced so nothing may."""
+        assert reelsfy.AUDIO_MASTERING_FILTER not in reelsfy.build_end_card_command()
+        assert (
+            reelsfy.AUDIO_MASTERING_FILTER
+            not in reelsfy.build_teaser_concat_fallback_command("l", "o")
+        )
+        assert (
+            reelsfy.AUDIO_MASTERING_FILTER
+            not in reelsfy.build_teaser_concat_full_fallback_command("l", "o")
+        )
 
 
 class TestProbeToolExists:
@@ -161,10 +248,28 @@ class TestProbeToolExists:
         # It must be able to reproduce the bug, not just describe the fix.
         assert "--unpinned-end-card" in source
 
-    def test_probe_tool_pins_the_settings_it_measures(self):
-        """The probe drifts from the pipeline unless it tracks it, so the
-        frame rate it asserts is shared with the pipeline's own constant."""
-        source = PROBE_TOOL.read_text(encoding="utf-8")
+    def test_probe_tool_reads_the_pipelines_constants(self):
+        """The probe drifts from the pipeline unless it tracks it.
 
-        assert "FPS = 30" in source
-        assert "15360" in source
+        Asserted by running its extractor, not by grepping for a name: a
+        probe that hardcoded fps=25 would satisfy a substring check but fail
+        here, which is the point.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "probe_end_card_assembly", PROBE_TOOL
+        )
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+
+        assert probe.CONST["fps"] == reelsfy.ASSEMBLY_FPS
+        assert probe.CONST["timescale"] == reelsfy.ASSEMBLY_VIDEO_TIMESCALE
+        assert probe.CONST["audio_rate"] == reelsfy.ASSEMBLY_AUDIO_RATE
+        assert probe.CONST["audio_channels"] == reelsfy.ASSEMBLY_AUDIO_CHANNELS
+        assert probe.CONST["mastering"] == reelsfy.AUDIO_MASTERING_FILTER
+        # and it must pin the timescale on the pieces it compares, or a
+        # retune of that constant would still report "healthy"
+        assert probe.TIMESCALE_ARGS == [
+            "-video_track_timescale", str(reelsfy.ASSEMBLY_VIDEO_TIMESCALE)
+        ]

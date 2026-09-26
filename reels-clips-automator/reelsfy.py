@@ -1131,9 +1131,14 @@ def build_pipe_ffmpeg_command(sanitized_input, sanitized_output, input_fps):
 
     Rendered BGR frames arrive on stdin (`-f rawvideo`); the segment input
     supplies the audio via the second -i + -map 1:a. Video is encoded ONCE
-    with the existing NVENC settings and normalized to 30 fps; audio is
+    with the existing NVENC settings and normalized to ASSEMBLY_FPS; audio is
     re-encoded to AAC 192k in the same pass. No mp4v intermediate, no
-    separate merge step."""
+    separate merge step.
+
+    The frame rate and timescale are pinned rather than left to the encoder
+    because this file is not always an intermediate: when generate_subtitle
+    has no overlays it stream-copies it straight into the published path (C3),
+    so its parameters would otherwise reach the assembly verbatim."""
     return (
         "ffmpeg -y "
         f"-f rawvideo -pix_fmt bgr24 -s 1080x1920 -r {input_fps} -i pipe:0 "
@@ -1141,8 +1146,10 @@ def build_pipe_ffmpeg_command(sanitized_input, sanitized_output, input_fps):
         "-map 0:v -map 1:a "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k "
-        "-r 30 -pix_fmt yuv420p "
-        "-c:a aac -b:a 192k "
+        f"-r {ASSEMBLY_FPS} -pix_fmt yuv420p "
+        f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} "
+        f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
+        f"-ac {ASSEMBLY_AUDIO_CHANNELS} "
         f"tmp/{sanitized_output}"
     )
 
@@ -1921,10 +1928,31 @@ def generate_short(
         else:
             # Legacy encode chain (fallback / _pipe=False): extract audio
             # from the original video, then merge audio and processed video.
-            command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_input} -vn -c:a aac -b:a 192k tmp/output-audio.aac"
+            # C3: this rung is reached whenever the single-pass pipe encoder
+            # fails, and it produces the SAME tmp/final-* file the teaser burn
+            # and the main burn both read — so its parameters reach the concat
+            # whenever the no-overlay `-c copy` rung is taken. It must declare
+            # the shared assembly shape like every other piece: the cv2 mp4v
+            # writer runs at input_fps (often 60) with no pinned timescale and
+            # an unpinned pixel format, and the audio extraction kept the
+            # capture's 44100. Left alone, that is the original freeze, plus a
+            # silent 0.40 s desync, re-introduced on the fallback path only.
+            command = (
+                f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_input} -vn "
+                f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
+                f"-ac {ASSEMBLY_AUDIO_CHANNELS} tmp/output-audio.aac"
+            )
             subprocess.call(command, shell=True)
 
-            command = f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} -i tmp/output-audio.aac -c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -c:a copy tmp/final-{sanitized_output}"
+            command = (
+                f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} "
+                f"-i tmp/output-audio.aac "
+                f"-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 "
+                f"-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k "
+                f"-pix_fmt yuv420p -r {ASSEMBLY_FPS} "
+                f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} "
+                f"-c:a copy tmp/final-{sanitized_output}"
+            )
             subprocess.call(command, shell=True)
 
         # Save performance report if profiling is enabled
@@ -4410,6 +4438,25 @@ def __main__():
 # __main__()
 
 
+# Assembly contract (Story C3). Every piece that assemble_hook_teaser_final
+# concatenates — teaser, main, end card — must declare the SAME frame rate,
+# video timescale and audio shape, or the concat demuxer silently rescales
+# the odd one out. That is not hypothetical: the end card used to omit -r,
+# so its `color` lavfi source defaulted to 25 fps / 1-12800 while everything
+# else was 30 fps / 1-15360, and `concat -c copy` produced a valid-looking
+# file whose end card collapsed into 2.5 ms on the main clip's last frames.
+# Instagram's transcoder stalls there; desktop players show an invisible
+# flash. See the Theme C appendix in the EPIC.
+#
+# Defined ONCE and used by every encoder so a retune cannot leave two
+# pieces disagreeing again (the HOOK_DUPLICATE_GUARD_SECONDS lesson).
+ASSEMBLY_FPS = 30
+# 15360 = ASSEMBLY_FPS * 512, the timescale NVENC picks for 30 fps. Pinned
+# explicitly because leaving it to the encoder is what caused the bug.
+ASSEMBLY_VIDEO_TIMESCALE = 15360
+ASSEMBLY_AUDIO_RATE = 48000
+ASSEMBLY_AUDIO_CHANNELS = 2
+
 # Audio mastering for the final published file: loudness-normalize to the
 # streaming-platform target (-14 LUFS) then gentle compression. Applied ONLY
 # in generate_subtitle's final mux; earlier pipeline stages pass audio through
@@ -4422,11 +4469,15 @@ AUDIO_MASTERING_FILTER = (
 def build_audio_filter_args():
     """Shell fragment mastering the audio stream and re-encoding it to AAC.
 
-    -ar 48000 pins the output rate: loudnorm processes at 192k internally
-    and would otherwise leave the AAC rate unpredictable, so the end-card
-    concat rungs (and the -c:a copy rung) could fail on differing stream
-    parameters."""
-    return f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k -ar 48000'
+    The rate/channel pin is not only about loudnorm: it is what keeps every
+    assembly piece byte-compatible, so `concat -c copy` cannot silently
+    adopt one piece's parameters and desync the rest (measured: a 44100 main
+    against a 48000 end card yields a container 0.40 s longer than the sum of
+    the pieces, with no error anywhere)."""
+    return (
+        f'-af "{AUDIO_MASTERING_FILTER}" -c:a aac -b:a 192k '
+        f"-ar {ASSEMBLY_AUDIO_RATE} -ac {ASSEMBLY_AUDIO_CHANNELS}"
+    )
 
 
 # Polish features (Story 10 / P3.1-P3.3): mild visual grade on the main clip,
@@ -4531,9 +4582,10 @@ def build_end_card_command():
     outline, expansion=none so the CTA text renders verbatim) plus a
     0.4 s fade-in. Audio is a silent anullsrc (44.1k) encoded
     as AAC 48000 Hz stereo so both sides of the concat agree with the
-    mastering args' pinned -ar 48000. NVENC settings match
-    the other concat pieces, and the end card is silent-sourced so no
-    mastering filter ever touches it.
+    mastering args' pinned -ar. The lavfi color source is pinned to
+    ASSEMBLY_FPS and ASSEMBLY_VIDEO_TIMESCALE, matching the other concat
+    pieces (C3). The end card is silent-sourced so no mastering filter
+    ever touches it.
     """
     color = os.getenv('END_CARD_COLOR', END_CARD_DEFAULT_COLOR).strip()
     text = escape_filter_option(
@@ -4548,10 +4600,17 @@ def build_end_card_command():
         "ffmpeg -y -hwaccel cuda "
         f"-f lavfi -i color=c={color}:s=1080x1920:d={END_CARD_DURATION_SECONDS} "
         "-f lavfi -i anullsrc=r=44100:cl=stereo "
+        # C3: the `color` source defaults to 25 fps, and without this the
+        # concat demuxer collapses this piece into ~2.5 ms (the Instagram
+        # freeze). ASSEMBLY_FPS/ASSEMBLY_VIDEO_TIMESCALE are shared with the
+        # other two pieces so the three cannot drift apart.
+        f"-r {ASSEMBLY_FPS} "
         f"-vf \"{drawtext},fade=t=in:st=0:d={END_CARD_FADE_SECONDS}\" "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
-        "-c:a aac -b:a 192k -ar 48000 -ac 2 -shortest "
+        f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} "
+        f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
+        f"-ac {ASSEMBLY_AUDIO_CHANNELS} -shortest "
         f"tmp/{END_CARD_FILE}"
     )
 
@@ -4947,6 +5006,8 @@ def build_teaser_burn_command(hook_text):
         f"{build_audio_filter_args()} "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 "
         "-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
+        f"-r {ASSEMBLY_FPS} "
+        f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} "
         f"tmp/{HOOK_TEASER_OUTPUT_FILE}"
     )
 
@@ -5629,9 +5690,10 @@ def generate_subtitle(
             )
             video_codec = (
                 "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 "
-                "-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p"
+                "-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
+                f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE}"
                 if filter_parts
-                else "-c:v copy"
+                else "-c copy"
             )
             ffmpeg_command = (
                 f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '
@@ -5639,7 +5701,13 @@ def generate_subtitle(
                 f'-filter_complex "{filter_complex}" '
                 f'{video_map} -map "[aout2]" '
                 f"{video_codec} "
-                f'-c:a aac -b:a 192k "{output_path}"'
+                # C3: this rung used to emit bare `-c:a aac -b:a 192k`, so it
+                # kept the capture's 44100 rate while every other piece was
+                # 48000. `concat -c copy` does not fail on that — it adopts
+                # the first stream's parameters and emits a container longer
+                # than the sum of the pieces. Pin the shared shape here.
+                f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
+                f"-ac {ASSEMBLY_AUDIO_CHANNELS} \"{output_path}\""
             )
         elif filter_parts:
             filter_complex = ";".join(filter_parts)
@@ -5649,6 +5717,7 @@ def generate_subtitle(
                 f'-map "[{last_filter}]" -map 0:a '
                 f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
                 f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
+                f'-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} '
                 f'{build_audio_filter_args()} "{output_path}"'
             )
     else:

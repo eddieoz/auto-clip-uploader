@@ -253,13 +253,23 @@ Scenario: Root cause is identified and written down
 
 **Files:** `docs/tasks/EPIC-content-complete-engaging-clips.md` (findings appendix), `reels-clips-automator/tools/probe_end_card_assembly.py`, `tests/test_end_card_assembly.py`.
 
-### Story C3 — Fix the assembly so the end card survives Instagram (1 pt)
+### Story C3 — Fix the assembly so the end card survives Instagram (1 pt) ✅ DONE
 
-**Decided in C2's appendix** (laya-validated): strategy **(B)** — make every assembly piece byte-compatible in frame rate, video timescale and audio rate, and keep the existing `-c copy` concat. Measured at 0 outcome strength for the alternative and near-zero cost, versus a full re-encode pass per publish. The characterization assertions in `tests/test_end_card_assembly.py` are the ones this story inverts.
+Strategy **(B)**, decided in [C2's appendix](#theme-c-findings-c2) and validated with laya: make every assembly piece declare the **same** frame rate, video timescale and audio shape, and keep the existing `-c copy` concat. Chosen over a `filter_complex` re-encode because it costs nothing per publish, leaves the three-rung ladder intact, and puts IDRs at both boundaries instead of cutting them mid-GOP.
 
-Work left: pin `-r 30` / `-video_track_timescale 15360` on the end card, the same timescale on the teaser and main burns, and `-ar 48000 -ac 2` on the music-bed rung (the one burn that omits the audio pin — see the appendix's secondary hazard). Ladder fallbacks and the mastering invariant stay as they are.
+Four shared constants, defined once and interpolated by every encoder that can reach `assemble_hook_teaser_final` — `ASSEMBLY_FPS` (30), `ASSEMBLY_VIDEO_TIMESCALE` (15360 = 30 × 512), `ASSEMBLY_AUDIO_RATE` (48000), `ASSEMBLY_AUDIO_CHANNELS` (2). The timescale is pinned explicitly rather than left to NVENC, because leaving it to the encoder is what caused the bug. Applied to:
 
-**TDD (write first):** invert the characterization assertions in `tests/test_end_card_assembly.py`; keep `tests/test_polish.py`'s end-card and ladder tests green.
+- `build_end_card_command` — **the fix**: `-r` and the timescale it never had.
+- `build_teaser_burn_command` — timescale and `-r`.
+- `build_pipe_ffmpeg_command` — timescale, and `-ar`/`-ac` on audio. Not only an intermediate: with no overlays, `generate_subtitle` stream-copies it straight into the published path.
+- `generate_subtitle`'s two burn rungs — timescale; the music-bed rung also gained the `-ar`/`-ac` it was the only burn to omit.
+- **the legacy `generate_short` fallback merge** — found in review, and the one that would have made the fix a lie. When the single-pass pipe encoder fails, that path produces the *same* `tmp/final-*` file both burns read, via a cv2 mp4v writer running at `input_fps` (often 60) with no pinned timescale, no pixel format and an unpinned audio rate. Left alone it re-introduced the original freeze — plus the silent desync — on the fallback path only.
+
+Unchanged on purpose: the `-c copy` primary rung, the two fallback rungs, and the mastering invariant (the end card stays silent-sourced, so no rung can re-master). `build_teaser_cut_command` is correctly left alone — its output is an intermediate consumed by `generate_short`, never concatenated.
+
+Verified by mutation, not just by green: removing the end card's `-r` or the music-bed audio pin each fails exactly one test. The probe exits 0 on the fixed settings and still reports all four findings under `--unpinned-end-card`. Full-suite failures are unchanged from the pre-C3 baseline (82, all pre-existing whisper/voxtral/numba environment).
+
+**TDD (write first):** the characterization assertions in `tests/test_end_card_assembly.py` were inverted before any code changed — 9 of 13 went red, the 4 ladder/mastering ones stayed green because C3 does not touch them.
 
 
 
@@ -283,6 +293,17 @@ Scenario: Fixed assembly still degrades safely
 ### Story C4 — Re-enable decision (user-driven, 1 pt)
 
 After C3, the user A/B tests performance with and without the end card. If the fixed assembly survives Instagram and metrics don't regress, flip the default back to `true` (one-line change + test/doc updates). No code beyond the default flip.
+
+**Ready to run.** C3 is shipped and the reproduction tool is in place, so the A/B is now measurable rather than a guess:
+
+```bash
+# confirm the boundaries still hold locally before trusting an upload
+python3 reels-clips-automator/tools/probe_end_card_assembly.py   # must exit 0
+```
+
+Arm A is `END_CARD_ENABLED=true`; arm B is leaving it unset, which is still the shipped default.
+The probe only proves the assembly boundaries are sound — it cannot tell you whether Instagram's
+transcoder accepts the result. That leg is the upload, and only the user can run it.
 
 **BDD:**
 ```gherkin
@@ -325,7 +346,7 @@ Scenario: Epic closes green
 | B4 publish-level dedup guard ✅ | B | 1 | done (`9305f3f`, +`1e7e81c`, `0d79d55`) |
 | C1 disable end card ✅ | C | 1 | done (`4728e95`) |
 | C2 diagnose Instagram freeze ✅ | C | 1 | done |
-| C3 fix assembly | C | 1 | C2 — decided: matched encoder settings (B) |
+| C3 fix assembly ✅ | C | 1 | done — shared assembly constants on every piece |
 | C4 re-enable decision | C | 1 | C3, user |
 | D1 regression + docs | D | 1 | A1-A5, B1-B4, C3 |
 
@@ -355,9 +376,16 @@ Notes for whoever tunes this next:
   there is no corpus. They were chosen so the cheap direction is "don't drop a good teaser".
   They are the first knobs to revisit if teasers feel too eager or too shy.
 
-**Theme C is diagnosed.** C2 replaced the R7 hypothesis with a measured root cause: a
-missing `-r` on the end card, not SPS divergence. See the appendix at the bottom of this file for
-the ffprobe tables, the reproduction, the two strategies compared, and the laya validation.
+**Themes C1-C3 are shipped.** C2 replaced the R7 hypothesis with a measured root cause — a missing
+`-r` on the end card, not SPS divergence — and C3 fixed it by giving every assembly piece the same
+declared shape. What is left is C4, which needs a real A/B run on Instagram. See the appendix at
+the bottom of this file for the ffprobe tables, the reproduction command, the two strategies
+compared, and the laya validation.
+
+One caution for whoever re-tunes: `ASSEMBLY_VIDEO_TIMESCALE` must stay `ASSEMBLY_FPS * 512`. It
+happens to equal 15360 today because that is what NVENC picks for 30 fps, but nothing in ffmpeg
+guarantees it — which is exactly why it is now an explicit constant rather than a default. A test
+pins the relationship.
 
 ### Deferred follow-ups (Theme B, non-blocking)
 
