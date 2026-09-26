@@ -15,12 +15,18 @@
 | # | Finding | Evidence |
 |---|---------|----------|
 | R1 | `monitor.py` invokes reelsfy **without** `--min-duration/--max-duration`, so the CLI defaults `min=1.0 / max=120.0` flow into `generate_viral`. The LLM may legally return a 5-second clip. | `monitor.py:224`, `reelsfy.py:3411-3421` |
-| R2 | The LIVE prompt **hard-codes "maximum of 59 seconds"**, ignoring the passed `max_duration`. Even when the capture holds a longer topic, the LLM is told to cap at 59 s. | `reelsfy.py:3049,3051` |
-| R3 | `generate_viral`'s own signature defaults (35/59) disagree with both the CLI defaults and the prompt. | `reelsfy.py:2719-2720` |
+| R2 | The LIVE prompt **hard-codes "maximum of 59 seconds"**, ignoring the passed `max_duration`. The 59 s value itself is the ratified product cap (see decisions), but it must come from the parameter, not a literal. | `reelsfy.py:3049,3051` |
+| R3 | `generate_viral`'s own signature defaults (35/59) disagree with the CLI defaults (1.0/120.0). | `reelsfy.py:2719-2720` |
 | R4 | The boundary LLM pass only ever **trims** the window start (previous-topic tail). It can never *extend* the start earlier to recover topic context that the heuristic window cut off. | `trim_window_to_topic_start`, `resolve_topic_start_cue` |
-| R5 | The OBS replay buffer is now **60 s** (was 90 s) — the source itself bounds how much topic context exists. Operational, not code. | user report |
+| R5 | ~~The OBS replay buffer is now 60 s — the source itself bounds how much topic context exists.~~ **RESOLVED 2026-09-26:** user raised the OBS clip duration to 90 s. | user report |
 | R6 | `select_hook_candidate` picks the **first** candidate inside the window and the prompt welds it as MANDATORY with "EXACTLY these values". Because the window starts at the topic start, the first sentence is usually the "winner" → teaser duplicates the clip opening. | `reelsfy.py:3007-3036`, `select_hook_candidate` |
 | R7 | The end-card assembly stream-copies three **differently encoded** pieces (teaser re-encode + main burn + lavfi/NVENC end card) with `-c copy`; local players tolerate the discontinuity, Instagram's transcoder freezes at the last main frame and never renders the end card. | `assemble_hook_teaser_final`, `build_teaser_concat_command`, `build_end_card_command` |
+
+## Ratified decisions (user, 2026-09-26)
+
+1. **OBS replay buffer = 90 s** (raised from 60 s by the user). The capture now holds enough topic context.
+2. **Maximum clip duration is a hard 59 s** — a product requirement driven by the YouTube video limit. Do NOT raise it; the earlier idea of allowing 120 s is dropped.
+3. Therefore the "too short" problem is **not** the cap: it is the effective 1 s minimum reaching the LLM via the CLI defaults (R1) and the LLM choosing a sub-window of the topic. The fix is to unify all bounds at min 35 s / max 59 s and let the boundary pass extend the start earlier within the 90 s capture (A3/A4), clamped so the clip never exceeds 59 s.
 
 ## Ratified invariants (must hold in every story)
 
@@ -36,30 +42,30 @@
 
 ### Story A1 — Unify duration bounds across CLI, signature, and prompt (1 pt)
 
-The LLM-facing prompt must derive its bounds from the actual `min_duration`/`max_duration` values instead of the hard-coded "59 seconds", and the three layers (CLI defaults, `generate_viral` signature, prompt) must agree.
+All three layers must agree on the ratified bounds (**min 35 s, max 59 s** — see decisions: 59 s is the YouTube-driven hard cap, not to be raised), and the LLM-facing prompt must derive its bounds from the actual `min_duration`/`max_duration` parameters instead of the hard-coded "59 seconds" literal.
 
 **TDD (write first):**
-- `tests/test_duration_bounds.py`: prompt built with `min_duration=30, max_duration=120` contains "minimum of 30 seconds" and "maximum of 120 seconds" and never the literal "maximum of 59 seconds"; default layers agree (`--max-duration` default == `generate_viral` default == prompt default rendering).
+- `tests/test_duration_bounds.py`: the reelsfy source contains no `"maximum of 59 seconds"` literal; the prompt template interpolates `{max_duration}`; `generate_viral` signature defaults are 35.0/59.0; the CLI `--min-duration`/`--max-duration` defaults are 35.0/59.0 (what monitor.py's no-flag invocation lands on).
 
 **BDD:**
 ```gherkin
 Scenario: Prompt reflects configured bounds
-  Given generate_viral is called with min_duration=30 and max_duration=120
+  Given generate_viral is called with min_duration=35 and max_duration=59
   When the LIVE prompt is built
-  Then the prompt says "minimum of 30 seconds and maximum of 120 seconds"
-  And the string "maximum of 59 seconds" does not appear
+  Then the prompt says "minimum of 35 seconds and maximum of 59 seconds"
+  And the literal "maximum of 59 seconds" appears nowhere in the source
 
-Scenario: Pipeline defaults are clip-sane
+Scenario: Pipeline defaults are clip-sane and respect the YouTube cap
   Given reelsfy is run the way monitor.py runs it (no duration flags)
-  Then the effective minimum duration is at least 30 seconds
-  And the effective maximum duration is at least 120 seconds
+  Then the effective minimum duration is 35 seconds
+  And the effective maximum duration is exactly 59 seconds
 ```
 
-**Files:** `reelsfy.py` (prompt f-string ~3049-3051, CLI defaults ~3411-3421, signature ~2719).
+**Files:** `reelsfy.py` (prompt f-string ~3049-3051, CLI defaults ~3411-3421), `tests/test_duration_bounds.py`.
 
-### Story A2 — Document the OBS replay-buffer ceiling (1 pt)
+### Story A2 — Document the OBS replay-buffer setup (1 pt)
 
-R5 is operational: no code change can recover context that was never captured.
+R5 is resolved operationally (buffer raised to 90 s), but the setup must be written down so future changes don't silently re-break it.
 
 **TDD:** none (documentation story) — verify by doc presence.
 
@@ -67,11 +73,11 @@ R5 is operational: no code change can recover context that was never captured.
 ```gherkin
 Scenario: Operator guidance exists
   Given a user reads the README video-processing section
-  Then they find the recommended replay-buffer length (120-180 s)
+  Then they find the recommended replay-buffer length (90 s) and why
   And an explanation that capture length bounds topic completeness
 ```
 
-**Files:** `README.md`, `AGENTS.md` (one bullet), `docs/tasks/` note. Optional: log a warning in reelsfy when capture duration < min_duration + 10 s ("capture shorter than the minimum clip window — check the OBS replay buffer").
+**Files:** `README.md`, `AGENTS.md` (one bullet). Optional: log a warning in reelsfy when capture duration < min_duration + 10 s ("capture shorter than the minimum clip window — check the OBS replay buffer").
 
 ### Story A3 — Boundary LLM pass reports topic completeness (1 pt)
 
@@ -93,10 +99,10 @@ Scenario: LLM says the topic starts earlier than the heuristic cue
 
 ### Story A4 — Apply start extension to the resolved window (1 pt)
 
-`trim_window_to_topic_start` (or a sibling) may **move the window start earlier** to `earlier_start_cue` when the parsed result says the topic is incomplete — clamped to cue 0 and to `max_duration` reach. END stays anchored (recency invariant).
+`trim_window_to_topic_start` (or a sibling) may **move the window start earlier** to `earlier_start_cue` when the parsed result says the topic is incomplete — clamped to cue 0 and to the 59 s max reach (the resulting window duration must never exceed `max_duration`; within the 90 s capture the END stays anchored, so extending the start is bounded by the cap).
 
 **TDD (write first):**
-- `tests/test_boundary_snap.py` additions: extension moves start earlier and recomputes duration; never extends beyond capture start; never changes end; when `topic_complete=true` or no earlier cue, window is byte-identical to today.
+- `tests/test_boundary_snap.py` additions: extension moves start earlier and recomputes duration; never extends beyond capture start; never changes end; never produces a window longer than `max_duration` (59 s) — extension is clamped by the cap; when `topic_complete=true` or no earlier cue, window is byte-identical to today.
 
 **BDD:**
 ```gherkin
@@ -104,6 +110,7 @@ Scenario: Incomplete topic gets more context
   Given the heuristic window starts at cue 20 and the LLM reports earlier_start_cue=12
   When the resolved window is built
   Then the window starts at cue 12 and still ends at the capture end
+  And the window duration stays within the 59 s cap
 
 Scenario: Complete topic is untouched
   Given topic_complete=true
