@@ -128,7 +128,7 @@ Scenario: Complete topic is untouched
 
 ### Story A5 — Completeness observability ✅ DONE (1 pt)
 
-Shipped as commit `4c892d3`. After selection, `build_selection_summary(...)` — a **pure** function returning a dict — is printed as one strictly-parseable `SELECTION_SUMMARY {…}` line, so the run log can be scraped to tune A1-A4. It changes no behavior. At least one line is emitted per run, including when the LLM returns no segments.
+Shipped as commit `e79045f`. After selection, `build_selection_summary(...)` — a **pure** function returning a dict — is printed as one strictly-parseable `SELECTION_SUMMARY {…}` line, so the run log can be scraped to tune A1-A4. It changes no behavior. An empty selection still emits one line, so every run produces at least one. Note the line count is **per validated segment**, not per run: an LLM reply with N segments emits N lines sharing `capture_span`, `resolved_window` and `topic_complete`, differing only in `chosen_duration` — a scraper keying by run must not assume one line.
 
 **TDD (write first):** unit test on the log builder (pure function returning the dict), plus wiring tests through the existing `_run_generate_viral` harness.
 
@@ -310,7 +310,7 @@ Scenario: Epic closes green
 | A2 OBS buffer doc + warn ✅ | A | 1 | done (`18c9600`) |
 | A3 completeness in boundary pass ✅ | A | 1 | done (`e3acda0`) |
 | A4 apply start extension ✅ | A | 1 | done (`13aa524`) |
-| A5 completeness observability ✅ | A | 1 | done (`4c892d3`) |
+| A5 completeness observability ✅ | A | 1 | done (`e79045f`) |
 | B1 anti-duplication rule | B | 1 | — |
 | B2 prefer mid-window hooks | B | 1 | B1 |
 | B3 prompt steering | B | 1 | — |
