@@ -3957,12 +3957,13 @@ def build_music_bed_audio_filters():
 
 
 def resolve_end_card_enabled():
-    """P3.2 gate: END_CARD_ENABLED defaults to "true"; only the literal
-    "false" (any case) disables the end card."""
-    enabled_raw = os.getenv('END_CARD_ENABLED', 'true').lower().strip()
-    enabled = enabled_raw != 'false'
+    """P3.2 gate: END_CARD_ENABLED defaults to "false" (the concat assembly
+    freezes before the end card on Instagram); only the literal "true"
+    (any case) enables it."""
+    enabled_raw = os.getenv('END_CARD_ENABLED', 'false').lower().strip()
+    enabled = enabled_raw == 'true'
     if not enabled:
-        print("End card disabled (END_CARD_ENABLED=false); publishing without it")
+        print("End card disabled (END_CARD_ENABLED!=true); publishing without it")
     return enabled
 
 

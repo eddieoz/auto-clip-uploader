@@ -457,20 +457,21 @@ class TestAssembleHookTeaserFinalEndCard:
 
 
 class TestPublishSegmentEndCard:
-    """P3.2: end card default ON; disabled path is byte-identical legacy."""
+    """P3.2: end card is opt-in (END_CARD_ENABLED=true); the default-off
+    path is byte-identical legacy."""
 
     def _run(
         self,
         monkeypatch,
         hook=None,
-        end_card_enabled=True,
+        end_card_enabled=False,
         end_card_path="tmp/end-card.mp4",
         assemble_return=True,
         generate_subtitle_side_effect=None,
     ):
         _clear_polish_env(monkeypatch)
-        if not end_card_enabled:
-            monkeypatch.setenv("END_CARD_ENABLED", "false")
+        if end_card_enabled:
+            monkeypatch.setenv("END_CARD_ENABLED", "true")
 
         generate_subtitle_mock = MagicMock(
             side_effect=generate_subtitle_side_effect or [True, True]
@@ -504,7 +505,7 @@ class TestPublishSegmentEndCard:
 
     def test_end_card_enabled_no_hook_assembles_main_plus_end_card(self, monkeypatch):
         generate_subtitle_mock, assemble_mock, end_card_mock = self._run(
-            monkeypatch, hook=None
+            monkeypatch, hook=None, end_card_enabled=True
         )
 
         end_card_mock.assert_called_once()
@@ -546,7 +547,7 @@ class TestPublishSegmentEndCard:
 
     def test_end_card_build_failure_falls_back_to_direct_publish(self, monkeypatch):
         generate_subtitle_mock, assemble_mock, end_card_mock = self._run(
-            monkeypatch, hook=None, end_card_path=None
+            monkeypatch, hook=None, end_card_enabled=True, end_card_path=None
         )
 
         end_card_mock.assert_called_once()
@@ -558,7 +559,7 @@ class TestPublishSegmentEndCard:
 
     def test_assembly_failure_still_publishes_directly(self, monkeypatch):
         generate_subtitle_mock, assemble_mock, _ = self._run(
-            monkeypatch, hook=None, assemble_return=False
+            monkeypatch, hook=None, end_card_enabled=True, assemble_return=False
         )
 
         assert assemble_mock.called
