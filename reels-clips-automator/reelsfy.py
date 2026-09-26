@@ -2,6 +2,7 @@ import random
 import sys
 import textwrap
 import time
+import math
 import numpy as np
 import yt_dlp
 import cv2
@@ -2782,6 +2783,271 @@ def validate_segment_against_window(
         return segment, [f"S4 validation failed ({e}); leaving segment unchanged"]
 
 
+def _first_sentence_ends_complete(text):
+    """True when `text` opens with a sentence that ends in . / ! / ?.
+
+    The ratified rule is literally "the first sentence ends with a
+    terminator", and the scan is flat: a terminator anywhere in the text ends
+    the first sentence, so "One. Two." opens with a finished sentence even
+    though it goes on.
+
+    KNOWN BIAS, deliberately not "fixed" (the rule was ratified as-is; these
+    are false positives that run SYSTEMATICALLY toward `complete`, and this
+    fact is the tuning signal for A1-A4):
+
+      * decimals — "the matrix is 3.14 wide and it keeps going" is reported
+        complete. Render/settings screencasts mention numbers constantly, so
+        this is the common case, not an edge case.
+      * abbreviations — "e.g." reads as a terminator.
+      * ellipses — "the pipeline is slow... and then it dropped" is reported
+        complete.
+
+    Tests in tests/test_selection_summary.py pin these; if one flips, the rule
+    changed on purpose, not by accident.
+    """
+    return any(char in '.!?' for char in text)
+
+
+def _cue_opens_new_sentence(cue):
+    """True when `cue`'s text visibly starts a new sentence.
+
+    Used as the second branch of the first-caption heuristic: Whisper cues
+    frequently carry no terminal punctuation, so a following cue that opens
+    with a capital is evidence the previous sentence ended at the cue
+    boundary.
+
+    Only a capital letter counts. Quotes and mid-sentence continuation marks
+    (`,)]}` and the dashes) are NOT new-sentence openers: a cue beginning
+    ", which is why the render stalled" continues the previous sentence, and
+    treating it as a fresh one claims a sentence finished when it did not.
+    """
+    if not isinstance(cue, dict):
+        return False
+    text = str(cue.get('text') or '').lstrip()
+    if not text:
+        return False
+    first = text[0]
+    return first.isalpha() and first.isupper()
+
+
+def build_selection_summary(
+    segments, resolved_window, chosen_segment, capture_span, topic_complete
+):
+    """A5: the five completeness facts about the chosen clip (pure).
+
+    Returns a dict with exactly:
+
+      capture_span                     float seconds, or None when unknown
+      resolved_window                  {"start", "end"} SRT strings, or None
+                                       (None on the fallback path, where no
+                                       window was resolved)
+      chosen_duration                  float seconds, or None
+      topic_complete                   the boundary LLM's own verdict, passed
+                                       through verbatim (True / False / None)
+      first_caption_sentence_complete  True / False / None
+
+    `segments` is the transcript cue list in either dual shape (floats under
+    start_time/end_time with SRT strings under start_time_srt/end_time_srt, or
+    the SRT-fallback shape with strings under start_time/end_time and bare
+    floats under start/end); `_cue_bounds` absorbs both.
+
+    Cues are selected by OVERLAP, not full containment, with the resolved
+    window: `snap_window_to_boundaries` can land the window start mid-cue, and
+    the cue that OWNS the window start begins before the window does — a
+    containment filter would drop exactly the cue whose first sentence the
+    check is about.
+
+    The first-caption verdict is the simple heuristic: the first in-window
+    cue's first sentence is complete when it ends in . / ! / ?, or when the
+    following cue's text opens a new sentence. No auxiliary LLM call, no
+    capitalization or pause heuristics. With no window, no overlapping cue,
+    or no text there is nothing to judge and the fact is reported as None
+    rather than guessed.
+
+    `chosen_duration` is recomputed from the chosen segment's times, which are
+    always the post-validation ones. `validate_segment_against_window` only
+    sets `duration` when it CORRECTS a segment, so an uncorrected one may
+    carry whatever the LLM put there (or none at all); the segment's own
+    `duration` is used only as a last resort.
+
+    Read `chosen_duration` as the PRE-CUT duration: the length of the window
+    the cutter starts from. It is NOT the length of the published file, and
+    the two routinely differ in both directions. Cutting happens after this
+    summary is built — jump cuts (JUMP_CUTS_ENABLED, on by default) remove
+    pause material of 0.6 s or more, so a screencast with pauses publishes
+    SHORTER than `chosen_duration`, and `generate_segments` pads any sub-30 s
+    segment up to 30 s, so a very short fallback-path segment publishes
+    LONGER. There is deliberately no `published_duration` companion field
+    (the story is scoped to these five facts): treat this one as the cutter's
+    input, not a measurement of its output.
+
+    `first_caption_sentence_complete` is judged at the RESOLVED WINDOW's
+    start, not at the chosen segment's start. The LLM's chosen segment may
+    begin anywhere inside that window, so when it starts later than the
+    window does, this fact describes a sentence the published clip does not
+    begin with. The two fields sit side by side in one JSON object but are
+    NOT both attributes of the same clip: `chosen_duration` describes the
+    chosen segment, this one describes the window. Neither the name nor the
+    window was changed; this note is the honest account of what is computed.
+
+    Pure: no I/O, no printing, no globals mutation. Never raises — any
+    missing or unparseable input degrades that one field to None and the rest
+    of the summary still emits. This is a diagnostics path; a partial line
+    is far more useful than a crash.
+    """
+    try:
+        return {
+            "capture_span": _summary_field(
+                lambda: _coerce_seconds(capture_span)
+            ),
+            "resolved_window": _summary_field(
+                lambda: _summary_window(resolved_window)
+            ),
+            "chosen_duration": _summary_field(
+                lambda: _summary_chosen_duration(chosen_segment)
+            ),
+            "topic_complete": topic_complete,
+            "first_caption_sentence_complete": _summary_field(
+                lambda: _summary_first_caption_complete(segments, resolved_window)
+            ),
+        }
+    except Exception:
+        # Belt and braces: each fact above is already computed behind
+        # _summary_field, so this is unreachable in practice — but a logging
+        # path must never be the thing that breaks a run.
+        return {
+            "capture_span": None,
+            "resolved_window": None,
+            "chosen_duration": None,
+            "topic_complete": topic_complete,
+            "first_caption_sentence_complete": None,
+        }
+
+
+def _summary_field(compute):
+    """One summary fact, isolated: any exception degrades it to None alone so
+    the other four still emit. The never-raises contract is per-fact, not
+    all-or-nothing."""
+    try:
+        return compute()
+    except Exception:
+        return None
+
+
+def _coerce_seconds(value):
+    """Float seconds for a FINITE numeric value, else None.
+
+    NaN / +inf / -inf degrade to None rather than being carried through: the
+    summary line is advertised as one strictly-parseable JSON object, and
+    `json.dumps` writes a bare NaN / Infinity, which jq and JSON.parse both
+    reject. It is reachable — `_srt_like_to_seconds("nan")` returns nan and
+    `capture_span` is a difference of two of its results. A degraded field is
+    honest; a line no parser can read is not.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    return seconds if math.isfinite(seconds) else None
+
+
+def _summary_window(resolved_window):
+    """{"start", "end"} of a usable resolved window, or None."""
+    try:
+        if not isinstance(resolved_window, dict):
+            return None
+        start = resolved_window.get("start_time")
+        end = resolved_window.get("end_time")
+        start_seconds = _srt_like_to_seconds(start)
+        end_seconds = _srt_like_to_seconds(end)
+        if start_seconds is None or end_seconds is None:
+            return None
+        # A non-finite bound ("inf" parses as a float) is not a usable window;
+        # report the fact as unknown rather than echoing a nonsense bound.
+        if not (math.isfinite(start_seconds) and math.isfinite(end_seconds)):
+            return None
+        return {"start": start, "end": end}
+    except Exception:
+        return None
+
+
+def _summary_chosen_duration(chosen_segment):
+    """Duration of the chosen (post-validation) segment in seconds, or None."""
+    try:
+        if not isinstance(chosen_segment, dict):
+            return None
+        start = _srt_like_to_seconds(chosen_segment.get("start_time"))
+        end = _srt_like_to_seconds(chosen_segment.get("end_time"))
+        if start is not None and end is not None:
+            duration = end - start
+        else:
+            duration = _coerce_seconds(chosen_segment.get("duration"))
+        # Either operand can be non-finite (see _coerce_seconds), so the
+        # difference can be too.
+        if duration is None or not math.isfinite(duration):
+            return None
+        return duration
+    except Exception:
+        return None
+
+
+def _summary_in_window_cues(segments, window_start, window_end):
+    """Cues OVERLAPPING [window_start, window_end], unparseable ones skipped.
+
+    Overlap, not containment: a cue that begins before the window start and
+    runs into it owns that start, and its text is the first thing the clip
+    shows.
+    """
+    cues = []
+    for cue in segments or []:
+        start, end = _cue_bounds(cue)
+        if start is None or end is None:
+            continue
+        if end > window_start and start < window_end:
+            cues.append(cue)
+    return cues
+
+
+def _summary_first_caption_complete(segments, resolved_window):
+    """True/False/None: is the first in-window cue's first sentence complete.
+
+    Judged at the RESOLVED WINDOW's start, deliberately: the chosen segment
+    is chosen by the LLM and may start anywhere inside that window, so
+    anchoring this to the segment would make the answer depend on a segment
+    the caller may not even have. The consequence is stated rather than
+    hidden — when the chosen segment starts later than the window, this
+    describes a sentence the published clip does not begin with.
+    """
+    try:
+        if not isinstance(segments, list) or not segments:
+            return None
+        if not isinstance(resolved_window, dict):
+            # No window -> no defensible in-window cue list; report unknown.
+            return None
+        window_start = _srt_like_to_seconds(resolved_window.get("start_time"))
+        window_end = _srt_like_to_seconds(resolved_window.get("end_time"))
+        if window_start is None or window_end is None or window_end <= window_start:
+            return None
+
+        cues = _summary_in_window_cues(segments, window_start, window_end)
+        if not cues:
+            return None
+
+        first = cues[0]
+        if not isinstance(first, dict):
+            return None
+        text = str(first.get("text") or "").strip()
+        if not text:
+            return None
+
+        if _first_sentence_ends_complete(text):
+            return True
+        if len(cues) > 1 and _cue_opens_new_sentence(cues[1]):
+            return True
+        return False
+    except Exception:
+        return None
+
+
 def refine_window_start_with_pause(
     window, audio_path, min_start_srt=None, neighborhood=1.5, max_duration=None
 ):
@@ -2947,6 +3213,9 @@ def generate_viral(
     # Capture-length guard: the OBS replay buffer bounds how much topic context
     # exists. If the capture is shorter than the minimum clip window plus margin,
     # the clip will feel truncated — raise the OBS replay buffer (90 s default).
+    # Seeded to None so the A5 selection summary can report it even when the
+    # guard below does not bind it (empty or unparseable cue list).
+    capture_span = None
     if segments:
         capture_start = _segment_start_seconds(segments[0])
         capture_end = _segment_end_seconds(segments[-1])
@@ -2965,6 +3234,9 @@ def generate_viral(
     title_language = "Portuguese"
     
     # If we have topic analysis results, use the optimized approach
+    # Seeded to None so the A5 selection summary can report the boundary LLM's
+    # verdict even on the fallback path, where no verdict exists.
+    topic_complete = None
     if 'topic_analysis' in locals() and 'error' not in topic_analysis:
         print("\n==== Using Topic-Focused Content Generation ====")
         
@@ -2981,8 +3253,9 @@ def generate_viral(
         # earlier cue where it actually begins. That cue extends the window
         # start backwards so the clip carries the full topic context; the end
         # stays anchored and the extension is bounded by `max_duration`. The
-        # completeness verdict itself is bound to `topic_complete` and read by
-        # nobody yet: A5 logs it for completeness observability.
+        # completeness verdict itself is bound to `topic_complete` and is read
+        # by the A5 selection summary, which logs it verbatim as
+        # SELECTION_SUMMARY.topic_complete.
         # S5: it also proposes hook candidates inside the final topic;
         # selection against the snapped window happens below.
         cue_index, topic_complete, earlier_start_cue, hook_candidates = (
@@ -3019,6 +3292,15 @@ def generate_viral(
         # would let the snapper drag the start forward again and silently
         # undo the extension.
         min_start_srt = None
+        # Latent seam, deliberately not coded around: this picks the owner by
+        # `earlier_start_cue is not None`, not by whether extend_window_to_
+        # earlier_topic_start actually applied. Were the extension ever to
+        # decline on an unparseable cue timestamp, _segment_start_srt would
+        # yield None and the snap floor would degrade to None — LOOSER than
+        # the pre-A4 floor, which came from the trimmed cue's timestamp.
+        # Currently unreachable: resolve_topic_start_cue only returns an
+        # earlier_start_cue that is a valid int strictly below a non-None
+        # cue_index, so the extension does apply whenever this branch is taken.
         start_owner_cue = earlier_start_cue if earlier_start_cue is not None else cue_index
         if (
             isinstance(start_owner_cue, int)
@@ -3341,6 +3623,36 @@ Return ONLY the JSON object, without any markdown formatting or code block marke
                 print(note)
             validated_segments.append(returned_segment)
         viral_json["segments"] = validated_segments
+
+        # A5: one structured line per chosen segment reporting the five
+        # completeness facts (capture span, resolved window, chosen duration,
+        # the boundary LLM's topic_complete verdict, and whether the first
+        # caption sentence is grammatically complete). This is the feedback
+        # signal for tuning A1-A4 — it changes no behavior, so the builder is
+        # pure and the print is wrapped: diagnostics must never break a run.
+        # An empty selection still gets ONE line (built with a None chosen
+        # segment, so chosen_duration is null): a run that selected nothing is
+        # exactly the run worth reading, and it used to log nothing at all.
+        # ONE LINE PER VALIDATED SEGMENT, not one per run: an LLM reply with
+        # N segments emits N lines that share capture_span, resolved_window
+        # and topic_complete and differ only in chosen_duration. A scraper
+        # keying these lines by run must not assume a single line per run.
+        for validated_segment in validated_segments or [None]:
+            try:
+                summary = build_selection_summary(
+                    segments,
+                    resolved_window,
+                    validated_segment,
+                    capture_span,
+                    topic_complete,
+                )
+            except Exception as e:
+                # Deliberately NOT prefixed with SELECTION_SUMMARY: that marker
+                # means "one parseable JSON object", so a scraper never sees a
+                # partial line.
+                print(f"⚠️ Selection summary unavailable (summary builder failed: {e})")
+                continue
+            print("SELECTION_SUMMARY " + json.dumps(summary))
 
     # Merge metadata and viral segments
     # Merge metadata and viral segments

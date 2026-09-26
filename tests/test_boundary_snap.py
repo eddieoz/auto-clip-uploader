@@ -449,12 +449,14 @@ def _run_generate_viral(
     analyzer_cls=None,
     resolve_return=(2, None, None, []),
     extra_patches=(),
+    final_reply=None,
 ):
     """Run generate_viral with the LLM and heavy dependencies mocked.
 
     ``resolve_return`` is what the mocked ``resolve_topic_start_cue`` hands
     back, ``extra_patches`` lets a test spy on the window helpers while the
-    real implementations still run.
+    real implementations still run, and ``final_reply`` overrides the mocked
+    LLM reply (the default is the one-segment reply the other tests expect).
 
     Returns (result, captured_messages, resolve_topic_start_cue mock).
     """
@@ -463,7 +465,7 @@ def _run_generate_viral(
     fake_topic_analyzer = MagicMock(return_value=analyzer_instance)
 
     metadata = {"content": json.dumps({"title": "T", "description": "D"})}
-    final_reply = json.dumps(
+    final_reply = final_reply or json.dumps(
         {
             "segments": [
                 {
