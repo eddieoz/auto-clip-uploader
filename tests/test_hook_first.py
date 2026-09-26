@@ -11,7 +11,7 @@ entire capture) and becomes a FIXED part of the answer. This suite covers:
    the hook candidates are parsed independently: a missing/invalid
    candidates list never invalidates the cue number (and vice versa); the
    legacy integer-only replies still parse; garbage degrades to
-   ``(None, [])`` without raising.
+   ``(None, None, None, [])`` without raising.
 2. ``select_hook_candidate`` — pure selection of the FIRST hook candidate
    whose span (cue_start → cue_end mapped to seconds over the segments
    list) falls inside the snapped resolved window and spans 1.5-6 s;
@@ -169,8 +169,8 @@ def _run_generate_viral(
     """Run generate_viral with the LLM and heavy dependencies mocked.
 
     The boundary pass is stubbed with `resolve_return` (the new
-    (cue_index, hook_candidates) shape). Returns (result, captured
-    messages, resolve_topic_start_cue mock).
+    (cue_index, earlier_start_cue, hook_candidates) shape). Returns
+    (result, captured messages, resolve_topic_start_cue mock).
     """
     analyzer_instance = MagicMock()
     analyzer_instance.analyze_transcript.return_value = topic_analysis
@@ -248,6 +248,8 @@ class TestParseBoundaryReply:
         result = _resolve_with_reply(monkeypatch, reply)
         assert result == (
             2,
+            None,
+            None,
             [_candidate(3, 3, "Hook one"), _candidate(3, 4, "Hook two")],
         )
 
@@ -255,14 +257,14 @@ class TestParseBoundaryReply:
         result = _resolve_with_reply(
             monkeypatch, json.dumps({"cue_number": 3})
         )
-        assert result == (3, [])
+        assert result == (3, None, None, [])
 
     def test_candidates_only_reply_yields_none_cue(self, monkeypatch):
         reply = json.dumps(
             {"hook_candidates": [_candidate(3, 3, "The hook")]}
         )
         result = _resolve_with_reply(monkeypatch, reply)
-        assert result == (None, [_candidate(3, 3, "The hook")])
+        assert result == (None, None, None, [_candidate(3, 3, "The hook")])
 
     def test_invalid_cue_does_not_invalidate_candidates(self, monkeypatch):
         reply = json.dumps(
@@ -272,14 +274,14 @@ class TestParseBoundaryReply:
             }
         )
         result = _resolve_with_reply(monkeypatch, reply)
-        assert result == (None, [_candidate(3, 3, "The hook")])
+        assert result == (None, None, None, [_candidate(3, 3, "The hook")])
 
     def test_invalid_candidates_do_not_invalidate_cue(self, monkeypatch):
         reply = json.dumps(
             {"cue_number": 2, "hook_candidates": "not a list"}
         )
         result = _resolve_with_reply(monkeypatch, reply)
-        assert result == (2, [])
+        assert result == (2, None, None, [])
 
     def test_malformed_candidate_entries_are_skipped(self, monkeypatch):
         reply = json.dumps(
@@ -296,13 +298,15 @@ class TestParseBoundaryReply:
             }
         )
         result = _resolve_with_reply(monkeypatch, reply)
-        cue_index, candidates = result
+        cue_index, topic_complete, earlier_start_cue, candidates = result
         assert cue_index == 2
+        assert topic_complete is None
+        assert earlier_start_cue is None
         assert candidates == [_candidate(3, 3, "Good hook")]
 
     def test_legacy_integer_reply_still_parses(self, monkeypatch):
         for reply in ("3", "cue 3", " 3 ", "Cue 3"):
-            assert _resolve_with_reply(monkeypatch, reply) == (3, [])
+            assert _resolve_with_reply(monkeypatch, reply) == (3, None, None, [])
 
     def test_garbage_reply_degrades_to_none_pair(self, monkeypatch):
         for reply in (
@@ -311,13 +315,13 @@ class TestParseBoundaryReply:
             "none",
             json.dumps(["unexpected", "shape"]),
         ):
-            assert _resolve_with_reply(monkeypatch, reply) == (None, [])
+            assert _resolve_with_reply(monkeypatch, reply) == (None, None, None, [])
 
     def test_out_of_range_legacy_integer_degrades_to_none_pair(
         self, monkeypatch
     ):
         for reply in ("0", "99", "9999"):
-            assert _resolve_with_reply(monkeypatch, reply) == (None, [])
+            assert _resolve_with_reply(monkeypatch, reply) == (None, None, None, [])
 
     def test_exception_degrades_to_none_pair(self, monkeypatch):
         mock_openai = MagicMock()
@@ -327,19 +331,19 @@ class TestParseBoundaryReply:
         monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "true")
         with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
             result = reelsfy.resolve_topic_start_cue("srt content", HOOK_CUES)
-        assert result == (None, [])
+        assert result == (None, None, None, [])
 
     def test_gate_off_degrades_to_none_pair(self, monkeypatch):
         mock_openai = MagicMock()
         monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "false")
         with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
             result = reelsfy.resolve_topic_start_cue("srt content", HOOK_CUES)
-        assert result == (None, [])
+        assert result == (None, None, None, [])
         mock_openai.OpenAI.assert_not_called()
 
     def test_empty_segments_degrade_to_none_pair(self, monkeypatch):
         result = _resolve_with_reply(monkeypatch, "3", segments=[])
-        assert result == (None, [])
+        assert result == (None, None, None, [])
 
     def test_prompt_ask_for_hook_candidates(self, monkeypatch):
         captured = {}
@@ -533,7 +537,7 @@ class TestMandatoryHookInjection:
     def test_mandatory_hook_block_reaches_the_live_prompt(self):
         result, captured, _ = _run_generate_viral(
             _topic_analysis_result(),
-            (2, [_candidate(3, 3, HOOK_TEXT)]),
+            (2, None, None, [_candidate(3, 3, HOOK_TEXT)]),
         )
 
         assert result, "generate_viral must return the merged JSON"
@@ -552,7 +556,7 @@ class TestMandatoryHookInjection:
     def test_hook_block_is_instruction_prose_after_the_resolved_section(self):
         result, captured, _ = _run_generate_viral(
             _topic_analysis_result(),
-            (2, [_candidate(3, 3, HOOK_TEXT)]),
+            (2, None, None, [_candidate(3, 3, HOOK_TEXT)]),
         )
 
         user_content = captured["messages"][1]["content"]
@@ -566,7 +570,7 @@ class TestMandatoryHookInjection:
 
     def test_no_surviving_candidate_keeps_prompt_without_hook_block(self):
         result, captured, _ = _run_generate_viral(
-            _topic_analysis_result(), (2, [])
+            _topic_analysis_result(), (2, None, None, [])
         )
 
         user_content = captured["messages"][1]["content"]
@@ -575,11 +579,11 @@ class TestMandatoryHookInjection:
         assert EXPECTED_TASK14_SECTION in user_content
 
     def test_gate_off_keeps_prompt_without_hook_block(self):
-        # Gate off → the boundary pass returns (None, []): the resolved
+        # Gate off → the boundary pass returns (None, None, None, []): the resolved
         # window (untrimmed + snapped) still reaches the prompt, without a
         # hook block and without the cue line.
         result, captured, resolve_mock = _run_generate_viral(
-            _topic_analysis_result(), (None, [])
+            _topic_analysis_result(), (None, None, None, [])
         )
 
         user_content = captured["messages"][1]["content"]
@@ -590,7 +594,7 @@ class TestMandatoryHookInjection:
 
     def test_fallback_path_never_injects_a_hook_block(self, tmp_path):
         result, captured, resolve_mock = _run_generate_viral(
-            {"error": "topic analysis exploded"}, (None, [])
+            {"error": "topic analysis exploded"}, (None, None, None, [])
         )
 
         assert result, "fallback path must still produce a result"

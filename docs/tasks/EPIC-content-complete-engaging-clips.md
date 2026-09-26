@@ -63,9 +63,9 @@ Scenario: Pipeline defaults are clip-sane and respect the YouTube cap
 
 **Files:** `reelsfy.py` (prompt f-string ~3049-3051, CLI defaults ~3411-3421), `tests/test_duration_bounds.py`.
 
-### Story A2 — Document the OBS replay-buffer setup (1 pt)
+### Story A2 — Document the OBS replay-buffer setup ✅ DONE
 
-R5 is resolved operationally (buffer raised to 90 s), but the setup must be written down so future changes don't silently re-break it.
+Shipped as commit `18c9600`: a README "OBS Replay Buffer (capture length)" section, an AGENTS.md bullet, and a capture-length warning in `generate_viral`. R5 is resolved operationally (buffer raised to 90 s), but the setup must be written down so future changes don't silently re-break it.
 
 **TDD:** none (documentation story) — verify by doc presence.
 
@@ -79,7 +79,7 @@ Scenario: Operator guidance exists
 
 **Files:** `README.md`, `AGENTS.md` (one bullet). Optional: log a warning in reelsfy when capture duration < min_duration + 10 s ("capture shorter than the minimum clip window — check the OBS replay buffer").
 
-### Story A3 — Boundary LLM pass reports topic completeness (1 pt)
+### Story A3 — Boundary LLM pass reports topic completeness ✅ DONE
 
 Extend `resolve_topic_start_cue`'s JSON reply contract with `topic_complete` (bool) and, when incomplete, `earlier_start_cue` (the cue where the final topic actually begins, earlier than the heuristic cue). Parsing failure degrades to today's `(cue_index, hook_candidates)`.
 
@@ -295,8 +295,8 @@ Scenario: Epic closes green
 | Story | Theme | Pt | Depends on |
 |-------|-------|----|------------|
 | A1 unify duration bounds | A | 1 | — |
-| A2 OBS buffer doc + warn | A | 1 | — |
-| A3 completeness in boundary pass | A | 1 | — |
+| A2 OBS buffer doc + warn ✅ | A | 1 | done (`18c9600`) |
+| A3 completeness in boundary pass ✅ | A | 1 | done |
 | A4 apply start extension | A | 1 | A3 |
 | A5 completeness observability | A | 1 | A4 |
 | B1 anti-duplication rule | B | 1 | — |

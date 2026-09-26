@@ -20,6 +20,7 @@ covers:
 The OpenAI client is replaced with mocks — no network access happens.
 """
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -164,7 +165,7 @@ class TestResolveTopicStartCue:
     @pytest.mark.parametrize("reply", ["3", "cue 3", " 3 ", "Cue 3"])
     def test_valid_reply_returns_cue_index(self, monkeypatch, reply):
         result, mock_openai = _resolve_with_reply(monkeypatch, reply)
-        assert result == (3, [])
+        assert result == (3, None, None, [])
         mock_openai.OpenAI.assert_called_once()
 
     def test_prompt_contains_every_cue_text(self, monkeypatch):
@@ -203,7 +204,7 @@ class TestResolveTopicStartCue:
             result = reelsfy.resolve_topic_start_cue(
                 "srt content", _make_segments()
             )
-        assert result == (None, [])
+        assert result == (None, None, None, [])
 
     @pytest.mark.parametrize(
         "reply", ["sorry, I cannot help with that", "", "none"]
@@ -212,14 +213,14 @@ class TestResolveTopicStartCue:
         result, _ = _resolve_with_reply(
             monkeypatch, reply, segments=_make_segments()
         )
-        assert result == (None, [])
+        assert result == (None, None, None, [])
 
     @pytest.mark.parametrize("reply", ["0", "99", "9999"])
     def test_out_of_range_reply_returns_none(self, monkeypatch, reply):
         result, _ = _resolve_with_reply(
             monkeypatch, reply, segments=_make_segments()
         )
-        assert result == (None, [])
+        assert result == (None, None, None, [])
 
     def test_gate_off_never_constructs_client(self, monkeypatch):
         segments = _make_segments()
@@ -227,12 +228,12 @@ class TestResolveTopicStartCue:
         monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "false")
         with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
             result = reelsfy.resolve_topic_start_cue("srt content", segments)
-        assert result == (None, [])
+        assert result == (None, None, None, [])
         mock_openai.OpenAI.assert_not_called()
 
     def test_gate_defaults_to_enabled(self, monkeypatch):
         result, mock_openai = _resolve_with_reply(monkeypatch, "3")
-        assert result == (3, [])
+        assert result == (3, None, None, [])
         mock_openai.OpenAI.assert_called_once()
 
     def test_empty_segments_returns_none_without_llm(self, monkeypatch):
@@ -240,7 +241,118 @@ class TestResolveTopicStartCue:
         monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "true")
         with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
             result = reelsfy.resolve_topic_start_cue("srt content", [])
-        assert result == (None, [])
+        assert result == (None, None, None, [])
+        mock_openai.OpenAI.assert_not_called()
+
+    # --- Story A3: completeness signal (topic_complete / earlier_start_cue) ---
+
+    def test_complete_reply_returns_none_earlier(self, monkeypatch):
+        reply = (
+            '{"topic_complete": true, "cue_number": 3, '
+            '"earlier_start_cue": null, "hook_candidates": []}'
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (3, True, None, [])
+
+    def test_incomplete_reply_reports_earlier_cue(self, monkeypatch):
+        reply = (
+            '{"topic_complete": false, "cue_number": 5, '
+            '"earlier_start_cue": 2, "hook_candidates": []}'
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        # earlier_start_cue is carried for the caller to consider.
+        assert result == (5, False, 2, [])
+
+    def test_incomplete_reply_without_earlier_cue_yields_none(self, monkeypatch):
+        # topic_complete false but no usable earlier cue -> no extension.
+        reply = (
+            '{"topic_complete": false, "cue_number": 3, '
+            '"earlier_start_cue": null, "hook_candidates": []}'
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (3, False, None, [])
+
+    def test_earlier_cue_after_cue_number_is_rejected(self, monkeypatch):
+        # Extension only moves the start earlier; a later index is ignored.
+        reply = (
+            '{"topic_complete": false, "cue_number": 2, '
+            '"earlier_start_cue": 4, "hook_candidates": []}'
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (2, False, None, [])
+
+    def test_earlier_cue_out_of_range_is_rejected(self, monkeypatch):
+        reply = (
+            '{"topic_complete": false, "cue_number": 3, '
+            '"earlier_start_cue": 99, "hook_candidates": []}'
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (3, False, None, [])
+
+    def test_topic_complete_missing_is_unknown_not_complete(self, monkeypatch):
+        # A legacy reply carries no verdict: topic_complete stays None so no
+        # caller reports a completeness the model never gave.
+        reply = '{"cue_number": 3, "hook_candidates": []}'
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (3, None, None, [])
+
+    def test_incomplete_is_reported_even_when_earlier_cue_is_unusable(self, monkeypatch):
+        # The model DID say "incomplete"; only the cue it offered was rejected.
+        # topic_complete=False must survive, or the A5 observability log would
+        # report this capture as complete and hide the signal it measures.
+        reply = (
+            '{"topic_complete": false, "cue_number": 3, '
+            '"earlier_start_cue": 99, "hook_candidates": []}'
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (3, False, None, [])
+
+    @pytest.mark.parametrize("flag", ["false", 0, 1, None])
+    def test_non_bool_topic_complete_is_ignored(self, monkeypatch, flag):
+        # Only a real JSON false means "incomplete"; a string/0/1 does not.
+        reply = json.dumps(
+            {
+                "topic_complete": flag,
+                "cue_number": 5,
+                "earlier_start_cue": 2,
+                "hook_candidates": [],
+            }
+        )
+        result = _resolve_with_reply(monkeypatch, reply)[0]
+        assert result == (5, None, None, [])
+
+    def test_malformed_reply_falls_back_to_legacy(self, monkeypatch):
+        # No JSON at all -> all-legacy shape.
+        result = _resolve_with_reply(monkeypatch, "no json here")[0]
+        assert result == (None, None, None, [])
+
+    def test_prompt_contains_complete_and_steering_instructions(self, monkeypatch):
+        segments = _make_segments()
+        captured = {}
+
+        def _capture(model, messages, n, stop):
+            captured["messages"] = messages
+            response = MagicMock()
+            response.choices[0].message.content = '{"topic_complete": true, "cue_number": 3}'
+            return response
+
+        mock_openai = MagicMock()
+        mock_openai.OpenAI.return_value.chat.completions.create.side_effect = _capture
+        monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "true")
+        with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
+            reelsfy.resolve_topic_start_cue("srt content", segments)
+
+        user_content = captured["messages"][-1]["content"]
+        assert "topic_complete" in user_content
+        assert "earlier_start_cue" in user_content
+
+    def test_gate_off_returns_legacy_none(self, monkeypatch):
+        segments = _make_segments()
+        mock_openai = MagicMock()
+        monkeypatch.setenv("TOPIC_BOUNDARY_LLM", "false")
+        with patch.object(reelsfy.openai, "OpenAI", mock_openai.OpenAI):
+            result = reelsfy.resolve_topic_start_cue("srt content", segments)
+        assert result == (None, None, None, [])
         mock_openai.OpenAI.assert_not_called()
 
 

@@ -2228,14 +2228,31 @@ def _parse_hook_candidates(value):
 
 
 def _parse_boundary_reply(content, cue_count):
-    """Parse the boundary reply into (cue_index, hook_candidates).
+    """Parse the boundary reply into (cue_index, topic_complete, earlier_start_cue, hook_candidates).
+
+    - ``cue_index`` — the 1-based cue where the final topic begins, or None.
+    - ``topic_complete`` — the model's own verdict on whether ``cue_index``
+      captures the whole topic, or None when the reply carried no verdict.
+      Kept separate from ``earlier_start_cue`` because the two can disagree:
+      an incomplete topic whose earlier cue was rejected still has
+      ``earlier_start_cue is None``, and the observability log (A5) must
+      report the model's actual answer rather than an inferred one.
+    - ``earlier_start_cue`` — when the topic is incomplete, the cue where it
+      actually begins (earlier than ``cue_index``); else None. Callers only
+      extend the window when it is set, so a legacy or malformed reply
+      degrades silently.
+    - ``hook_candidates`` — a possibly empty list of cue dicts.
 
     The cue number and the hook candidates are parsed INDEPENDENTLY: a
     missing/invalid candidates list never invalidates the cue number and
-    vice versa. Legacy integer-only replies fall back to the first-number
-    regex; a missing/out-of-range cue number yields None for the cue only.
+    vice versa. A malformed reply with no parseable cue yields
+    ``(None, None, None, [])`` so the pipeline degrades to today's untrimmed
+    window.
     """
     cue_index = None
+    topic_complete = None
+    earlier_start_cue = None
+    hook_candidates = []
     text = str(content) if content is not None else ""
     text = text.replace("```json", "").replace("```", "").strip()
     payload = None
@@ -2251,9 +2268,11 @@ def _parse_boundary_reply(content, cue_count):
             and 1 <= raw_cue <= cue_count
         ):
             cue_index = raw_cue
+        earlier_start_cue = _parse_earlier_start_cue(payload, cue_index, cue_count)
+        if isinstance(payload.get('topic_complete'), bool):
+            topic_complete = payload['topic_complete']
         hook_candidates = _parse_hook_candidates(payload.get('hook_candidates'))
     else:
-        hook_candidates = []
         match = re.search(r"-?\d+", text)
         if match:
             try:
@@ -2262,31 +2281,63 @@ def _parse_boundary_reply(content, cue_count):
                     cue_index = value
             except ValueError:
                 cue_index = None
-    return cue_index, hook_candidates
+    return cue_index, topic_complete, earlier_start_cue, hook_candidates
+
+
+def _parse_earlier_start_cue(payload, cue_index, cue_count):
+    """Validate the completeness signal; return an earlier cue index or None.
+
+    ``topic_complete`` says whether the heuristic cue already captures the
+    whole topic. Only a literal JSON ``false`` counts as "incomplete" — an
+    absent or non-bool flag is treated as no signal at all. When it is false,
+    ``earlier_start_cue`` names the cue where the topic actually begins and
+    must be a valid index strictly before ``cue_index`` (the extension only
+    ever moves the start earlier). Every other shape — a missing cue, an
+    out-of-range or later index — returns None.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if payload.get('topic_complete') is not False:
+        return None
+    earlier = payload.get('earlier_start_cue')
+    if (
+        isinstance(earlier, int)
+        and not isinstance(earlier, bool)
+        and 1 <= earlier <= cue_count
+        and cue_index is not None
+        and earlier < cue_index
+    ):
+        return earlier
+    return None
 
 
 def resolve_topic_start_cue(transcript_content, segments):
-    """S2/S5: ask the LLM where the FINAL topic begins + hook candidates.
+    """S2/S3/S5: ask the LLM where the FINAL topic begins + hook candidates.
 
     Replay-buffer captures are <= 90 s and the final topic concludes at the
     end, but the capture's start often holds the PREVIOUS topic's tail. The
     numbered cue list below covers the full capture (nothing is truncated)
     and the model must answer with the first cue that belongs to the final
     topic; on top of that cue number it proposes up to 3 hook candidates
-    inside the final topic (S5 hook-first selection).
+    inside the final topic (S5 hook-first selection). It also reports whether
+    that cue already captures the whole topic, and if not an earlier cue where
+    the topic actually begins (S3 completeness signal).
 
-    Returns (cue_index, hook_candidates): cue_index is the 1-based cue
-    index or None on any failure (exception, unparseable reply, out-of-range
-    index) so the pipeline degrades to today's untrimmed optimized window;
-    hook_candidates is a possibly empty list of
-    {"cue_start", "cue_end", "text"} dicts. A missing/invalid candidates
-    list never invalidates the cue number and vice versa. Never raises.
+    Returns (cue_index, topic_complete, earlier_start_cue, hook_candidates):
+    cue_index is the 1-based cue index or None on any failure (exception,
+    unparseable reply, out-of-range index) so the pipeline degrades to today's
+    untrimmed window; topic_complete is the model's own completeness verdict,
+    or None when the reply carried none; earlier_start_cue is an earlier valid
+    cue index when the topic is incomplete, else None; hook_candidates is a
+    possibly empty list of {"cue_start", "cue_end", "text"} dicts. A
+    missing/invalid candidates list never invalidates the cue number and vice
+    versa. Never raises.
     """
     if not segments:
         print("Topic boundary LLM: no segments available; keeping window unchanged")
-        return None, []
+        return None, None, None, []
     if not resolve_topic_boundary_llm_enabled():
-        return None, []
+        return None, None, None, []
 
     # Cues come from the analyzed segments, which span the entire capture.
     cue_lines = []
@@ -2301,12 +2352,14 @@ The FINAL topic of this capture CONCLUDES at the end of the capture. Any cue tex
 
 Return ONLY a JSON object (no markdown, no code block markers) with EXACTLY this shape:
 
-{{"cue_number": <integer>, "hook_candidates": [{{"cue_start": <integer>, "cue_end": <integer>, "text": "<hook sentence>"}}]}}
+{{"topic_complete": <bool>, "cue_number": <integer>, "earlier_start_cue": <integer or null>, "hook_candidates": [{{"cue_start": <integer>, "cue_end": <integer>, "text": "<hook sentence>"}}]}}
 
+- "topic_complete": true when the cue you pick for "cue_number" already captures the whole final topic; false when it does NOT — the topic actually began earlier than that cue and context is missing.
 - "cue_number": the cue number where the FINAL topic BEGINS — the first cue that belongs to the final topic, not the previous topic's tail.
+- "earlier_start_cue": only when "topic_complete" is false, the earlier cue number where the final topic actually BEGINS (an integer strictly less than "cue_number"); otherwise null.
 - "hook_candidates": up to 3 hook candidates INSIDE the final topic, best first. Each candidate spans ONE engaging sentence (2-5 seconds long): "cue_start" is the first cue number of the hook sentence, "cue_end" is the last cue number of the hook sentence, and "text" is the hook sentence verbatim. Use an empty list when no clear hook sentence exists."""
 
-    system = """You identify topic boundaries in video transcripts and propose hook candidates. You receive numbered cues covering a full short capture and must return the cue number where the final topic begins plus hook candidates inside the final topic."""
+    system = """You identify topic boundaries in video transcripts and propose hook candidates. You receive numbered cues covering a full short capture and must report whether the final topic is captured in full, the cue number where the final topic begins, an earlier cue when it is not, plus hook candidates inside the final topic."""
 
     messages = [
         {"role": "system", "content": system},
@@ -2321,7 +2374,9 @@ Return ONLY a JSON object (no markdown, no code block markers) with EXACTLY this
         )
 
         content = response.choices[0].message.content
-        cue_index, hook_candidates = _parse_boundary_reply(content, len(segments))
+        cue_index, topic_complete, earlier_start_cue, hook_candidates = (
+            _parse_boundary_reply(content, len(segments))
+        )
         if cue_index is None:
             print(
                 f"Topic boundary LLM: unparseable or out-of-range reply "
@@ -2329,14 +2384,19 @@ Return ONLY a JSON object (no markdown, no code block markers) with EXACTLY this
             )
         else:
             print(f"Topic boundary LLM: final topic begins at cue {cue_index}")
+        if earlier_start_cue is not None:
+            print(
+                f"Topic boundary LLM: topic incomplete — it actually begins "
+                f"earlier at cue {earlier_start_cue}"
+            )
         if hook_candidates:
             print(
                 f"Topic boundary LLM: {len(hook_candidates)} hook candidate(s) proposed"
             )
-        return cue_index, hook_candidates
+        return cue_index, topic_complete, earlier_start_cue, hook_candidates
     except Exception as e:
         print(f"Topic boundary LLM pass failed ({e}); keeping window unchanged")
-        return None, []
+        return None, None, None, []
 
 
 def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments, segments):
@@ -2842,10 +2902,14 @@ def generate_viral(
         # of the previous topic. Resolve where the final topic begins and trim
         # the window start to that cue; any failure keeps the window exactly
         # as analyzed above. The end time (recency anchor) is untouched.
-        # S5: the same pass also proposes hook candidates inside the final
-        # topic; selection against the snapped window happens below.
-        cue_index, hook_candidates = resolve_topic_start_cue(
-            transcript_content, topic_analysis['segments']
+        # S3: the same pass also reports when the topic is incomplete and an
+        # earlier cue where it begins. Story A3 only REPORTS that signal —
+        # the window extension that consumes it is A4, so nothing below reads
+        # `earlier_start_cue` yet.
+        # S5: it also proposes hook candidates inside the final topic;
+        # selection against the snapped window happens below.
+        cue_index, _topic_complete, earlier_start_cue, hook_candidates = (
+            resolve_topic_start_cue(transcript_content, topic_analysis['segments'])
         )
         if cue_index is not None:
             optimized_segment, supporting_segments = trim_window_to_topic_start(
