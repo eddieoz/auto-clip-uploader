@@ -137,6 +137,9 @@ throws away the screen content, which is the actual payload of the video.
   re-crop or strip burned text: append `Date: DD/MM/YYYY` and the overlay title to
   `description.txt` in `save_metadata` (`reelsfy.py:1711`). Rule of thumb going forward:
   **anything burned in the video must also be in the description.**
+- **Status update:** both burned overlays are OFF by default and gated by
+  `OVERLAY_DATE_ENABLED` / `OVERLAY_TITLE_ENABLED` (only the literal `true` turns one on).
+  The description lines follow the same gates, so nothing is written that wasn't burned.
 - Keep reusing the master transcript (offset by segment start) for subtitles instead of
   re-transcribing the cropped clip (see P1.2).
 

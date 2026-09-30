@@ -4315,12 +4315,22 @@ def __main__():
     try:
         parsed_content = json.loads(content)
         # Save metadata in a copy-paste friendly format. Anything burned in
-        # the video (date + overlay title) must also be in the description.
+        # the video (date + overlay title) must also be in the description —
+        # and both overlays are off by default, so neither line is added
+        # unless the matching OVERLAY_*_ENABLED flag turned the burn on.
         save_metadata(
             parsed_content["metadata"],
             f"{output_dir}",
-            date_text=datetime.now().strftime("%d/%m/%Y"),
-            overlay_title=resolve_overlay_title(args.video_title, get_channel_name()),
+            date_text=(
+                datetime.now().strftime("%d/%m/%Y")
+                if resolve_overlay_date_enabled()
+                else None
+            ),
+            overlay_title=(
+                resolve_overlay_title(args.video_title, get_channel_name())
+                if resolve_overlay_title_enabled()
+                else None
+            ),
         )
         print(f"Processing {len(parsed_content['segments'])} generated segments...")
         # Jump cuts (Story 5): plan the intra-segment pause removal once per
@@ -4831,6 +4841,28 @@ OVERLAY_FONT_SIZE = 32
 OVERLAY_FONT_COLOR = "white@0.65"
 OVERLAY_Y = 120
 OVERLAY_X_MARGIN = 30
+
+
+def _overlay_enabled(name):
+    """Shared gate for the burned top overlays. Only the literal "true"
+    enables one, so an unset or misspelled value leaves it off."""
+    enabled = os.getenv(name, 'false').lower().strip() == 'true'
+    if not enabled:
+        print(f"Burned overlay off ({name} is not 'true')")
+    return enabled
+
+
+def resolve_overlay_date_enabled():
+    """Gate for the top-left burned date. Default OFF."""
+    return _overlay_enabled('OVERLAY_DATE_ENABLED')
+
+
+def resolve_overlay_title_enabled():
+    """Gate for the top-right burned title/channel (chapter) overlay.
+
+    Default OFF.
+    """
+    return _overlay_enabled('OVERLAY_TITLE_ENABLED')
 
 
 def build_overlay_filters(date_text, title_text, input_label="0:v"):
@@ -5483,7 +5515,9 @@ def generate_subtitle(
     from datetime import datetime
 
     current_time = datetime.now()
-    date_text = current_time.strftime("%d/%m/%Y")
+    date_text = (
+        current_time.strftime("%d/%m/%Y") if resolve_overlay_date_enabled() else None
+    )
 
     # Use the configured STT model to transcribe the final cropped video segment
     # This ensures subtitles are perfectly synced to the segment timing and uses the same model as the main transcription
@@ -5679,7 +5713,11 @@ def generate_subtitle(
     # name (top-right), semi-transparent inside the top safe zone.
     if video_title:
         print(f"Using video title for overlay: {video_title}")
-    title_text = resolve_overlay_title(video_title, channel_name)
+    title_text = (
+        resolve_overlay_title(video_title, channel_name)
+        if resolve_overlay_title_enabled()
+        else None
+    )
     overlay_filters, last_filter = build_overlay_filters(
         date_text, title_text, input_label=last_filter
     )

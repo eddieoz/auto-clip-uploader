@@ -95,6 +95,29 @@ class TestBuildOverlayFilters:
         assert out_label == "v1"
 
 
+class TestOverlayEnvGates:
+    """Both burned top overlays default OFF; only "true" enables one."""
+
+    def test_both_disabled_when_unset(self, monkeypatch):
+        monkeypatch.delenv("OVERLAY_DATE_ENABLED", raising=False)
+        monkeypatch.delenv("OVERLAY_TITLE_ENABLED", raising=False)
+        assert reelsfy.resolve_overlay_date_enabled() is False
+        assert reelsfy.resolve_overlay_title_enabled() is False
+
+    def test_enabled_only_on_literal_true(self, monkeypatch):
+        monkeypatch.setenv("OVERLAY_DATE_ENABLED", "true")
+        monkeypatch.setenv("OVERLAY_TITLE_ENABLED", "TRUE")
+        assert reelsfy.resolve_overlay_date_enabled() is True
+        assert reelsfy.resolve_overlay_title_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "", "1", "yes", "maybe"])
+    def test_other_values_stay_off(self, monkeypatch, value):
+        monkeypatch.setenv("OVERLAY_DATE_ENABLED", value)
+        monkeypatch.setenv("OVERLAY_TITLE_ENABLED", value)
+        assert reelsfy.resolve_overlay_date_enabled() is False
+        assert reelsfy.resolve_overlay_title_enabled() is False
+
+
 class TestResolveOverlayTitle:
     """Precedence: video_title (arg) beats channel_name beats none."""
 
@@ -201,7 +224,13 @@ class TestGenerateSubtitleUsesOverlayHelper:
         {"word": "world", "start": 0.5, "end": 1.0},
     ]
 
-    def _run(self, tmp_path, monkeypatch, video_title, channel):
+    def _run(self, tmp_path, monkeypatch, video_title, channel, overlays=True):
+        if overlays:
+            monkeypatch.setenv("OVERLAY_DATE_ENABLED", "true")
+            monkeypatch.setenv("OVERLAY_TITLE_ENABLED", "true")
+        else:
+            monkeypatch.delenv("OVERLAY_DATE_ENABLED", raising=False)
+            monkeypatch.delenv("OVERLAY_TITLE_ENABLED", raising=False)
         (tmp_path / "tmp").mkdir()
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(reelsfy, "get_channel_name", lambda: channel)
@@ -251,18 +280,62 @@ class TestGenerateSubtitleUsesOverlayHelper:
         )
 
         assert result is True
-        # Date overlay is always present, no title overlay
+        # Date overlay is on, no title overlay
         assert commands[0].count("drawtext=") == 1
         assert "x=30:y=120" in commands[0]
+
+    def test_no_overlays_burned_by_default(self, tmp_path, monkeypatch):
+        result, commands = self._run(
+            tmp_path,
+            monkeypatch,
+            video_title="My Title",
+            channel="TestChannel",
+            overlays=False,
+        )
+
+        assert result is True
+        assert commands[0].count("drawtext=") == 0
+        assert "x=30:y=120" not in commands[0]
+        assert "x=W-tw-30:y=120" not in commands[0]
+
+    def test_date_can_be_enabled_independently(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OVERLAY_DATE_ENABLED", "true")
+        monkeypatch.delenv("OVERLAY_TITLE_ENABLED", raising=False)
+        (tmp_path / "tmp").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(reelsfy, "get_channel_name", lambda: "TestChannel")
+        commands = []
+        monkeypatch.setattr(
+            reelsfy.subprocess, "call", lambda cmd, *a, **k: commands.append(cmd) or 0
+        )
+
+        result = reelsfy.generate_subtitle(
+            "seg000.mp4",
+            "vid",
+            "outputs/vid",
+            video_title="My Title",
+            subtitle_words=list(self.WORDS),
+        )
+
+        assert result is True
+        assert commands[0].count("drawtext=") == 1
+        assert "x=30:y=120" in commands[0]
+        assert "My Title" not in commands[0]
 
 
 class TestMainMetadataWiring:
     """__main__ passes the date and burn-precedence overlay title to save_metadata."""
 
-    def _run_main(self, monkeypatch, tmp_path, save_mock, extra_args):
+    def _run_main(self, monkeypatch, tmp_path, save_mock, extra_args, overlays=True):
         input_file = tmp_path / "input.mp4"
         input_file.write_bytes(b"\x00\x01")
 
+        if overlays:
+            monkeypatch.setenv("OVERLAY_DATE_ENABLED", "true")
+            monkeypatch.setenv("OVERLAY_TITLE_ENABLED", "true")
+        else:
+            monkeypatch.delenv("OVERLAY_DATE_ENABLED", raising=False)
+            monkeypatch.delenv("OVERLAY_TITLE_ENABLED", raising=False)
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(
             sys, "argv", ["reelsfy.py", "--file", str(input_file), *extra_args]
@@ -304,3 +377,16 @@ class TestMainMetadataWiring:
         kwargs = save_mock.call_args.kwargs
         assert re.fullmatch(r"\d{2}/\d{2}/\d{4}", kwargs["date_text"])
         assert kwargs["overlay_title"] == "TestChannel"
+
+    def test_no_overlay_lines_when_overlays_disabled(
+        self, monkeypatch, tmp_path
+    ):
+        save_mock = Mock()
+        self._run_main(
+            monkeypatch, tmp_path, save_mock, ("--video-title", "My Title"),
+            overlays=False,
+        )
+
+        kwargs = save_mock.call_args.kwargs
+        assert kwargs["date_text"] is None
+        assert kwargs["overlay_title"] is None
