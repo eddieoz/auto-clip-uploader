@@ -87,7 +87,9 @@ python reelsfy.py --file /path/to/video.mp4 --upscale --enhance --thumb
 - `TOPIC_BOUNDARY_LLM` - LLM topic-start pass (default on; `false` = legacy heuristics)
 - `JUMP_CUTS_ENABLED` / `JUMP_CUT_PAUSE_THRESHOLD` - Dead-air removal
 - `CAPTION_FONT_FAMILY` / `CAPTION_HIGHLIGHT_COLOR` - Karaoke caption styling
-- `FRAMING_MODE` - Screencast framing: `auto`, `pip`, `screen_zoom`, `closeup`
+- `FRAMING_MODE` - Screencast framing: `auto`, `pip`, `screen_zoom`, `face_zoom`,
+  `face_wide`, `closeup`. In `auto`, a screencast rotates pip → screen_zoom →
+  face_zoom → face_wide on 5 s boundaries.
 - `VIDEO_GRADE` / `VIDEO_LUT` - Visual grade and optional .cube LUT
 - `END_CARD_ENABLED` / `END_CARD_TEXT` / `END_CARD_COLOR` - End-card CTA, on by
   default (`END_CARD_ENABLED=false` opts out)

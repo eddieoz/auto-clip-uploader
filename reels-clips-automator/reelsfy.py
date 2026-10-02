@@ -1,4 +1,5 @@
 import random
+import re
 import sys
 import textwrap
 import time
@@ -752,12 +753,23 @@ LAYOUT_TALKING_HEAD = "talking_head"
 # Screencast rendering modes
 SCREENCAST_PIP = "pip"
 SCREENCAST_SCREEN_ZOOM = "screen_zoom"
+SCREENCAST_FACE_ZOOM = "face_zoom"
+SCREENCAST_FACE_WIDE = "face_wide"
 SCREENCAST_CLOSEUP = "closeup"
-FRAMING_MODE_VALID = ("auto", SCREENCAST_PIP, SCREENCAST_SCREEN_ZOOM, SCREENCAST_CLOSEUP)
+
+# Modes the screencast render loop can draw. FRAMING_MODE accepts any of them
+# to pin the clip to one framing for the whole run.
+SCREENCAST_RENDER_MODES = (
+    SCREENCAST_PIP,
+    SCREENCAST_SCREEN_ZOOM,
+    SCREENCAST_FACE_ZOOM,
+    SCREENCAST_FACE_WIDE,
+)
 
 # FRAMING_MODE env override: auto (default) uses detection; the others force
 # the framing mode for the clip.
 FRAMING_MODE_ENV_VAR = "FRAMING_MODE"
+FRAMING_MODE_VALID = ("auto",) + SCREENCAST_RENDER_MODES + (SCREENCAST_CLOSEUP,)
 
 # Detection thresholds (binding per design)
 LAYOUT_SAMPLE_COUNT = 30            # frames sampled for layout detection
@@ -780,9 +792,39 @@ PIP_BADGE_MARGIN_RATIO = 0.03       # badge distance from the frame edges
 PIP_BADGE_SMOOTHING_FACTOR = 0.9    # badge EMA: 90% previous / 10% new
 PIP_BADGE_MOVEMENT_THRESHOLD = 15   # detector jitter (px) ignored by the EMA
 
-# Deterministic variety schedule: alternate PiP -> screen-zoom on ~5 s
-# boundaries (fixed pattern, PiP first).
+# Deterministic variety schedule: rotate pip -> screen_zoom -> face_zoom ->
+# face_wide on 5 s boundaries. The two face modes are what keep a screencast
+# from reading as one static composition: they put a tracked face crop back in
+# the rotation, so the clip alternates between "screen with a badge" and
+# "face-forward" the way the talking-head path always did.
 SCREENCAST_SEGMENT_SECONDS = 5
+SCREENCAST_MODE_CYCLE = (
+    SCREENCAST_PIP,
+    SCREENCAST_SCREEN_ZOOM,
+    SCREENCAST_FACE_ZOOM,
+    SCREENCAST_FACE_WIDE,
+)
+
+# Face-mode crop widths, as a multiple of the smoothed face side. face_zoom is
+# a tight talking-head crop; face_wide keeps the face plus enough screen around
+# it to stay oriented.
+FACE_ZOOM_WIDTH_RATIO = 1.6
+FACE_WIDE_WIDTH_RATIO = 3.2
+
+# Hard cap on a face-mode crop width, as a fraction of the frame width. The
+# ratios above are keyed to the face, which on a portrait screencast can be
+# large enough that face_wide asks for a window wider than the frame. Clamping
+# BEFORE the push-in (rather than after) is what keeps the cap from collapsing
+# the crop to the full frame and cancelling the motion: without it, face_wide
+# on a 1080-wide source became 1080x1920 with no push-in at all, i.e. a static
+# duplicate of the un-cropped frame.
+FACE_MODE_MAX_WIDTH_RATIO = 0.85
+
+# In-segment push-in for the face modes: the crop eases tighter across the
+# segment (100% -> 92%), giving each face segment its own motion instead of a
+# frozen crop that snaps at the mode boundary.
+FACE_MODE_PUSH_IN_START_SCALE = 1.0
+FACE_MODE_PUSH_IN_END_SCALE = 0.92
 
 # Whole-clip push-in (PiP only): background zoom eases 100% -> 96%.
 PUSH_IN_START_SCALE = 1.0
@@ -838,7 +880,7 @@ def detect_layout(face_boxes_per_sample, frame_shape, edge_density_below_face,
 
     A forced mode (FRAMING_MODE override) bypasses the classification.
     """
-    if forced_mode in (SCREENCAST_PIP, SCREENCAST_SCREEN_ZOOM):
+    if forced_mode in SCREENCAST_RENDER_MODES:
         return LAYOUT_SCREENCAST
     if forced_mode == SCREENCAST_CLOSEUP:
         return LAYOUT_TALKING_HEAD
@@ -942,20 +984,57 @@ def compute_push_in_scale(progress,
     return start_scale + (end_scale - start_scale) * smooth
 
 def screencast_mode_for_frame(frame_count, fps, segment_seconds=SCREENCAST_SEGMENT_SECONDS):
-    """Deterministic variety: pip -> screen_zoom -> pip on ~10 s boundaries."""
+    """Deterministic variety: rotate through SCREENCAST_MODE_CYCLE on segment
+    boundaries (fixed pattern, pip first)."""
     if fps <= 0:
         fps = 30.0
     segment_frames = max(int(fps * segment_seconds), 1)
-    if (frame_count // segment_frames) % 2 == 0:
-        return SCREENCAST_PIP
-    return SCREENCAST_SCREEN_ZOOM
+    return SCREENCAST_MODE_CYCLE[(frame_count // segment_frames) % len(SCREENCAST_MODE_CYCLE)]
 
 def resolve_screencast_mode(frame_count, fps, forced="auto",
                             segment_seconds=SCREENCAST_SEGMENT_SECONDS):
     """Per-frame screencast mode: forced override or the deterministic schedule."""
-    if forced in (SCREENCAST_PIP, SCREENCAST_SCREEN_ZOOM):
+    if forced in SCREENCAST_RENDER_MODES:
         return forced
     return screencast_mode_for_frame(frame_count, fps, segment_seconds)
+
+def compute_face_push_in(progress,
+                         start_scale=FACE_MODE_PUSH_IN_START_SCALE,
+                         end_scale=FACE_MODE_PUSH_IN_END_SCALE):
+    """Smoothstep easing of the face-mode crop scale across one segment."""
+    p = min(max(progress, 0.0), 1.0)
+    smooth = p * p * (3.0 - 2.0 * p)
+    return start_scale + (end_scale - start_scale) * smooth
+
+def compute_face_crop(center, face_side, frame_shape, width_ratio, push_scale=1.0,
+                      max_width_ratio=FACE_MODE_MAX_WIDTH_RATIO):
+    """
+    9:16 crop window centered on the tracked face, sized from the smoothed
+    face side times `width_ratio`. Clamped to FACE_MODE_MAX_WIDTH_RATIO of the
+    frame width BEFORE the push-in is applied, so the in-segment motion always
+    survives the clamp. Clamped to stay inside the frame.
+
+    Returns (x, y, width, height).
+    """
+    frame_height, frame_width = frame_shape[0], frame_shape[1]
+
+    side = max(int(face_side or 0), 16)
+    max_width = max(int(frame_width * max_width_ratio), 16)
+    crop_w = min(max(int(side * width_ratio), 16), max_width)
+    crop_w = max(int(crop_w * push_scale), 16)
+    crop_w = min(crop_w, frame_width)
+    crop_h = int(crop_w * 16 / 9)
+    if crop_h > frame_height:
+        crop_h = frame_height
+        crop_w = max(int(frame_height * 9 / 16), 16)
+
+    cx = int(center[0])
+    cy = int(center[1])
+    cx = max(cx, crop_w // 2)
+    cx = min(cx, frame_width - crop_w // 2)
+    cy = max(cy, crop_h // 2)
+    cy = min(cy, frame_height - crop_h // 2)
+    return (cx - crop_w // 2, cy - crop_h // 2, crop_w, crop_h)
 
 def smooth_center(prev_center, raw_center, smoothing_factor=0.7, movement_threshold=5):
     """
@@ -1446,31 +1525,32 @@ def generate_short(
                             )
                         prev_screencast_mode = sc_mode
 
+                    raw_center = None
+                    raw_side = None
+                    if face_box is not None:
+                        fb_x, fb_y, fb_w, fb_h = face_box
+                        raw_center = (fb_x + fb_w // 2, fb_y + fb_h // 2)
+                        raw_side = int(
+                            max(fb_w, fb_h) * (1.0 + 2 * PIP_FACE_MARGIN_RATIO)
+                        )
+                    # Shared face tracking: the badge crop and the full-frame
+                    # face modes read the SAME smoothed center and side, so a
+                    # mode switch reuses the current estimate instead of
+                    # re-snapping to a raw (jittery) detector box.
+                    face_center = smooth_center(
+                        prev_badge_center,
+                        raw_center,
+                        PIP_BADGE_SMOOTHING_FACTOR,
+                        PIP_BADGE_MOVEMENT_THRESHOLD,
+                    )
+                    prev_badge_center = face_center
+                    face_side = smooth_badge_side(prev_badge_side, raw_side)
+                    prev_badge_side = face_side
+
                     if sc_mode == SCREENCAST_PIP:
                         # Background push-in over the whole clip duration
                         progress = frame_count / total_frames if total_frames > 0 else 0.0
                         push_scale = compute_push_in_scale(progress)
-
-                        raw_center = None
-                        raw_side = None
-                        if face_box is not None:
-                            fb_x, fb_y, fb_w, fb_h = face_box
-                            raw_center = (fb_x + fb_w // 2, fb_y + fb_h // 2)
-                            raw_side = int(
-                                max(fb_w, fb_h) * (1.0 + 2 * PIP_FACE_MARGIN_RATIO)
-                            )
-                        # Badge EMA smoothing applied EVERY frame (not only when
-                        # frame_tracking_enabled); strong factor + dead-zone so
-                        # detector jitter does not shake the badge.
-                        badge_center = smooth_center(
-                            prev_badge_center,
-                            raw_center,
-                            PIP_BADGE_SMOOTHING_FACTOR,
-                            PIP_BADGE_MOVEMENT_THRESHOLD,
-                        )
-                        prev_badge_center = badge_center
-                        badge_side = smooth_badge_side(prev_badge_side, raw_side)
-                        prev_badge_side = badge_side
 
                         # Live crop every frame at the smoothed center: the
                         # EMA + dead-zone absorb detector jitter, while the
@@ -1479,10 +1559,10 @@ def generate_short(
                             frame,
                             screen_region,
                             face_box,
-                            badge_center,
+                            face_center,
                             push_scale=push_scale,
                             last_badge=last_badge,
-                            face_side=badge_side,
+                            face_side=face_side,
                         )
                         if badge_crop is not None:
                             last_badge = badge_crop
@@ -1500,6 +1580,40 @@ def generate_short(
                             )
                             if candidate_found:
                                 smile_candidates.append(candidate_frame)
+                    elif sc_mode in (SCREENCAST_FACE_ZOOM, SCREENCAST_FACE_WIDE):
+                        # Face-forward modes: the tracked face fills the frame
+                        # instead of sitting in a badge. The crop eases tighter
+                        # across the segment so the segment has its own motion.
+                        if face_center is None:
+                            # No face tracked yet: fall back to the screen
+                            # region so the segment still renders.
+                            ms_x, ms_y, ms_w, ms_h = screen_region
+                            face_center = (ms_x + ms_w // 2, ms_y + ms_h // 2)
+                        if face_side is None:
+                            face_side = int(
+                                frame_height * FACE_ZOOM_WIDTH_RATIO * 0.5
+                            )
+
+                        segment_frames = max(int(input_fps * SCREENCAST_SEGMENT_SECONDS), 1)
+                        seg_progress = (frame_count % segment_frames) / segment_frames
+                        push_scale = compute_face_push_in(seg_progress)
+
+                        width_ratio = (
+                            FACE_ZOOM_WIDTH_RATIO
+                            if sc_mode == SCREENCAST_FACE_ZOOM
+                            else FACE_WIDE_WIDTH_RATIO
+                        )
+                        crop_x, crop_y, crop_w9, crop_h9 = compute_face_crop(
+                            face_center,
+                            face_side,
+                            (frame_height, frame_width),
+                            width_ratio,
+                            push_scale=push_scale,
+                        )
+                        crop_img = frame[crop_y : crop_y + crop_h9, crop_x : crop_x + crop_w9]
+                        out.write(
+                            cv2.resize(crop_img, (1080, 1920), interpolation=cv2.INTER_CUBIC)
+                        )
                     else:
                         # Screen-zoom: follow the point of maximum motion energy,
                         # fallback to the screen-region center when negligible.

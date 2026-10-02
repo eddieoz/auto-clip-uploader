@@ -533,10 +533,11 @@ class TestVarietySchedule:
         assert reelsfy.screencast_mode_for_frame(299, 30.0) == "screen_zoom"
 
     def test_pattern_alternates_every_5s(self):
+        # The rotation is four modes long now; consecutive segments differ.
         assert reelsfy.screencast_mode_for_frame(299, 30.0) == "screen_zoom"
-        assert reelsfy.screencast_mode_for_frame(300, 30.0) == "pip"
-        assert reelsfy.screencast_mode_for_frame(449, 30.0) == "pip"
-        assert reelsfy.screencast_mode_for_frame(450, 30.0) == "screen_zoom"
+        assert reelsfy.screencast_mode_for_frame(300, 30.0) == "face_zoom"
+        assert reelsfy.screencast_mode_for_frame(449, 30.0) == "face_zoom"
+        assert reelsfy.screencast_mode_for_frame(450, 30.0) == "face_wide"
 
     def test_segment_seconds_is_5(self):
         assert reelsfy.SCREENCAST_SEGMENT_SECONDS == 5
@@ -664,6 +665,8 @@ class TestScreencastEndToEnd:
         captured = capsys.readouterr()
         assert "Screencast mode switch" in captured.out
 
+
+
     def test_screencast_missing_face_holds_badge(self, capsys):
         """After frames run out of detections the badge is held, not dropped."""
         frame = make_screencast_frame()
@@ -723,3 +726,358 @@ class TestScreencastEndToEnd:
             ring_w = max(2, d // 30)
             ring_pixel = written[bcy, bcx + d // 2 - ring_w // 2]
             assert ring_pixel.min() > 230
+# ---------------------------------------------------------------------------
+# 7. Screencast face modes (face_zoom / face_wide)
+#
+# The screencast path used to alternate only pip <-> screen_zoom, so a
+# screencast lost the face dynamics the talking-head path still had (close-up,
+# wide, face tracking). These modes put a tracked face crop back into the
+# screencast rotation, alongside the badge rather than instead of it.
+# ---------------------------------------------------------------------------
+
+
+class TestFaceModeSchedule:
+    """The rotation cycles through four modes instead of alternating two."""
+
+    def test_first_segment_is_pip(self):
+        assert reelsfy.screencast_mode_for_frame(0, 30.0) == "pip"
+        assert reelsfy.screencast_mode_for_frame(149, 30.0) == "pip"
+
+    def test_second_segment_is_screen_zoom(self):
+        assert reelsfy.screencast_mode_for_frame(150, 30.0) == "screen_zoom"
+        assert reelsfy.screencast_mode_for_frame(299, 30.0) == "screen_zoom"
+
+    def test_third_segment_is_face_zoom(self):
+        assert reelsfy.screencast_mode_for_frame(300, 30.0) == "face_zoom"
+        assert reelsfy.screencast_mode_for_frame(449, 30.0) == "face_zoom"
+
+    def test_fourth_segment_is_face_wide(self):
+        assert reelsfy.screencast_mode_for_frame(450, 30.0) == "face_wide"
+        assert reelsfy.screencast_mode_for_frame(599, 30.0) == "face_wide"
+
+    def test_rotation_wraps_back_to_pip(self):
+        assert reelsfy.screencast_mode_for_frame(600, 30.0) == "pip"
+        assert reelsfy.screencast_mode_for_frame(750, 30.0) == "screen_zoom"
+        assert reelsfy.screencast_mode_for_frame(900, 30.0) == "face_zoom"
+
+    def test_cycle_length_is_four(self):
+        assert len(reelsfy.SCREENCAST_MODE_CYCLE) == 4
+        assert reelsfy.SCREENCAST_MODE_CYCLE == (
+            "pip",
+            "screen_zoom",
+            "face_zoom",
+            "face_wide",
+        )
+
+    def test_every_mode_in_cycle_is_known(self):
+        for mode in reelsfy.SCREENCAST_MODE_CYCLE:
+            assert mode in reelsfy.SCREENCAST_RENDER_MODES
+
+    def test_auto_visits_every_mode_over_a_full_cycle(self):
+        seen = {
+            reelsfy.screencast_mode_for_frame(fc, 30.0)
+            for fc in (0, 150, 300, 450)
+        }
+        assert seen == set(reelsfy.SCREENCAST_MODE_CYCLE)
+
+    def test_face_zoom_is_tighter_than_face_wide(self):
+        """The two face modes differ in crop width, not just in name."""
+        assert reelsfy.FACE_ZOOM_WIDTH_RATIO < reelsfy.FACE_WIDE_WIDTH_RATIO
+
+    def test_forced_face_zoom_overrides_schedule(self):
+        for fc in (0, 300, 600, 900):
+            assert (
+                reelsfy.resolve_screencast_mode(fc, 30.0, forced="face_zoom")
+                == "face_zoom"
+            )
+
+    def test_forced_face_wide_overrides_schedule(self):
+        for fc in (0, 300, 600, 900):
+            assert (
+                reelsfy.resolve_screencast_mode(fc, 30.0, forced="face_wide")
+                == "face_wide"
+            )
+
+    def test_face_modes_are_valid_env_values(self):
+        assert "face_zoom" in reelsfy.FRAMING_MODE_VALID
+        assert "face_wide" in reelsfy.FRAMING_MODE_VALID
+
+    def test_face_modes_classify_as_screencast(self):
+        for mode in ("face_zoom", "face_wide"):
+            assert (
+                reelsfy.detect_layout([], FRAME_SHAPE, 0.0, forced_mode=mode)
+                == "screencast"
+            )
+
+
+class TestComputeFaceCrop:
+    """9:16 crop window centered on the tracked face, clamped to the frame."""
+
+    def test_crop_is_9_16(self):
+        _, _, w, h = reelsfy.compute_face_crop(
+            (960, 540), 300, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        assert h == int(w * 16 / 9)
+
+    def test_crop_centers_on_the_face(self):
+        x, y, w, h = reelsfy.compute_face_crop(
+            (960, 540), 300, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        assert abs((x + w / 2) - 960) <= 1
+        assert abs((y + h / 2) - 540) <= 1
+
+    def test_zoom_is_tighter_than_wide(self):
+        _, _, zoom_w, _ = reelsfy.compute_face_crop(
+            (960, 540), 300, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        _, _, wide_w, _ = reelsfy.compute_face_crop(
+            (960, 540), 300, FRAME_SHAPE, reelsfy.FACE_WIDE_WIDTH_RATIO
+        )
+        assert zoom_w < wide_w
+
+    def test_crop_never_exceeds_the_frame(self):
+        """A huge face side must clamp to the frame, not overflow it."""
+        x, y, w, h = reelsfy.compute_face_crop(
+            (960, 540), 5000, FRAME_SHAPE, reelsfy.FACE_WIDE_WIDTH_RATIO
+        )
+        assert w <= 1920 and h <= 1080
+        assert x >= 0 and y >= 0
+        assert x + w <= 1920 and y + h <= 1080
+
+    def test_face_near_left_edge_is_clamped_inside(self):
+        x, y, w, h = reelsfy.compute_face_crop(
+            (5, 200), 300, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        assert x >= 0
+        assert x + w <= 1920
+
+    def test_push_in_shrinks_the_window(self):
+        base = reelsfy.compute_face_crop(
+            (960, 540), 300, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        pushed = reelsfy.compute_face_crop(
+            (960, 540),
+            300,
+            FRAME_SHAPE,
+            reelsfy.FACE_ZOOM_WIDTH_RATIO,
+            push_scale=reelsfy.FACE_MODE_PUSH_IN_END_SCALE,
+        )
+        assert pushed[2] < base[2]
+
+    def test_push_in_ends_at_declared_scale(self):
+        base_w = reelsfy.compute_face_crop(
+            (960, 540), 300, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )[2]
+        end_w = reelsfy.compute_face_crop(
+            (960, 540),
+            300,
+            FRAME_SHAPE,
+            reelsfy.FACE_ZOOM_WIDTH_RATIO,
+            push_scale=reelsfy.FACE_MODE_PUSH_IN_END_SCALE,
+        )[2]
+        assert abs(end_w / base_w - reelsfy.FACE_MODE_PUSH_IN_END_SCALE) < 0.02
+
+    def test_max_width_ratio_clamps_a_very_large_face(self):
+        """A face big enough to ask for more than the cap must be clamped to
+        the cap, not to the full frame width. Uses the portrait capture shape
+        (1080x1920), which is where the cap is the binding constraint."""
+        x, y, w, h = reelsfy.compute_face_crop(
+            (540, 200), 900, (1920, 1080), reelsfy.FACE_WIDE_WIDTH_RATIO
+        )
+        assert w == int(1080 * reelsfy.FACE_MODE_MAX_WIDTH_RATIO)
+        assert w < 1080
+
+    def test_height_constraint_still_wins_on_a_short_frame(self):
+        """On a 1080-tall landscape frame a 9:16 window is capped by HEIGHT
+        (1080*9/16), independently of the width cap. A face large enough that
+        width*16/9 exceeds the frame height must be clamped by height."""
+        x, y, w, h = reelsfy.compute_face_crop(
+            (960, 540), 900, FRAME_SHAPE, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        assert h == 1080
+        assert w == int(1080 * 9 / 16)
+
+    def test_push_in_still_moves_when_the_clamp_binds(self):
+        """Regression: clamping after the push-in collapsed face_wide to the
+        full frame and cancelled its motion entirely. The cap must be applied
+        first so the push-in still changes the window."""
+        side = 438  # the real median smoothed face side on a 1080-wide capture
+        shape = (1920, 1080)
+        base_w = reelsfy.compute_face_crop(
+            (540, 200), side, shape, reelsfy.FACE_WIDE_WIDTH_RATIO
+        )[2]
+        end_w = reelsfy.compute_face_crop(
+            (540, 200),
+            side,
+            shape,
+            reelsfy.FACE_WIDE_WIDTH_RATIO,
+            push_scale=reelsfy.FACE_MODE_PUSH_IN_END_SCALE,
+        )[2]
+        # Both widths are at the clamp, and the push-in still bites.
+        assert base_w == int(1080 * reelsfy.FACE_MODE_MAX_WIDTH_RATIO)
+        assert end_w < base_w
+        assert abs(end_w / base_w - reelsfy.FACE_MODE_PUSH_IN_END_SCALE) < 0.02
+
+    def test_face_wide_is_never_the_whole_frame(self):
+        """face_wide must remain a real crop on a portrait source, otherwise it
+        is a static duplicate of the un-cropped frame."""
+        for side in (300, 438, 600, 900):
+            x, y, w, h = reelsfy.compute_face_crop(
+                (540, 200), side, (1920, 1080), reelsfy.FACE_WIDE_WIDTH_RATIO
+            )
+            assert w < 1080, f"face_wide collapsed to the full frame at side={side}"
+
+    def test_real_portrait_face_modes_are_distinct(self):
+        """On the measured capture geometry (1080x1920, face side ~438) the
+        two face modes must differ in crop size AND both stay in bounds."""
+        shape = (1920, 1080)
+        zoom = reelsfy.compute_face_crop(
+            (540, 200), 438, shape, reelsfy.FACE_ZOOM_WIDTH_RATIO
+        )
+        wide = reelsfy.compute_face_crop(
+            (540, 200), 438, shape, reelsfy.FACE_WIDE_WIDTH_RATIO
+        )
+        assert zoom[2] < wide[2]
+        for x, y, w, h in (zoom, wide):
+            assert 0 <= x and 0 <= y
+            assert x + w <= 1080 and y + h <= 1920
+            assert abs(h / w - 16 / 9) < 0.01
+
+
+class TestFaceModePushIn:
+    """The in-segment push-in eases the crop tighter across the segment."""
+
+    def test_progress_starts_at_start_scale(self):
+        assert reelsfy.compute_face_push_in(0.0) == pytest.approx(
+            reelsfy.FACE_MODE_PUSH_IN_START_SCALE
+        )
+
+    def test_progress_ends_at_end_scale(self):
+        assert reelsfy.compute_face_push_in(1.0) == pytest.approx(
+            reelsfy.FACE_MODE_PUSH_IN_END_SCALE
+        )
+
+    def test_push_in_is_monotonically_tighter(self):
+        values = [reelsfy.compute_face_push_in(i / 10) for i in range(11)]
+        assert all(a > b for a, b in zip(values, values[1:]))
+
+    def test_progress_is_clamped_outside_zero_one(self):
+        assert reelsfy.compute_face_push_in(-5.0) == pytest.approx(
+            reelsfy.FACE_MODE_PUSH_IN_START_SCALE
+        )
+        assert reelsfy.compute_face_push_in(5.0) == pytest.approx(
+            reelsfy.FACE_MODE_PUSH_IN_END_SCALE
+        )
+
+    def test_push_in_end_scale_is_tighter_than_start(self):
+        assert (
+            reelsfy.FACE_MODE_PUSH_IN_END_SCALE
+            < reelsfy.FACE_MODE_PUSH_IN_START_SCALE
+        )
+
+
+class TestFaceModesEndToEnd:
+    """The face modes render real 9:16 frames on the screencast path."""
+
+    def _run_forced(self, mode, monkeypatch):
+        monkeypatch.setenv("FRAMING_MODE", mode)
+        frame = make_screencast_frame()
+        return _run_generate_short(
+            frame, cascade_boxes=[list(SC_FACE)], debug_faces=True
+        )
+
+    def test_face_zoom_renders_1080x1920(self, monkeypatch):
+        result, writer = self._run_forced("face_zoom", monkeypatch)
+        assert result == "tmp/final-output_reel.mp4"
+        assert writer.write.call_count >= 1
+        for call in writer.write.call_args_list:
+            assert call.args[0].shape == (1920, 1080, 3)
+
+    def test_face_wide_renders_1080x1920(self, monkeypatch):
+        result, writer = self._run_forced("face_wide", monkeypatch)
+        assert result == "tmp/final-output_reel.mp4"
+        assert writer.write.call_count >= 1
+        for call in writer.write.call_args_list:
+            assert call.args[0].shape == (1920, 1080, 3)
+
+    def test_face_modes_carry_no_badge(self, monkeypatch):
+        """The badge belongs to the pip mode; a full-frame face crop has no
+        ring in the corner where the badge would be."""
+        result, writer = self._run_forced("face_zoom", monkeypatch)
+        assert result == "tmp/final-output_reel.mp4"
+        d = int(1080 * reelsfy.PIP_BADGE_DIAMETER_RATIO)
+        margin = max(10, int(1080 * 0.03))
+        bcx = 1080 - d // 2 - margin
+        bcy = d // 2 + margin
+        ring_w = max(2, d // 30)
+        written = writer.write.call_args_list[0].args[0]
+        assert written[bcy, bcx + d // 2 - ring_w // 2].min() <= 230
+
+    def test_face_zoom_and_face_wide_differ(self, monkeypatch):
+        _, zoom_writer = self._run_forced("face_zoom", monkeypatch)
+        _, wide_writer = self._run_forced("face_wide", monkeypatch)
+        zoom_frame = zoom_writer.write.call_args_list[0].args[0]
+        wide_frame = wide_writer.write.call_args_list[0].args[0]
+        assert not np.array_equal(zoom_frame, wide_frame)
+
+    def test_face_mode_falls_back_when_face_is_lost(self, monkeypatch):
+        """No face at all in the render loop must still write frames, not
+        crash or stall the encoder."""
+        monkeypatch.setenv("FRAMING_MODE", "face_zoom")
+        frame = make_screencast_frame()
+
+        detector = _make_detector(lookahead_result=0, single_result=0)
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.side_effect = [(True, frame.copy()) for _ in range(3)] + [
+            (False, None)
+        ] * 50
+        cap.grab.return_value = True
+        cap.retrieve.return_value = (True, frame.copy())
+        cap.get.side_effect = lambda attr: {
+            cv2.CAP_PROP_FRAME_WIDTH: 1920.0,
+            cv2.CAP_PROP_FRAME_HEIGHT: 1080.0,
+            cv2.CAP_PROP_FPS: 30.0,
+            cv2.CAP_PROP_FRAME_COUNT: 90.0,
+        }.get(attr, 0.0)
+
+        calls = {"n": 0}
+
+        def detect(gray, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 31:  # sampler + first loop frame
+                return np.array([list(SC_FACE)], dtype=np.int32)
+            return np.array([], dtype=np.int32).reshape(0, 4)
+
+        cascade = MagicMock()
+        cascade.detectMultiScale.side_effect = detect
+        writer = MagicMock()
+
+        with patch.object(reelsfy.cv2, "VideoCapture", return_value=cap), patch.object(
+            reelsfy.cv2, "VideoWriter", return_value=writer
+        ), patch.object(reelsfy.cv2, "CascadeClassifier", return_value=cascade), patch.object(
+            reelsfy.cv2, "destroyAllWindows"
+        ), patch.object(
+            reelsfy.subprocess, "Popen", return_value=_success_pipe_proc()
+        ), patch.object(
+            reelsfy, "_PipeFrameWriter", return_value=writer
+        ), patch.object(reelsfy.subprocess, "call"), patch.object(
+            reelsfy, "TalkingFaceDetector", return_value=detector
+        ):
+            result = reelsfy.generate_short("input.mp4", "output_reel.mp4")
+
+        assert result == "tmp/final-output_reel.mp4"
+        # Every frame still written despite the detection loss.
+        assert writer.write.call_count == 3
+
+    def test_pip_mode_still_renders_the_badge(self, monkeypatch):
+        """Bringing the face modes back must not disturb the badge."""
+        result, writer = self._run_forced("pip", monkeypatch)
+        assert result == "tmp/final-output_reel.mp4"
+        d = int(1080 * reelsfy.PIP_BADGE_DIAMETER_RATIO)
+        margin = max(10, int(1080 * 0.03))
+        bcx = 1080 - d // 2 - margin
+        bcy = d // 2 + margin
+        ring_w = max(2, d // 30)
+        written = writer.write.call_args_list[0].args[0]
+        assert written[bcy, bcx + d // 2 - ring_w // 2].min() > 230
