@@ -332,7 +332,11 @@ class TestResolveTopicStartCue:
 
     @pytest.mark.parametrize("flag", ["false", 0, 1, None])
     def test_non_bool_topic_complete_is_ignored(self, monkeypatch, flag):
-        # Only a real JSON false means "incomplete"; a string/0/1 does not.
+        # Only a real JSON false means "incomplete"; a string/0/1 does not, so
+        # the VERDICT stays None and the summary log never reports a
+        # completeness the model did not give. The explicit, strictly-earlier
+        # cue named alongside it is a separate, more specific signal and is
+        # still honoured — dropping it is what left clips starting mid-topic.
         reply = json.dumps(
             {
                 "topic_complete": flag,
@@ -342,7 +346,7 @@ class TestResolveTopicStartCue:
             }
         )
         result = _resolve_with_reply(monkeypatch, reply)[0]
-        assert result == (5, None, None, [])
+        assert result == (5, None, 2, [])
 
     def test_malformed_reply_falls_back_to_legacy(self, monkeypatch):
         # No JSON at all -> all-legacy shape.

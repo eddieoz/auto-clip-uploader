@@ -3,7 +3,7 @@ Hook teaser tests for Story 7 (P2.2): cold-open hook teaser in reelsfy.py.
 
 Covers:
 1. parse_hook_fields validation: all three fields required, SRT timestamps
-   via parse_srt_time, 1.5-6 s range, inside the segment, end > start.
+   via parse_srt_time, the hook teaser duration band, inside the segment, end > start.
 2. generate_viral prompt/json template paths mention the hook fields
    (string assertions only - no live LLM call).
 3. Teaser pipeline: cut command timestamps (NVENC style), hook drawtext
@@ -143,17 +143,17 @@ class TestParseHookFields:
         assert reelsfy.parse_hook_fields(segment, 0.0, 35.0) is None
 
     def test_range_shorter_than_1_5s_returns_none(self):
-        # 1.0 s span: below the 1.5 s minimum.
+        # 1.0 s span: below the 2.5 s minimum.
         segment = _hook_segment(
             hook_start="00:00:05,000", hook_end="00:00:06,000"
         )
 
         assert reelsfy.parse_hook_fields(segment, 0.0, 35.0) is None
 
-    def test_range_longer_than_6s_returns_none(self):
-        # 6.5 s span: above the 6 s maximum.
+    def test_range_longer_than_9s_returns_none(self):
+        # 9.5 s span: above the 9 s maximum.
         segment = _hook_segment(
-            hook_start="00:00:05,000", hook_end="00:00:11,500"
+            hook_start="00:00:05,000", hook_end="00:00:14,500"
         )
 
         assert reelsfy.parse_hook_fields(segment, 0.0, 35.0) is None

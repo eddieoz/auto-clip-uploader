@@ -2428,19 +2428,24 @@ def _parse_boundary_reply(content, cue_count):
 
 
 def _parse_earlier_start_cue(payload, cue_index, cue_count):
-    """Validate the completeness signal; return an earlier cue index or None.
+    """Validate the earlier-cue answer; return an earlier cue index or None.
 
-    ``topic_complete`` says whether the heuristic cue already captures the
-    whole topic. Only a literal JSON ``false`` counts as "incomplete" — an
-    absent or non-bool flag is treated as no signal at all. When it is false,
-    ``earlier_start_cue`` names the cue where the topic actually begins and
-    must be a valid index strictly before ``cue_index`` (the extension only
-    ever moves the start earlier). Every other shape — a missing cue, an
-    out-of-range or later index — returns None.
+    ``earlier_start_cue`` is honored whenever the model supplies a usable
+    index strictly before ``cue_index``, whether or not it also set
+    ``topic_complete`` to a literal false. It used to require that boolean,
+    which silently dropped the answer whenever the model named an earlier cue
+    and omitted (or mangled) the redundant flag — the very reply shape that
+    carries the most actionable signal, and the one behind a clip starting
+    mid-topic. An explicit, in-range, strictly-earlier cue is the stronger and
+    more specific instruction, and honouring it only ever moves the window
+    earlier (bounded by the duration cap). Every other shape — a missing cue,
+    a non-integer, an out-of-range or later index — returns None.
+
+    The ``topic_complete`` VERDICT itself is parsed separately and still only
+    accepts a literal false, so the observability log never reports a
+    completeness the model did not give.
     """
     if not isinstance(payload, dict):
-        return None
-    if payload.get('topic_complete') is not False:
         return None
     earlier = payload.get('earlier_start_cue')
     if (
@@ -2500,7 +2505,7 @@ Return ONLY a JSON object (no markdown, no code block markers) with EXACTLY this
 - "topic_complete": true when the cue you pick for "cue_number" already captures the whole final topic; false when it does NOT — the topic actually began earlier than that cue and context is missing.
 - "cue_number": the cue number where the FINAL topic BEGINS — the first cue that belongs to the final topic, not the previous topic's tail.
 - "earlier_start_cue": only when "topic_complete" is false, the earlier cue number where the final topic actually BEGINS (an integer strictly less than "cue_number"); otherwise null.
-- "hook_candidates": up to 3 hook candidates INSIDE the final topic, best first. Each candidate spans ONE engaging sentence (2-5 seconds long): "cue_start" is the first cue number of the hook sentence, "cue_end" is the last cue number of the hook sentence, and "text" is the hook sentence verbatim. A candidate MUST NOT be the first sentence of the final topic (the clip already opens there, so a hook there only repeats it) — prefer an engaging sentence from mid-topic instead. Use an empty list when no clear hook sentence exists."""
+- "hook_candidates": up to 3 hook candidates INSIDE the final topic, best first. Each candidate is a self-contained, curiosity-driving stretch of 3-9 seconds: "cue_start" is the first cue number of that stretch, "cue_end" is the last cue number of it, and "text" is the hook wording verbatim. Cues here run several seconds each, so aim for a stretch of 1-3 consecutive cues and ALWAYS return a span that is at least 3 seconds and at most 9 seconds long — a shorter span cannot be used as a cold open. A candidate MUST NOT be the first sentence of the final topic (the clip already opens there, so a hook there only repeats it) — prefer an engaging stretch from mid-topic instead. Use an empty list when no clear hook exists."""
 
     system = """You identify topic boundaries in video transcripts and propose hook candidates. You receive numbered cues covering a full short capture and must report whether the final topic is captured in full, the cue number where the final topic begins, an earlier cue when it is not, plus hook candidates inside the final topic."""
 
@@ -2542,14 +2547,35 @@ Return ONLY a JSON object (no markdown, no code block markers) with EXACTLY this
         return None, None, None, []
 
 
-def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments, segments):
+def trim_window_to_topic_start(
+    cue_index,
+    optimized_segment,
+    supporting_segments,
+    segments,
+    min_duration=None,
+    max_duration=None,
+):
     """Move the optimized window start to the resolved final-topic cue.
 
     The end time and concluding topic are untouched — the recency anchor
     (the final topic still concludes near the capture's end) is preserved.
-    A cue that is not strictly after the current window start leaves the
-    window unchanged, and supporting segments that begin before the new
-    window start are dropped. Returns the (optimized, supporting) pair.
+
+    The cue is applied in EITHER direction. It used to be applied only when it
+    started strictly AFTER the window, which silently threw away the boundary
+    model's most valuable answer: "the final topic actually begins earlier than
+    your window". That left the previous topic's tail inside the clip — the
+    exact symptom of the topic not being identified from the capture start. A
+    cue at the window start is still a no-op.
+
+    The window stays inside its bounds whichever way the start moves:
+    ``min_duration`` (seconds, None = no floor) stops a cue near the capture end
+    from collapsing the clip, and ``max_duration`` (None = no cap) stops an
+    early cue from growing the clip past the cap. Both clamp the start and are
+    reported. The start is never before 0.0 s.
+
+    Moving the start EARLIER only grows the window, so supporting segments are
+    kept as-is; moving it LATER drops the ones that begin before the new start.
+    Returns the (optimized, supporting) pair.
     """
     if not isinstance(cue_index, int) or isinstance(cue_index, bool):
         return optimized_segment, supporting_segments
@@ -2563,21 +2589,60 @@ def trim_window_to_topic_start(cue_index, optimized_segment, supporting_segments
     if cue_seconds is None or window_seconds is None or end_seconds is None:
         print("Topic boundary LLM: could not compare cue/window timestamps; keeping window unchanged")
         return optimized_segment, supporting_segments
-    if cue_seconds <= window_seconds:
-        print(f"Topic boundary LLM: cue {cue_index} starts at or before the window start; keeping window unchanged")
+    if abs(cue_seconds - window_seconds) < 1e-9:
+        print(f"Topic boundary LLM: cue {cue_index} is already the window start; keeping window unchanged")
         return optimized_segment, supporting_segments
 
+    moving_earlier = cue_seconds < window_seconds
+    new_start = max(0.0, cue_seconds)
+    if (
+        isinstance(min_duration, (int, float))
+        and not isinstance(min_duration, bool)
+        and end_seconds - new_start < float(min_duration)
+    ):
+        clamped = max(0.0, end_seconds - float(min_duration))
+        print(
+            f"Topic boundary trim: cue {cue_index} at {new_start:.1f}s would leave "
+            f"{end_seconds - new_start:.1f}s, under the {float(min_duration):.0f}s "
+            f"floor; clamping the window start to {clamped:.1f}s"
+        )
+        new_start = clamped
+    # The cap is enforced here as well as in
+    # extend_window_to_earlier_topic_start: moving the start earlier is now
+    # reachable from this call, and without the cap an early cue would produce
+    # a clip longer than max_duration.
+    if (
+        isinstance(max_duration, (int, float))
+        and not isinstance(max_duration, bool)
+        and end_seconds - new_start > float(max_duration)
+    ):
+        clamped = max(0.0, end_seconds - float(max_duration))
+        print(
+            f"Topic boundary trim: cue {cue_index} at {new_start:.1f}s would exceed "
+            f"the {float(max_duration):.0f}s cap; clamping the window start to {clamped:.1f}s"
+        )
+        new_start = clamped
+
     previous_start = optimized_segment.get('start_time')
-    optimized_segment['start_time'] = _segment_start_srt(cue)
-    optimized_segment['duration'] = end_seconds - cue_seconds
+    if abs(new_start - cue_seconds) < 1e-9:
+        optimized_segment['start_time'] = _segment_start_srt(cue)
+    else:
+        optimized_segment['start_time'] = format_timestamp(round(new_start, 3))
+    optimized_segment['duration'] = end_seconds - new_start
 
-    trimmed_supporting = []
-    for segment in supporting_segments:
-        segment_seconds = _segment_start_seconds(segment)
-        if segment_seconds is None or segment_seconds >= cue_seconds:
-            trimmed_supporting.append(segment)
+    if moving_earlier:
+        # The window only grew, so every supporting segment is still inside it.
+        direction = "extend"
+        trimmed_supporting = list(supporting_segments)
+    else:
+        direction = "trim"
+        trimmed_supporting = []
+        for segment in supporting_segments:
+            segment_seconds = _segment_start_seconds(segment)
+            if segment_seconds is None or segment_seconds >= new_start:
+                trimmed_supporting.append(segment)
 
-    print(f"✂️ Topic boundary trim: window start {previous_start} → {optimized_segment['start_time']} (cue {cue_index}); supporting segments {len(supporting_segments)} → {len(trimmed_supporting)}")
+    print(f"✂️ Topic boundary {direction}: window start {previous_start} → {optimized_segment['start_time']} (cue {cue_index}); supporting segments {len(supporting_segments)} → {len(trimmed_supporting)}")
     return optimized_segment, trimmed_supporting
 
 
@@ -2771,7 +2836,161 @@ def snap_window_to_boundaries(window, segments, min_start_srt=None, min_duration
         return window
 
 
-def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments):
+def build_sentence_spans(transcript_segments):
+    """Sentence units with exact word-timestamp bounds (pure).
+
+    Whisper cues are short (~2 s on a real 90 s capture, measured 0.92-3.5 s)
+    and routinely break mid-sentence, so a hook cut on cue boundaries starts
+    and ends mid-thought. The transcribers already emit word-level timestamps
+    for every word, so the real sentence boundaries are recoverable: walk the
+    flattened word stream and close a sentence after each word whose text ends
+    one. A trailing partial sentence is flushed too, so the last one is not
+    lost.
+
+    Returns a chronological list of {"index" (1-based), "start", "end",
+    "text"}, or [] when the transcript carries no usable word data so callers
+    fall back to the cue-based path. Never raises.
+    """
+    sentences = []
+    pending = []
+
+    def _close():
+        if not pending:
+            return
+        start = pending[0]["start"]
+        end = pending[-1]["end"]
+        text = " ".join(word["word"] for word in pending).strip()
+        pending.clear()
+        if text and end > start:
+            sentences.append(
+                {
+                    "index": len(sentences) + 1,
+                    "start": start,
+                    "end": end,
+                    "text": text,
+                }
+            )
+
+    try:
+        for segment in transcript_segments or []:
+            if not isinstance(segment, dict):
+                continue
+            for word in segment.get("words") or []:
+                if not isinstance(word, dict):
+                    continue
+                try:
+                    start = float(word.get("start"))
+                    end = float(word.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                text = str(word.get("word") or "").strip()
+                if not text or end <= start:
+                    continue
+                pending.append({"word": text, "start": start, "end": end})
+                if text[-1] in ".!?":
+                    _close()
+        _close()
+    except Exception as e:
+        print(f"Sentence span build failed ({e}); keeping the cue-based hook")
+        return []
+    return sentences
+
+
+def _sentence_hook_overlap_score(sentence, hook_text):
+    """How much of `hook_text` a sentence covers, as a 0-1 ratio.
+
+    Pure: the ratio of hook words present in the sentence, so the sentence the
+    model actually quoted outranks one that merely overlaps in time."""
+    try:
+        wanted = {word for word in _HOOK_WORD_RE.findall(hook_text or "" if isinstance(hook_text, str) else "")}
+        if not wanted:
+            return 0.0
+        have = set(_HOOK_WORD_RE.findall(sentence.get("text") or ""))
+        return len(wanted & have) / len(wanted)
+    except Exception:
+        return 0.0
+
+
+def refine_hook_span_to_sentences(
+    hook_start,
+    hook_end,
+    hook_text,
+    sentences,
+    min_duration=None,
+    max_duration=None,
+    window_end=None,
+):
+    """Snap a cue-derived hook span onto real sentence boundaries (pure).
+
+    The cue span is only an approximation of the hook — it starts wherever the
+    cue started, mid-sentence. This picks the sentence inside that span which
+    best covers the hook wording, then extends forward across WHOLE following
+    sentences until the hook is long enough to read as a cold open. Every
+    candidate span is therefore sentence-aligned on both edges.
+
+    Returns (start, end) in float seconds, or the input span unchanged when
+    nothing better is available: no sentences, no sentence overlapping the
+    span, or no sentence-aligned span that satisfies the duration band. Never
+    raises.
+    """
+    try:
+        if not sentences or hook_start is None or hook_end is None:
+            return hook_start, hook_end
+        if hook_end <= hook_start:
+            return hook_start, hook_end
+        band_min = min_duration if min_duration else HOOK_TEASER_MIN_DURATION
+        band_max = max_duration if max_duration else HOOK_TEASER_MAX_DURATION
+        target = min(band_max, HOOK_TARGET_DURATION)
+
+        overlapping = [
+            sentence
+            for sentence in sentences
+            if sentence["end"] > hook_start + 1e-9
+            and sentence["start"] < hook_end - 1e-9
+            # A sentence that runs past the resolved window would put hook
+            # audio outside the clip, so it is not a candidate at all.
+            and (window_end is None or sentence["end"] <= window_end + 1e-9)
+        ]
+        if not overlapping:
+            return hook_start, hook_end
+
+        def _rank(sentence):
+            shared = min(hook_end, sentence["end"]) - max(hook_start, sentence["start"])
+            return (_sentence_hook_overlap_score(sentence, hook_text), shared)
+
+        chosen = max(overlapping, key=_rank)
+        position = sentences.index(chosen)
+
+        # A run of whole sentences, grown only while it stays inside the band
+        # and inside the resolved window.
+        run_start, run_end, cursor = chosen["start"], chosen["end"], position
+        while (run_end - run_start) < target - 1e-9 and cursor + 1 < len(sentences):
+            following = sentences[cursor + 1]
+            if window_end is not None and following["end"] > window_end + 1e-9:
+                break
+            if (following["end"] - run_start) > band_max + 1e-9:
+                break
+            run_end = following["end"]
+            cursor += 1
+
+        for candidate_start, candidate_end in (
+            (run_start, run_end),
+            (chosen["start"], chosen["end"]),
+        ):
+            if (
+                candidate_end - candidate_start >= band_min - 1e-9
+                and candidate_end - candidate_start <= band_max + 1e-9
+            ):
+                return candidate_start, candidate_end
+        return hook_start, hook_end
+    except Exception as e:
+        print(f"Hook span refinement failed ({e}); keeping the cue-based span")
+        return hook_start, hook_end
+
+
+def select_hook_candidate(
+    candidates, window_start_srt, window_end_srt, segments, sentences=None
+):
     """S5: first hook candidate inside the resolved window (pure).
 
     Candidates come from the boundary LLM pass and reference cues by their
@@ -2853,6 +3072,26 @@ def select_hook_candidate(candidates, window_start_srt, window_end_srt, segments
                     or format_timestamp(span_end),
                     "hook_text": text.strip(),
                 }
+                # Snap the cue-derived span onto real sentence boundaries when
+                # word timestamps are available, so the teaser neither opens nor
+                # closes mid-sentence. Falls back to the cue span unchanged.
+                if sentences:
+                    refined_start, refined_end = refine_hook_span_to_sentences(
+                        span_start,
+                        span_end,
+                        text,
+                        sentences,
+                        min_duration=HOOK_TEASER_MIN_DURATION,
+                        max_duration=HOOK_TEASER_MAX_DURATION,
+                        window_end=window_end,
+                    )
+                    if (refined_start, refined_end) != (span_start, span_end):
+                        survivor["hook_start_time"] = format_timestamp(
+                            round(refined_start, 3)
+                        )
+                        survivor["hook_end_time"] = format_timestamp(
+                            round(refined_end, 3)
+                        )
                 # B2: the first mid-band survivor wins outright; an edge
                 # survivor is only kept as the fallback.
                 if band_start - 1e-9 <= span_start <= band_end + 1e-9:
@@ -3305,6 +3544,7 @@ def generate_viral(
     min_duration=35.0,
     max_duration=59.0,
     source_link=None,
+    word_segments=None,
 ):
     # GEMINI WAS HERE
 
@@ -3440,6 +3680,8 @@ def generate_viral(
                 optimized_segment,
                 supporting_segments,
                 topic_analysis['segments'],
+                min_duration=min_duration,
+                max_duration=max_duration,
             )
         if earlier_start_cue is not None:
             optimized_segment, supporting_segments = (
@@ -3654,6 +3896,7 @@ def generate_viral(
             optimized_segment['start_time'],
             optimized_segment['end_time'],
             topic_analysis['segments'],
+            sentences=build_sentence_spans(word_segments),
         )
         resolved_window_section = (
             "\nRESOLVED TOPIC WINDOW:\n"
@@ -3698,7 +3941,7 @@ and have a minimum of {min_duration} seconds and maximum of {max_duration} secon
 Do not select a segment with partial or incomplete information.
 
 HOOK TEASER (optional):
-- "hook_start_time" and "hook_end_time": SRT timestamps (HH:MM:SS,mmm) INSIDE the segment, spanning the single most engaging sentence (2-5 seconds long).
+- "hook_start_time" and "hook_end_time": SRT timestamps (HH:MM:SS,mmm) INSIDE the segment, spanning an engaging, self-contained stretch of 3-9 seconds. A span shorter than 3 seconds is unusable as a cold open, so pick a stretch that carries a complete point.
 - "hook_text": a punchy 4-7 word hook in {title_language} that will be burned as text over the teaser.
 - These fields are optional: only include them when a clear hook sentence exists inside the segment.
 
@@ -4338,6 +4581,7 @@ def __main__():
                 min_duration=args.min_duration,
                 max_duration=args.max_duration,
                 source_link=args.source_link,
+                word_segments=transcript_result.get("segments"),
             )
             content = viral_segments["content"]
             print(
@@ -5007,15 +5251,28 @@ def build_overlay_filters(date_text, title_text, input_label="0:v"):
 
 
 # Cold-open hook teaser (Story 7 / P2.2): when GPT returns valid hook fields
-# for a segment, a 1.5-6 s teaser cut of that moment is burned with the hook
+# for a segment, a HOOK_TEASER_MIN_DURATION..HOOK_TEASER_MAX_DURATION s teaser
+# cut of that moment is burned with the hook
 # text, cropped to 9:16, and prepended to the main clip. Audio is mastered
 # exactly once per output stream: the teaser gets the chain in its burn step
 # and the main clip keeps it in generate_subtitle's final mux; the concat
 # between them is -c copy (or a video-only re-encode fallback) and NEVER
 # re-masters audio.
 
-HOOK_TEASER_MIN_DURATION = 1.5
-HOOK_TEASER_MAX_DURATION = 6.0
+# The teaser length band. These are set from the CUE GRID, not from taste:
+# Whisper cues on a 90 s capture measure 3.7-10.9 s, so with the old 1.5-6.0 s
+# band most cues were longer than the maximum and could never be a hook, the
+# shortest two-cue span was 10.4 s (so a hook was ALWAYS a single cue), and the
+# reachable durations collapsed to five values topping out at 5.7 s -- a teaser
+# that reads as a flash. The floor also rejects the 1-2 s blink outright.
+HOOK_TEASER_MIN_DURATION = 2.5
+HOOK_TEASER_MAX_DURATION = 9.0
+# How long a sentence-aligned hook should run before it is considered long
+# enough. Below this the refine step keeps adding whole following sentences,
+# which is what stops the teaser being a 1.5 s flash.
+HOOK_TARGET_DURATION = 4.5
+# Word tokenizer for matching the quoted hook text against candidate sentences.
+_HOOK_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 # Story B1: the cold-open teaser is prepended to the clip, so a teaser taken
 # from the clip's own first seconds plays the same words twice. Any candidate
 # overlapping this opening span of the resolved window is rejected; the clip
@@ -5062,7 +5319,8 @@ def parse_hook_fields(segment, seg_start_sec, seg_end_sec):
 
     Returns (hook_start_sec, hook_end_sec, hook_text) or None. All three
     fields must be present with non-empty text; timestamps are parsed with
-    parse_srt_time and the range must be 1.5-6 s, strictly increasing, and
+    parse_srt_time and the range must sit inside the hook teaser band, be
+    strictly increasing, and
     fully inside the segment boundaries.
     """
     if not isinstance(segment, dict):
