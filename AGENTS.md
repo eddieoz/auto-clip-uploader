@@ -37,7 +37,8 @@ Auto Clip Uploader is an automated video processing system that monitors for new
 
 ### Social Media Publishing (Postiz)
 - Edited videos are appended to a disk-backed publish queue (`publish_queue.json`, gitignored) and drip-published one at a time on a configurable interval
-- Configuration is done via environment variables in `.env` (`PUBLISH_INTERVAL_MINUTES`, `PUBLISH_MAX_RETRIES`, `DASHBOARD_INTERVAL_SECONDS`)
+- Batch selection (`social_media_publisher/clip_selection.py`, default on) holds finished clips as candidates and, once editing has been quiet for `SELECTION_QUIET_MINUTES`, ranks the batch with ONE LLM call and enqueues only the top `SELECTION_LIMIT` (default 6); losing clips stay on disk, recorded in `selection_state.json` (gitignored). A ranking failure degrades to a deterministic order and logs why — publishing is never blocked. `--no-selection` restores queue-everything.
+- Configuration is done via environment variables in `.env` (`PUBLISH_INTERVAL_MINUTES`, `PUBLISH_MAX_RETRIES`, `DASHBOARD_INTERVAL_SECONDS`, `SELECTION_ENABLED`, `SELECTION_LIMIT`, `SELECTION_QUIET_MINUTES`, `SELECTION_BATCH_CAP`, `RANKING_MODEL`)
 - See `social_media_publisher/publish_queue.py` for the queue/scheduler and `social_media_publisher/publisher.py` for the Postiz posting workflow
 
 ### Video Editing Pipeline (reelsfy)

@@ -119,3 +119,4 @@ clean.sh
 reels-clips-automator/performance_test_report.json
 tmp/e2e_validation_report.json
 publish_queue.json
+selection_state.json

@@ -16,6 +16,7 @@ Built with Python 3.11, CUDA acceleration, and PyTorch for high-performance vide
 - 🎨 **Polish** - Mild visual grade, optional LUT, end-card CTA, optional music bed
 - 🖼️ **Thumbnail Creation** - Best-quality smile frame with hook-text preference
 - 📱 **Multi-Platform Publishing** - Drip publishing to Twitter, Instagram, YouTube, and more via Postiz
+- 🏆 **Batch Selection** - Finished clips are ranked and only the best N (default 6) are published; losing clips stay on disk
 - 🔍 **Face Enhancement** - Optional RealESRGAN face upscaling
 
 ## Quick Start
@@ -98,6 +99,33 @@ python reelsfy.py --file /path/to/video.mp4 --upscale --enhance --thumb
 See `reels-clips-automator/.env.example` for all video-editing options with
 defaults, and `docs/VIDEO_EDITING_IMPROVEMENT_PLAN.md` +
 `docs/VIRAL_SELECTION_IMPROVEMENT_PLAN.md` for the design behind them.
+
+### Batch Selection (publish the best N, not all)
+
+Clips are edited one at a time, so a batch has no natural boundary. Instead:
+
+- Every finished clip is held back as a **candidate** (nothing is queued yet).
+- When editing has been quiet for `SELECTION_QUIET_MINUTES` (default 20), **one
+  LLM call ranks the whole batch** from each clip's `content.txt` metadata, and
+  only the top `SELECTION_LIMIT` (default 6) are queued for publishing.
+- Fewer candidates than the limit publishes all of them — the limit is a ceiling.
+- Losing clips are **kept on disk**, marked not-selected in
+  `selection_state.json`; nothing is deleted.
+- If the ranking call fails, the batch degrades to a deterministic order and
+  says so in the log — publishing is never blocked.
+- `--no-selection` restores the old behaviour (queue every edited clip
+  immediately); `--select-limit`, `--select-quiet-minutes` and
+  `--select-batch-cap` override the env for one run.
+
+Preview a ranking against clips already on disk without queueing anything:
+
+```bash
+python3 -m social_media_publisher.clip_selection --dry-run output/<dir>... --fallback
+```
+
+(Drop `--fallback` to use the real LLM ranking. Run the monitor and this command
+inside the `reels-clips-automator` conda env — the ranking needs a working
+`openai` client.)
 
 ### OBS Replay Buffer (capture length)
 

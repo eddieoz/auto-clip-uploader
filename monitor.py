@@ -15,7 +15,9 @@ import re
 
 class NewVideoHandler(FileSystemEventHandler):
     def __init__(self, source_link=None, publish_interval_minutes=0, max_publish_retries=3,
-                 dashboard_interval_seconds=0):
+                 dashboard_interval_seconds=0, selection_enabled=True, selection_limit=6,
+                 selection_quiet_minutes=20, selection_batch_cap=0,
+                 publish_queue_path=None, selection_state_path=None):
         self.processing_files = set()  # Track files currently being processed
         self.lock = threading.Lock()
         self.video_queue = queue.Queue()  # FIFO queue for video files
@@ -26,10 +28,17 @@ class NewVideoHandler(FileSystemEventHandler):
         # Editing-side bookkeeping for the dashboard.
         self.edited_total = 0
 
-        # Disk-backed publish queue + drip scheduler. Editing appends to the queue;
-        # a background thread publishes one video at a time on the configured interval.
+        # Disk-backed publish queue + drip scheduler. Editing collects candidates;
+        # a selection pass ranks the batch and only the best clips are queued, then
+        # a background thread publishes them one at a time on the configured interval.
         from social_media_publisher.publish_queue import PublishQueue, PublishScheduler
-        queue_path = Path(__file__).parent / "publish_queue.json"
+        from social_media_publisher.clip_selection import (
+            SelectionScheduler,
+            SelectionStore,
+            read_candidate,
+        )
+        root = Path(__file__).parent
+        queue_path = Path(publish_queue_path) if publish_queue_path else root / "publish_queue.json"
         self.publish_queue = PublishQueue(str(queue_path))
         self.publish_scheduler = PublishScheduler(
             self.publish_queue,
@@ -39,10 +48,55 @@ class NewVideoHandler(FileSystemEventHandler):
         )
         self.publish_interval_minutes = publish_interval_minutes
 
+        # Batch selection: edited clips become candidates; once editing goes
+        # quiet the batch is ranked and only the top `selection_limit` are queued.
+        self.selection_enabled = selection_enabled
+        selection_path = (
+            Path(selection_state_path) if selection_state_path else root / "selection_state.json"
+        )
+        self.selection_store = SelectionStore(str(selection_path))
+        self.selection_scheduler = SelectionScheduler(
+            self.selection_store,
+            self.publish_queue,
+            limit=selection_limit,
+            quiet_seconds=selection_quiet_minutes * 60.0,
+            batch_cap=selection_batch_cap,
+            enabled=selection_enabled,
+            is_editing_busy=self.is_editing_busy,
+        )
+        # Candidates restored from a previous run have not been decided yet, but
+        # their edits are long over, so the quiet period is treated as elapsed.
+        if self.selection_store.pending():
+            self.selection_scheduler.prime_as_quiet()
+        self._reconcile_with_publish_queue()
+
         # Periodic dashboard ticker.
         self.dashboard_interval_seconds = dashboard_interval_seconds
         self.dashboard_thread = None
         self.stop_dashboard = threading.Event()
+
+    def _reconcile_with_publish_queue(self):
+        """Decide any restored candidate that a previous run already queued.
+
+        Without this, a restart could rank a clip that is already waiting in the
+        publish queue and enqueue it a second time.
+        """
+        queued = set(self.publish_queue.active_video_names())
+        if not queued:
+            return
+        for candidate in self.selection_store.pending():
+            if candidate.video_name in queued:
+                self.selection_store.mark_decided(
+                    candidate.video_name,
+                    rank=0,
+                    score=None,
+                    selected=False,
+                    reason="already in publish queue from a previous run",
+                )
+
+    def is_editing_busy(self):
+        """True while a video is being edited, so the batch is left open."""
+        return not self.video_queue.empty() or bool(self.processing_files)
         
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v")):
@@ -76,6 +130,15 @@ class NewVideoHandler(FileSystemEventHandler):
         mode = (f"{self.publish_interval_minutes} min interval"
                 if self.publish_interval_minutes > 0 else "immediate")
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Publish scheduler started ({mode})")
+        if self.selection_enabled:
+            self.selection_scheduler.start()
+            limit = self.selection_scheduler.limit
+            quiet = self.selection_scheduler.quiet_seconds / 60.0
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch selection started "
+                  f"(top {limit} clips published after {quiet:g} min of quiet editing)")
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch selection disabled — "
+                  f"every edited clip is queued immediately")
         if self.dashboard_interval_seconds > 0:
             self.stop_dashboard.clear()
             self.dashboard_thread = threading.Thread(target=self._dashboard_loop, daemon=True)
@@ -88,6 +151,7 @@ class NewVideoHandler(FileSystemEventHandler):
         if self.dashboard_thread and self.dashboard_thread.is_alive():
             self.stop_dashboard.set()
             self.dashboard_thread.join(timeout=3)
+        self.selection_scheduler.stop(timeout=5)
         self.publish_scheduler.stop(timeout=5)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Publish scheduler stopped")
 
@@ -104,14 +168,28 @@ class NewVideoHandler(FileSystemEventHandler):
             "edited_total": self.edited_total,
         }
 
+    def selection_stats(self):
+        """Snapshot of batch-selection progress for the dashboard."""
+        stats = self.selection_store.stats()
+        last = self.selection_scheduler.last_edit_finished()
+        return {
+            "pending": stats["pending"],
+            "decided": stats["decided"],
+            "last_edit": (
+                datetime.fromtimestamp(last).strftime("%H:%M:%S") if last else "n/a"
+            ),
+        }
+
     def render_dashboard(self):
         """Render a one-block status summary of editing + publishing."""
         e = self.editing_stats()
         p = self.publish_queue.stats()
+        s = self.selection_stats()
         ts = datetime.now().strftime('%H:%M:%S')
         return (
             f"╭─ 📊 Auto-Clip Uploader Status — {ts} ─────╮\n"
             f"│ ✂️  Editing    pending: {e['pending']:<3} in-progress: {e['in_progress']:<3} done: {e['edited_total']}\n"
+            f"│ 🏆 Selection  candidates: {s['pending']:<3} decided: {s['decided']:<3} last edit: {s['last_edit']}\n"
             f"│ 📤 Publishing pending: {p.get('pending', 0):<3} publishing: {p.get('publishing', 0):<3} "
             f"✅ published: {p.get('published', 0):<3} ❌ failed: {p.get('failed', 0)}\n"
             f"│ 📋 Queue total: {p.get('total', 0)}\n"
@@ -348,14 +426,39 @@ class NewVideoHandler(FileSystemEventHandler):
             if moved_files:
                 print(f"Organized {len(moved_files)} files in {video_output_dir}")
 
-                # Count a successful edit for the dashboard, then enqueue for publishing.
+                # Count a successful edit for the dashboard, then either collect the
+                # clip as a selection candidate or queue it immediately.
                 self.edited_total += 1
-                self._publish_to_social_media(video_output_dir, video_name)
+                if self.selection_enabled:
+                    self._collect_candidate(video_output_dir, video_name)
+                else:
+                    self._publish_to_social_media(video_output_dir, video_name)
             else:
                 print("No output files found to organize")
-                
+
         except Exception as e:
             print(f"Error organizing output files: {e}")
+
+    def _collect_candidate(self, video_output_dir, video_name):
+        """Hold a finished clip back for the next ranking instead of queueing it."""
+        try:
+            from social_media_publisher.clip_selection import read_candidate
+
+            candidate = read_candidate(
+                str(video_output_dir), video_name, self.source_link
+            )
+            self.selection_store.add_candidate(candidate)
+            # Restart the quiet period: the batch stays open while edits continue.
+            self.selection_scheduler.on_edit_finished()
+            stats = self.selection_store.stats()
+            print(f"🏆 Candidate '{video_name}' held for selection "
+                  f"({stats['pending']} waiting; best "
+                  f"{self.selection_scheduler.limit} will be queued)")
+        except Exception as e:
+            # A clip we cannot even record must still reach the publish queue
+            # rather than silently disappearing.
+            print(f"⚠️  Could not record candidate '{video_name}': {e}")
+            self._publish_to_social_media(video_output_dir, video_name)
     
     def _publish_to_social_media(self, video_output_dir, video_name):
         """Enqueue an edited video for drip publishing (non-blocking)."""
@@ -377,6 +480,24 @@ def is_cifs_mount(path):
     except:
         return False
 
+def build_arg_parser():
+    """CLI surface. Every flag overrides the matching environment variable."""
+    parser = argparse.ArgumentParser(description='Monitor folder for new video files to process and publish.')
+    parser.add_argument('--link', help='Optional URL of the original video/source to include in description')
+    parser.add_argument('--publish-delay', type=int, default=None,
+                        help='Minutes between publishes (overrides PUBLISH_INTERVAL_MINUTES; 0=immediate)')
+    parser.add_argument('--no-dashboard', action='store_true',
+                        help='Disable the periodic status dashboard')
+    parser.add_argument('--no-selection', action='store_true',
+                        help='Disable batch selection: queue every edited clip immediately')
+    parser.add_argument('--select-limit', type=int, default=None,
+                        help='How many of the best clips to publish per batch (overrides SELECTION_LIMIT)')
+    parser.add_argument('--select-quiet-minutes', type=int, default=None,
+                        help='Minutes of quiet editing before a batch is ranked (overrides SELECTION_QUIET_MINUTES)')
+    parser.add_argument('--select-batch-cap', type=int, default=None,
+                        help='Rank early once this many candidates are waiting (overrides SELECTION_BATCH_CAP; 0=no cap)')
+    return parser
+
 def main():
     # Load environment variables from the root .env file
     load_dotenv()
@@ -392,22 +513,17 @@ def main():
     if not video_folder_path.is_absolute():
         # Make relative paths relative to the script location
         video_folder_path = Path(__file__).parent / video_folder
-    
+
     output_folder = Path(__file__).parent / "output"
-    
+
     # Check if the path is on a CIFS mount
     use_polling = is_cifs_mount(video_folder_path)
     observer_type = "PollingObserver (CIFS detected)" if use_polling else "Observer (native filesystem)"
-    
+
     print("🎬 Video File Monitor Starting...")
 
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Monitor folder for new video files to process and publish.')
-    parser.add_argument('--link', help='Optional URL of the original video/source to include in description')
-    parser.add_argument('--publish-delay', type=int, default=None,
-                        help='Minutes between publishes (overrides PUBLISH_INTERVAL_MINUTES; 0=immediate)')
-    parser.add_argument('--no-dashboard', action='store_true',
-                        help='Disable the periodic status dashboard')
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     if args.link:
@@ -419,10 +535,28 @@ def main():
     max_retries = int(os.getenv("PUBLISH_MAX_RETRIES", "3"))
     dashboard_interval = 0 if args.no_dashboard else int(os.getenv("DASHBOARD_INTERVAL_SECONDS", "60"))
 
+    # Resolve batch selection: CLI flag overrides env, which has in-code defaults.
+    selection_enabled = (os.getenv("SELECTION_ENABLED", "true").strip().lower()
+                         != "false") and not args.no_selection
+    select_limit = args.select_limit if args.select_limit is not None else int(
+        os.getenv("SELECTION_LIMIT", "6"))
+    select_quiet = args.select_quiet_minutes if args.select_quiet_minutes is not None else int(
+        os.getenv("SELECTION_QUIET_MINUTES", "20"))
+    select_cap = args.select_batch_cap if args.select_batch_cap is not None else int(
+        os.getenv("SELECTION_BATCH_CAP", "0"))
+    select_limit = max(1, select_limit)
+
     if publish_interval > 0:
         print(f"📤 Drip publishing: one video every {publish_interval} minute(s)")
     else:
         print("📤 Publishing: immediate (each edited video published in order)")
+
+    if selection_enabled:
+        print(f"🏆 Batch selection: best {select_limit} clip(s) per batch, ranked after "
+              f"{select_quiet} min of quiet editing"
+              + (f" (early rank at {select_cap} candidates)" if select_cap > 0 else ""))
+    else:
+        print("🏆 Batch selection disabled — every edited clip is queued")
 
     print(f"👀 Monitoring: {video_folder_path.absolute()}")
     print(f"📁 Output to: {output_folder.absolute()}")
@@ -438,6 +572,10 @@ def main():
         publish_interval_minutes=publish_interval,
         max_publish_retries=max_retries,
         dashboard_interval_seconds=dashboard_interval,
+        selection_enabled=selection_enabled,
+        selection_limit=select_limit,
+        selection_quiet_minutes=select_quiet,
+        selection_batch_cap=select_cap,
     )
 
     # Start the queue worker and the publish scheduler

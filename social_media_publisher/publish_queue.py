@@ -168,6 +168,19 @@ class PublishQueue:
                 entry.status = STATUS_PENDING  # eligible for another attempt
             self._save()
 
+    def active_video_names(self) -> List[str]:
+        """Names of entries still awaiting publication (pending or in flight).
+
+        Used at startup so a clip left in an inconsistent state by a crash —
+        enqueued but not yet marked decided — is never published a second time.
+        """
+        with self._lock:
+            return [
+                e.video_name
+                for e in self._entries
+                if e.status in (STATUS_PENDING, STATUS_PUBLISHING)
+            ]
+
     def get_last_publish_time(self) -> Optional[float]:
         with self._lock:
             return self._last_publish_time
