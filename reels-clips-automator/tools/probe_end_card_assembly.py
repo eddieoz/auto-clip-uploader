@@ -251,21 +251,6 @@ def all_frames_pts(path):
     return [float(v) for v in pts if v != "N/A"]
 
 
-def all_frames_pts(path):
-    """Presentation timestamps of every video frame, in decode order.
-
-    Used to locate the end card by frame count rather than by keyframe:
-    see the occupancy check in assess().
-    """
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
-        capture_output=True, text=True,
-    )
-    pts = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    return [float(v) for v in pts if v != "N/A"]
-
-
 def keyframes(path):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",

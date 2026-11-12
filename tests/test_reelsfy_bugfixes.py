@@ -281,3 +281,35 @@ class TestIntervalPrintGatedBehindDebugFaces:
 
         captured = capsys.readouterr()
         assert "tracking_mode=" in captured.out
+
+
+class TestCollectSegmentWordsToleratesMalformedWords:
+    """A malformed word entry must degrade to the documented fallback
+    (re-transcription) instead of killing the run with KeyError/TypeError."""
+
+    def test_missing_start_end_keys_returns_none(self):
+        segments = [{"words": [{"word": "hello"}]}]
+
+        assert reelsfy.collect_segment_words(segments, "00:00:00,000", "00:00:10,000") is None
+
+    def test_non_numeric_start_end_values_returns_none(self):
+        segments = [{"words": [{"word": "hello", "start": None, "end": 1.0}]}]
+
+        assert reelsfy.collect_segment_words(segments, "00:00:00,000", "00:00:10,000") is None
+
+    def test_malformed_entries_skipped_valid_words_kept(self):
+        segments = [
+            {
+                "words": [
+                    {"word": "bad", "start": "oops"},
+                    {"word": "good", "start": 1.0, "end": 2.0},
+                ]
+            }
+        ]
+
+        words = reelsfy.collect_segment_words(segments, "00:00:00,000", "00:00:10,000")
+
+        assert words is not None
+        assert [w["word"] for w in words] == ["good"]
+        assert words[0]["start"] == 1.0
+        assert words[0]["end"] == 2.0

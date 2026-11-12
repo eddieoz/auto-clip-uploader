@@ -133,15 +133,20 @@ def short_env():
         yield env
 
 
+def _cmd_str(cmd):
+    """reelsfy no longer runs a shell: rejoin list args for asserts."""
+    return " ".join(cmd) if isinstance(cmd, list) else cmd
+
+
 def _pipe_command_of(env):
     assert env["popen"].call_args is not None, (
         "generate_short must start the pipe ffmpeg process"
     )
-    return env["popen"].call_args[0][0]
+    return _cmd_str(env["popen"].call_args[0][0])
 
 
 def _legacy_commands_of(env):
-    return [args[0][0] for args in env["call"].call_args_list]
+    return [_cmd_str(args[0][0]) for args in env["call"].call_args_list]
 
 
 class TestSegmentsFastSeek:
@@ -158,7 +163,7 @@ class TestSegmentsFastSeek:
         with patch.object(reelsfy.subprocess, "call") as call_mock:
             reelsfy.generate_segments([self._segment()])
 
-        command = call_mock.call_args[0][0]
+        command = _cmd_str(call_mock.call_args[0][0])
         assert "-ss 10.0 -to 40.0 -i tmp/input_video.mp4" in command
         assert command.index("-ss 10.0") < command.index("-i tmp/input_video.mp4")
         # NVENC output settings unchanged.
@@ -177,7 +182,7 @@ class TestSegmentsFastSeek:
         with patch.object(reelsfy.subprocess, "call") as call_mock:
             reelsfy.generate_segments([self._segment()], jump_cut_plans=plans)
 
-        command = call_mock.call_args[0][0]
+        command = _cmd_str(call_mock.call_args[0][0])
         assert command.count("-i tmp/input_video.mp4") == 2
         # Each "-ss ... -to ... -i ..." substring guarantees the trim
         # options precede that piece's input flag.

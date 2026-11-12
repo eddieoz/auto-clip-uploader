@@ -509,8 +509,15 @@ if __name__ == "__main__":
 
             # Create simple test audio
             import subprocess
-            cmd = "ffmpeg -y -f lavfi -i sine=frequency=440:duration=10 -ac 1 -ar 22050 tmp/test_audio.wav"
-            subprocess.call(cmd, shell=True, stderr=subprocess.DEVNULL)
+            subprocess.call(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=10",
+                    "-ac", "1", "-ar", "22050", test_audio,
+                ],
+                shell=False,
+                stderr=subprocess.DEVNULL,
+            )
             
             if os.path.exists(test_audio):
                 analyzer = EnhancedAudioAnalyzer(test_audio)

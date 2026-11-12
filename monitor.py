@@ -283,8 +283,18 @@ class NewVideoHandler(FileSystemEventHandler):
         """Process a video file using reelsfy"""
         with self.lock:
             video_name = Path(video_path).stem  # filename without extension
+            # The watched folder is external input: a name containing path
+            # separators or dot components must not be able to steer the
+            # output directory outside output/.
+            video_name = re.sub(r"[^A-Za-z0-9._-]+", "_", video_name).strip("._") or "untitled"
             output_base_dir = Path("output")
             video_output_dir = output_base_dir / video_name
+            # Containment guard: the write sites below (logs, organized
+            # outputs) must stay under output/ even if a future rename
+            # weakens the name sanitization above.
+            if video_output_dir.resolve().parent != output_base_dir.resolve():
+                print(f"⚠️  Refusing unsafe output dir for {video_name!r}; skipping")
+                return
             
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing video: {Path(video_path).name}")
             print(f"Output directory: {video_output_dir}")

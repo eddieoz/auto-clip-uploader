@@ -102,9 +102,15 @@ def _run_generate_subtitle(tmp_path, monkeypatch, main_output_path=None, subtitl
     return result, call_mock
 
 
+def _cmd_str(cmd):
+    """reelsfy no longer runs a shell: subprocess args are lists.
+    Rejoin them so string assertions keep working."""
+    return " ".join(cmd) if isinstance(cmd, list) else cmd
+
+
 def _commands_called(call_mock):
-    """Extract all shell command strings passed to subprocess.call."""
-    return [args[0][0] for args in call_mock.call_args_list]
+    """Extract all command strings passed to subprocess.call."""
+    return [_cmd_str(args[0][0]) for args in call_mock.call_args_list]
 
 
 class TestParseHookFields:
@@ -326,7 +332,7 @@ class TestTeaserCommandBuilders:
         assert "-f concat" in command
         assert "-safe 0" in command
         assert "-c copy" in command
-        assert '"/out/final-test_cropped000.mp4"' in command
+        assert "/out/final-test_cropped000.mp4" in command
 
     def test_concat_fallback_reencodes_video_copies_audio(self):
         command = reelsfy.build_teaser_concat_fallback_command(
@@ -415,7 +421,7 @@ class TestGenerateSubtitleMainOutputPath:
         commands = _commands_called(call_mock)
         final_cmds = [c for c in commands if "final-test_cropped000.mp4" in c or "hook-main.mp4" in c]
         assert final_cmds
-        assert any('tmp/hook-main.mp4"' in c for c in final_cmds)
+        assert any("tmp/hook-main.mp4" in c for c in final_cmds)
         # The burned main file is NOT written to the published output dir
         assert not any(
             f"{tmp_path / 'work' / 'output'}" in c and "hook-main" in c
@@ -431,7 +437,7 @@ class TestGenerateSubtitleMainOutputPath:
         ]
         assert published
         assert any(
-            f'"{tmp_path / "work" / "output"}/final-test_cropped000.mp4"' in c
+            f"{tmp_path / 'work' / 'output'}/final-test_cropped000.mp4" in c
             for c in published
         )
 
@@ -509,7 +515,7 @@ class TestAssembleHookTeaserFinal:
             assert os.path.isabs(entry), entry
         assert entries[0].endswith("tmp/hook-teaser.mp4")
         assert entries[1].endswith("tmp/hook-main.mp4")
-        command = call_mock.call_args[0][0]
+        command = _cmd_str(call_mock.call_args[0][0])
         assert "-f concat" in command
         assert "-c copy" in command
 
@@ -517,7 +523,7 @@ class TestAssembleHookTeaserFinal:
         result, call_mock, _ = self._run(tmp_path, [1, 0])
 
         assert result is True
-        fallback_command = call_mock.call_args_list[1][0][0]
+        fallback_command = _cmd_str(call_mock.call_args_list[1][0][0])
         assert "h264_nvenc" in fallback_command
         assert "-c:a copy" in fallback_command
         assert reelsfy.AUDIO_MASTERING_FILTER not in fallback_command
@@ -1023,4 +1029,4 @@ class TestNoTeaserPathByteIdentical:
             if f"{tmp_path / 'work' / 'output'}" in c
         ]
         assert len(final_cmds) == 1
-        assert f"-af \"{reelsfy.AUDIO_MASTERING_FILTER}\"" in final_cmds[0]
+        assert f"-af {reelsfy.AUDIO_MASTERING_FILTER}" in final_cmds[0]

@@ -96,7 +96,11 @@ def _run_generate_subtitle(tmp_path, monkeypatch, main_output_path=None):
             main_output_path=main_output_path,
         )
 
-    commands = [args[0][0] for args in call_mock.call_args_list]
+    def _cmd_str(cmd):
+        # reelsfy no longer runs a shell: subprocess args are lists.
+        return " ".join(cmd) if isinstance(cmd, list) else cmd
+
+    commands = [_cmd_str(args[0][0]) for args in call_mock.call_args_list]
     return result, commands
 
 
@@ -149,7 +153,7 @@ class TestGradeInGenerateSubtitle:
             "grade must be burned before the captions, not after"
         )
         # The grade opens the filter_complex and hands [v0] to the captions.
-        assert f'-filter_complex "{GRADE_FILTER}[v0];[v0]subtitles=' in command
+        assert f"-filter_complex {GRADE_FILTER}[v0];[v0]subtitles=" in command
 
     def test_grade_disabled_leaves_legacy_chain(self, tmp_path, monkeypatch):
         _clear_polish_env(monkeypatch)
@@ -162,7 +166,7 @@ class TestGradeInGenerateSubtitle:
         assert GRADE_FILTER not in command
         assert "lut3d=" not in command
         # Legacy audio mastering is untouched
-        assert f'-af "{reelsfy.AUDIO_MASTERING_FILTER}"' in command
+        assert f"-af {reelsfy.AUDIO_MASTERING_FILTER}" in command
 
     def test_video_lut_used_instead_of_eq_unsharp(self, tmp_path, monkeypatch):
         _clear_polish_env(monkeypatch)
@@ -229,7 +233,7 @@ class TestMusicBedInGenerateSubtitle:
 
         command = _final_mux_command(commands, output_dir)
 
-        assert f'-af "{reelsfy.AUDIO_MASTERING_FILTER}"' in command
+        assert f"-af {reelsfy.AUDIO_MASTERING_FILTER}" in command
         assert "amix" not in command
         assert "-stream_loop" not in command
 
@@ -243,13 +247,13 @@ class TestMusicBedInGenerateSubtitle:
 
         # Bed added as a looped extra input
         assert "-stream_loop -1" in command
-        assert '-i "music/bed-loop.mp3"' in command
+        assert "-i music/bed-loop.mp3" in command
         # Mixed UNDER the speech, then mastered exactly once
         assert "[1:a]volume=-24dB[m]" in command
         assert "[0:a][m]amix=inputs=2:duration=first[aout]" in command
         assert command.count(reelsfy.AUDIO_MASTERING_FILTER) == 1
         assert '-af "' not in command
-        assert '-map "[aout2]"' in command
+        assert "-map [aout2]" in command
         # Video chain unchanged: captions and overlays still burn, NVENC still
         # encodes
         assert "subtitles=" in command
@@ -376,7 +380,7 @@ class TestEndCardConcatFullFallback:
         assert "-f concat" in command
         assert "-safe 0" in command
         assert "h264_nvenc" in command
-        assert '-c:a aac -b:a 192k "/out/final-x.mp4"' in command
+        assert "-c:a aac -b:a 192k /out/final-x.mp4" in command
         # Never re-master audio over the concatenation
         assert reelsfy.AUDIO_MASTERING_FILTER not in command
 
@@ -419,7 +423,8 @@ class TestAssembleHookTeaserFinalEndCard:
         assert entries[1].endswith("tmp/hook-main.mp4")
         assert entries[2].endswith("tmp/end-card.mp4")
         # First ladder rung is unchanged: -c copy
-        assert "-c copy" in call_mock.call_args_list[0][0][0]
+        first_cmd = call_mock.call_args_list[0][0][0]
+        assert "-c copy" in (" ".join(first_cmd) if isinstance(first_cmd, list) else first_cmd)
 
     def test_no_end_card_keeps_legacy_two_entry_list(self, tmp_path):
         result, _, concat_list = self._run(tmp_path, [0])
@@ -433,7 +438,9 @@ class TestAssembleHookTeaserFinalEndCard:
         result, call_mock, _ = self._run(tmp_path, [1, 1, 0], end_card_path="tmp/end-card.mp4")
 
         assert result is True
-        first, second, third = [c[0][0] for c in call_mock.call_args_list]
+        def _cmd_str(cmd):
+            return " ".join(cmd) if isinstance(cmd, list) else cmd
+        first, second, third = [_cmd_str(c[0][0]) for c in call_mock.call_args_list]
         assert "-c copy" in first
         assert "h264_nvenc" in second
         assert "-c:a copy" in second

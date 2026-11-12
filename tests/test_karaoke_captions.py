@@ -257,6 +257,21 @@ class TestBuilderEscapingAndTime:
 # ---------------------------------------------------------------------------
 
 
+def _hermetic_cwd(monkeypatch, tmp_path):
+    """Isolate the test from the surrounding machine.
+
+    generate_subtitle resolves tmp/ relative to the cwd, the overlay gates
+    read os.getenv at call time, and get_channel_name() walks up the
+    directory tree looking for a root .env — so run from a scratch dir
+    containing an empty tmp/ and clear the ambient CHANNEL_NAME.
+    """
+    scratch = tmp_path / "cwd"
+    (scratch / "tmp").mkdir(parents=True)
+    monkeypatch.chdir(scratch)
+    monkeypatch.delenv("CHANNEL_NAME", raising=False)
+    return scratch
+
+
 class TestGenerateSubtitleWiring:
     def _run(self, subtitle_words, input_file="karaoke_wired.mp4", output_dir="/tmp/out"):
         captured = {}
@@ -274,38 +289,57 @@ class TestGenerateSubtitleWiring:
             )
         return result, captured.get("cmd", "")
 
-    def test_burns_ass_file_without_force_style(self, tmp_path):
+    def test_burns_ass_file_without_force_style(self, tmp_path, monkeypatch):
+        scratch = _hermetic_cwd(monkeypatch, tmp_path)
+        # The date overlay is read at call time; force it on so the expected
+        # drawtext is deterministic regardless of any ambient .env.
+        monkeypatch.setenv("OVERLAY_DATE_ENABLED", "true")
         words = _words("hello", "karaoke", "world")
-        result, cmd = self._run(
-            words, input_file="karaoke_wired.mp4", output_dir=str(tmp_path)
-        )
+        captured = {}
+
+        def fake_call(cmd, *args, **kwargs):
+            # reelsfy no longer runs a shell: rejoin list args for asserts.
+            captured["cmd"] = " ".join(cmd) if isinstance(cmd, list) else cmd
+            return 0
+
+        with patch.object(reelsfy.subprocess, "call", side_effect=fake_call):
+            result = reelsfy.generate_subtitle(
+                "karaoke_wired.mp4",
+                "video-id",
+                str(tmp_path),
+                subtitle_words=words,
+            )
+        cmd = captured.get("cmd", "")
 
         assert result is True
         assert "subtitles='tmp/karaoke_wired.ass'" in cmd
         assert "force_style" not in cmd
         # ASS file must have been written with the builder output
-        assert Path(PROJECT_ROOT / "tmp" / "karaoke_wired.ass").exists()
-        ass_doc = (PROJECT_ROOT / "tmp" / "karaoke_wired.ass").read_text()
+        assert Path("tmp/karaoke_wired.ass").exists()
+        ass_doc = Path("tmp/karaoke_wired.ass").read_text()
         assert "HELLO" in ass_doc
         # overlays chain unchanged: date drawtext follows the subtitles filter
         assert "drawtext" in cmd
         # cleanup
-        (PROJECT_ROOT / "tmp" / "karaoke_wired.ass").unlink(missing_ok=True)
+        Path("tmp/karaoke_wired.ass").unlink(missing_ok=True)
 
-    def test_no_transcription_when_words_provided(self, tmp_path):
+    def test_no_transcription_when_words_provided(self, tmp_path, monkeypatch):
+        _hermetic_cwd(monkeypatch, tmp_path)
         words = _words("hello", "world")
         called_cmds = []
         try:
             with patch.object(
                 reelsfy.subprocess,
                 "call",
-                side_effect=lambda c, shell=False: called_cmds.append(c) or 0,
+                side_effect=lambda c, *a, **k: called_cmds.append(
+                    " ".join(c) if isinstance(c, list) else c
+                ) or 0,
             ):
                 reelsfy.generate_subtitle(
                     "karaoke_notrans.mp4", "vid", str(tmp_path), subtitle_words=words
                 )
         finally:
-            (PROJECT_ROOT / "tmp" / "karaoke_notrans.ass").unlink(missing_ok=True)
+            Path("tmp/karaoke_notrans.ass").unlink(missing_ok=True)
 
         assert called_cmds, "ffmpeg burn command must still run"
         for c in called_cmds:
@@ -315,10 +349,10 @@ class TestGenerateSubtitleWiring:
 
 
 class TestGenerateSubtitleFallback:
-    def test_fallback_srt_path_unchanged_when_words_absent(self, monkeypatch):
+    def test_fallback_srt_path_unchanged_when_words_absent(self, monkeypatch, tmp_path):
+        scratch = _hermetic_cwd(monkeypatch, tmp_path)
         input_file = "karaoke_fallback.mp4"
-        srt_path = PROJECT_ROOT / "tmp" / "karaoke_fallback.srt"
-        audio_path = PROJECT_ROOT / "tmp" / "subtitle_audio_karaoke_fallback.mp4.wav"
+        srt_path = scratch / "tmp" / "karaoke_fallback.srt"
 
         # Real transcriber stub: audio extraction "succeeds", transcribe
         # returns one segment -> SRT content built and burned with force_style.
@@ -345,14 +379,16 @@ class TestGenerateSubtitleFallback:
 
         captured = {}
 
-        def fake_call(cmd, shell=False):
-            captured.setdefault("cmds", []).append(cmd)
+        def fake_call(cmd, *args, **kwargs):
+            captured.setdefault("cmds", []).append(
+                " ".join(cmd) if isinstance(cmd, list) else cmd
+            )
             return 0
 
         try:
             with patch.object(reelsfy.subprocess, "call", side_effect=fake_call):
                 result = reelsfy.generate_subtitle(
-                    input_file, "vid", str(PROJECT_ROOT / "tmp" / "out-karaoke")
+                    input_file, "vid", str(scratch / "tmp" / "out-karaoke")
                 )
         finally:
             srt_path.unlink(missing_ok=True)

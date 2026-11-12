@@ -238,7 +238,7 @@ class TestGenerateSubtitleUsesOverlayHelper:
         commands = []
 
         def fake_call(cmd, *args, **kwargs):
-            commands.append(cmd)
+            commands.append(" ".join(cmd) if isinstance(cmd, list) else cmd)
             return 0
 
         monkeypatch.setattr(reelsfy.subprocess, "call", fake_call)
@@ -306,7 +306,11 @@ class TestGenerateSubtitleUsesOverlayHelper:
         monkeypatch.setattr(reelsfy, "get_channel_name", lambda: "TestChannel")
         commands = []
         monkeypatch.setattr(
-            reelsfy.subprocess, "call", lambda cmd, *a, **k: commands.append(cmd) or 0
+            reelsfy.subprocess,
+            "call",
+            lambda cmd, *a, **k: commands.append(
+                " ".join(cmd) if isinstance(cmd, list) else cmd
+            ) or 0,
         )
 
         result = reelsfy.generate_subtitle(

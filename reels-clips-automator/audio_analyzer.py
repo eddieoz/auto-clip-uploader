@@ -206,8 +206,14 @@ if __name__ == "__main__":
             print(f"Creating test audio file at: {audio_path}")
             
             # Generate a test tone
-            command = f"ffmpeg -y -f lavfi -i sine=frequency=440:duration=5 -ac 1 -ar 22050 {audio_path}"
-            subprocess.call(command, shell=True)
+            subprocess.call(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=5",
+                    "-ac", "1", "-ar", "22050", audio_path,
+                ],
+                shell=False,
+            )
             
             if not os.path.exists(audio_path):
                 print("Failed to create test audio file")

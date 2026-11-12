@@ -90,9 +90,15 @@ def _run_generate_subtitle(tmp_path, monkeypatch, segments):
     return result, call_mock
 
 
+def _cmd_str(cmd):
+    """reelsfy no longer runs a shell: subprocess args are lists.
+    Rejoin them so string assertions keep working."""
+    return " ".join(cmd) if isinstance(cmd, list) else cmd
+
+
 def _commands_called(call_mock):
-    """Extract all shell command strings passed to subprocess.call."""
-    return [args[0][0] for args in call_mock.call_args_list]
+    """Extract all command strings passed to subprocess.call."""
+    return [_cmd_str(args[0][0]) for args in call_mock.call_args_list]
 
 
 class TestFilterChainDefinition:
@@ -212,7 +218,7 @@ class TestSingleApplicationInvariant:
         commands = []
 
         def popen_command_recorder(command, *args, **kwargs):
-            commands.append(command)
+            commands.append(" ".join(command) if isinstance(command, list) else command)
             return proc
 
         with patch.object(reelsfy.cv2, "VideoCapture", return_value=cap), patch.object(

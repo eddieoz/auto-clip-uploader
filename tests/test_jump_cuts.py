@@ -289,6 +289,8 @@ class TestGenerateSegmentsAppliesPlan:
             reelsfy.generate_segments([self._segment()], jump_cut_plans=plans)
 
         command = call_mock.call_args[0][0]
+        if isinstance(command, list):  # reelsfy no longer runs a shell
+            command = " ".join(command)
         assert "concat" in command
         # One input per piece, each with its own trim.
         assert command.count("-i tmp/input_video.mp4") == 2
@@ -304,6 +306,8 @@ class TestGenerateSegmentsAppliesPlan:
             reelsfy.generate_segments([self._segment()], jump_cut_plans=plans)
 
         command = call_mock.call_args[0][0]
+        if isinstance(command, list):  # reelsfy no longer runs a shell
+            command = " ".join(command)
         # Same command shape as the no-plan single cut, now with the
         # Story 9 fast seek (-ss/-to before -i).
         assert command == (
@@ -319,6 +323,8 @@ class TestGenerateSegmentsAppliesPlan:
             reelsfy.generate_segments([self._segment()])
 
         command = call_mock.call_args[0][0]
+        if isinstance(command, list):  # reelsfy no longer runs a shell
+            command = " ".join(command)
         assert "concat" not in command
         assert "-ss 10.0 -to 40.0" in command
 
@@ -337,6 +343,8 @@ class TestGenerateSegmentsAppliesPlan:
             reelsfy.generate_segments([segment], jump_cut_plans=plans)
 
         command = call_mock.call_args[0][0]
+        if isinstance(command, list):  # reelsfy no longer runs a shell
+            command = " ".join(command)
         # 15 + (30 - 5) = 40 adjusted end lands in the final trim.
         assert "-to 40.0" in command
 

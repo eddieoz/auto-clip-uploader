@@ -1,5 +1,6 @@
 import random
 import re
+import shlex
 import sys
 import textwrap
 import time
@@ -62,6 +63,27 @@ face_enhancer = None
 import argparse
 import glob
 import re
+
+
+def _contained_path(base_dir, filename):
+    """Join filename under base_dir, refusing escapes outside it.
+
+    Returns the same joined form the call site would have built (relative
+    stays relative), so existing behavior is unchanged; the check only
+    refuses paths that would land outside base_dir. Defense in depth for
+    writes whose base directory ultimately derives from watched-folder
+    names: even with upstream sanitization, a write must never land
+    outside the directory it was meant for.
+    """
+    joined = os.path.join(str(base_dir), str(filename))
+    base = os.path.abspath(str(base_dir))
+    full = os.path.abspath(joined)
+    if full != base and not full.startswith(base + os.sep):
+        raise ValueError(
+            f"path escapes its base directory: {filename!r} under {base_dir!r}"
+        )
+    return joined
+
 
 def sanitize_filename(filename):
     """
@@ -488,7 +510,7 @@ def _build_multi_piece_command(pieces, output_file):
         + f" -filter_complex \"{filter_complex}\" -map \"[out_v]\" -map \"[out_a]\" "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k "
-        f"tmp/{output_file}"
+        f"tmp/{shlex.quote(output_file)}"
     )
 
 
@@ -503,7 +525,7 @@ def build_single_piece_command(start_time, end_time, output_file):
         f"-ss {start_time} -to {end_time} -i tmp/input_video.mp4 "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k -c:a aac -b:a 192k "
-        f"tmp/{output_file}"
+        f"tmp/{shlex.quote(output_file)}"
     )
 
 
@@ -538,7 +560,7 @@ def generate_segments(response, jump_cut_plans=None):
             command = _build_multi_piece_command(pieces, str(output_file))
         else:
             command = build_single_piece_command(start_time, end_time, str(output_file))
-        subprocess.call(command, shell=True)
+        run_ffmpeg_command(command)
 
 
 def compute_jump_cut_plans(segments, transcript_segments, pause_threshold):
@@ -1221,7 +1243,7 @@ def build_pipe_ffmpeg_command(sanitized_input, sanitized_output, input_fps):
     return (
         "ffmpeg -y "
         f"-f rawvideo -pix_fmt bgr24 -s 1080x1920 -r {input_fps} -i pipe:0 "
-        f"-i tmp/{sanitized_input} "
+        f"-i tmp/{shlex.quote(sanitized_input)} "
         "-map 0:v -map 1:a "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k "
@@ -1229,7 +1251,7 @@ def build_pipe_ffmpeg_command(sanitized_input, sanitized_output, input_fps):
         f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} "
         f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
         f"-ac {ASSEMBLY_AUDIO_CHANNELS} "
-        f"tmp/{sanitized_output}"
+        f"tmp/{shlex.quote(sanitized_output)}"
     )
 
 
@@ -1454,7 +1476,7 @@ def generate_short(
             print(f"Single-pass encode command: {pipe_command}")
             try:
                 pipe_proc = subprocess.Popen(
-                    pipe_command, shell=True, stdin=subprocess.PIPE
+                    shlex.split(pipe_command), shell=False, stdin=subprocess.PIPE
                 )
                 out = _PipeFrameWriter(pipe_proc)
             except Exception as e:
@@ -2052,22 +2074,22 @@ def generate_short(
             # capture's 44100. Left alone, that is the original freeze, plus a
             # silent 0.40 s desync, re-introduced on the fallback path only.
             command = (
-                f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_input} -vn "
+                f"ffmpeg -y -hwaccel cuda -i tmp/{shlex.quote(sanitized_input)} -vn "
                 f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
                 f"-ac {ASSEMBLY_AUDIO_CHANNELS} tmp/output-audio.aac"
             )
-            subprocess.call(command, shell=True)
+            run_ffmpeg_command(command)
 
             command = (
-                f"ffmpeg -y -hwaccel cuda -i tmp/{sanitized_output} "
+                f"ffmpeg -y -hwaccel cuda -i tmp/{shlex.quote(sanitized_output)} "
                 f"-i tmp/output-audio.aac "
                 f"-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 "
                 f"-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k "
                 f"-pix_fmt yuv420p -r {ASSEMBLY_FPS} "
                 f"-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} "
-                f"-c:a copy tmp/final-{sanitized_output}"
+                f"-c:a copy tmp/final-{shlex.quote(sanitized_output)}"
             )
-            subprocess.call(command, shell=True)
+            run_ffmpeg_command(command)
 
         # Save performance report if profiling is enabled
         if profiler is not None:
@@ -3856,7 +3878,7 @@ def generate_viral(
             # Save audio analysis results for each segment
             if output_dir:
                 # Create an audio analysis summary file
-                summary_file = os.path.join(output_dir, "audio_analysis_summary.txt")
+                summary_file = _contained_path(output_dir, "audio_analysis_summary.txt")
                 with open(summary_file, "w", encoding="utf-8") as f:
                     f.write("Audio Analysis Summary\n")
                     f.write("=====================\n\n")
@@ -4148,8 +4170,11 @@ def generate_transcript(input_file):
 
     print(f"Extracting audio from {input_file}...")
     # Use subprocess instead of ffmpeg-python
-    audio_cmd = f"ffmpeg -y -i tmp/{input_file} -vn -acodec pcm_s16le -ac 1 -ar 16000 {audio_path}"
-    subprocess.call(audio_cmd, shell=True)
+    audio_cmd = (
+        f"ffmpeg -y -i tmp/{shlex.quote(input_file)} "
+        f"-vn -acodec pcm_s16le -ac 1 -ar 16000 {shlex.quote(audio_path)}"
+    )
+    run_ffmpeg_command(audio_cmd)
 
     try:
         # Get transcriber through the service factory
@@ -4248,7 +4273,7 @@ Source: {metadata.get('source_link', 'N/A')}
         if extra_lines:
             formatted_text = formatted_text.rstrip("\n") + extra_lines + "\n"
         # Save to file
-        metadata_file = os.path.join(output_dir, "description.txt")
+        metadata_file = _contained_path(output_dir, "description.txt")
         with open(metadata_file, "w", encoding="utf-8") as file:
             file.write(formatted_text)
         print(f"Metadata saved to {metadata_file}")
@@ -4486,9 +4511,12 @@ def __main__():
     # - Use 22050Hz sample rate which works well with librosa
     # - Use PCM 16-bit format
     # - Don't use hardware acceleration for audio extraction
-    command = f"ffmpeg -y -i tmp/input_video.mp4 -vn -acodec pcm_s16le -ar 22050 -ac 1 {audio_path}"
+    command = (
+        "ffmpeg -y -i tmp/input_video.mp4 -vn -acodec pcm_s16le -ar 22050 -ac 1 "
+        f"{shlex.quote(audio_path)}"
+    )
     print(f"Running audio extraction command: {command}")
-    subprocess.call(command, shell=True)
+    run_ffmpeg_command(command)
 
     # Verify the audio file was created correctly
     if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
@@ -4512,8 +4540,11 @@ def __main__():
         # Try a different extraction approach as fallback
         fallback_audio_path = f"tmp/audio_fallback.wav"
         print(f"Trying alternative extraction approach to: {fallback_audio_path}")
-        command = f"ffmpeg -y -i tmp/input_video.mp4 -vn -acodec pcm_s16le -ar 16000 -ac 1 {fallback_audio_path}"
-        subprocess.call(command, shell=True)
+        command = (
+            "ffmpeg -y -i tmp/input_video.mp4 -vn -acodec pcm_s16le -ar 16000 -ac 1 "
+            f"{shlex.quote(fallback_audio_path)}"
+        )
+        run_ffmpeg_command(command)
 
         if (
             os.path.exists(fallback_audio_path)
@@ -4528,7 +4559,7 @@ def __main__():
                 pass
 
     # Copy the audio file to the output directory for reference
-    output_audio_path = f"{output_dir}/audio_analysis.wav"
+    output_audio_path = _contained_path(output_dir, "audio_analysis.wav")
     try:
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
             shutil.copy2(audio_path, output_audio_path)
@@ -4537,8 +4568,8 @@ def __main__():
         print(f"Warning: Could not copy audio file to output directory: {str(e)}")
 
     # Verifies if output_file exists, or create it. If exists, it doesn't call OpenAI APIs
-    output_file = f"{output_dir}/content.txt"
-    transcript_file = f"{output_dir}/transcript.txt"
+    output_file = _contained_path(output_dir, "content.txt")
+    transcript_file = _contained_path(output_dir, "transcript.txt")
     transcript_done = False
 
     print(f"\n==== Transcript Generation ====")
@@ -4999,7 +5030,7 @@ def generate_end_card():
     try:
         command = build_end_card_command()
         print(f"End card command: {command}")
-        result = subprocess.call(command, shell=True)
+        result = run_ffmpeg_command(command)
         end_card_path = f"tmp/{END_CARD_FILE}"
         if (
             result != 0
@@ -5152,8 +5183,13 @@ def collect_segment_words(segments, start_time, end_time):
     words = []
     for segment in segments or []:
         for word in segment.get("words") or []:
-            start = float(word["start"])
-            end = float(word["end"])
+            # A malformed entry must not defeat the documented fallback: skip
+            # it and let an empty result degrade to re-transcription.
+            try:
+                start = float(word["start"])
+                end = float(word["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
             midpoint = (start + end) / 2
             if seg_start <= midpoint <= seg_end:
                 words.append(
@@ -5164,6 +5200,17 @@ def collect_segment_words(segments, start_time, end_time):
                     }
                 )
     return words if words else None
+
+
+def run_ffmpeg_command(command):
+    """Run a shell-built ffmpeg command WITHOUT a shell.
+
+    Every command string this module executes is POSIX-exact, so
+    shlex.split yields exactly the argv a shell would produce — minus the
+    injection surface: an interpolated path or text can no longer add shell
+    syntax, it can only change its own argument.
+    """
+    return subprocess.call(shlex.split(command), shell=False)
 
 
 def get_channel_name():
@@ -5237,6 +5284,13 @@ def build_overlay_filters(date_text, title_text, input_label="0:v"):
     """
     filters = []
     last_label = input_label
+    # The filter strings land inside a shell double-quoted -filter_complex:
+    # strip the characters that stay shell-alive there (env-derived title,
+    # e.g. CHANNEL_NAME, must not be able to break out).
+    if date_text:
+        date_text = re.sub(r'["`$\\]', "", str(date_text))
+    if title_text:
+        title_text = re.sub(r'["`$\\]', "", str(title_text))
     if date_text:
         filters.append(
             f"[{last_label}]drawtext=text='{date_text}':fontfile={OVERLAY_FONTFILE}:fontsize={OVERLAY_FONT_SIZE}:fontcolor={OVERLAY_FONT_COLOR}:x={OVERLAY_X_MARGIN}:y={OVERLAY_Y}:shadowcolor=black:shadowx=2:shadowy=2[v2]"
@@ -5353,9 +5407,14 @@ def sanitize_hook_text(text):
 
     Uppercases (hook style), strips apostrophes (drawtext would otherwise
     break the quoting), and escapes ':' and '%' like drawtext requires.
+    Also strips the characters that stay shell-alive inside the double
+    quotes wrapping the -vf argument (" ` $ \\), so LLM-derived hook text
+    can never break out of the ffmpeg command.
     """
     text = str(text).strip().upper()
     text = text.replace("'", "")
+    for ch in ('"', "`", "$", "\\"):
+        text = text.replace(ch, "")
     text = text.replace(":", r"\:")
     text = text.replace("%", r"\%")
     return text
@@ -5429,8 +5488,8 @@ def build_teaser_burn_command(hook_text):
 def build_teaser_concat_command(concat_list_path, published_path):
     """Stream-copy concat of teaser + main into the published path."""
     return (
-        f'ffmpeg -y -f concat -safe 0 -i "{concat_list_path}" '
-        f'-c copy "{published_path}"'
+        f"ffmpeg -y -f concat -safe 0 -i {shlex.quote(concat_list_path)} "
+        f"-c copy {shlex.quote(published_path)}"
     )
 
 
@@ -5451,10 +5510,10 @@ def build_teaser_concat_full_fallback_command(concat_list_path, published_path):
     -c copy and the video-only re-encode fail. Audio is re-encoded WITHOUT
     the mastering chain — never re-mastered over the concatenation."""
     return (
-        f'ffmpeg -y -f concat -safe 0 -i "{concat_list_path}" '
+        f"ffmpeg -y -f concat -safe 0 -i {shlex.quote(concat_list_path)} "
         "-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 -b:v 10000k "
         "-maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p "
-        f'-c:a aac -b:a 192k "{published_path}"'
+        f"-c:a aac -b:a 192k {shlex.quote(published_path)}"
     )
 
 
@@ -5468,7 +5527,7 @@ def generate_hook_teaser(hook_start, hook_end, hook_text):
     try:
         command = build_teaser_cut_command(hook_start, hook_end)
         print(f"Hook teaser cut command: {command}")
-        result = subprocess.call(command, shell=True)
+        result = run_ffmpeg_command(command)
         raw_path = f"tmp/{HOOK_TEASER_RAW_FILE}"
         if (
             result != 0
@@ -5488,7 +5547,7 @@ def generate_hook_teaser(hook_start, hook_end, hook_text):
 
         command = build_teaser_burn_command(hook_text)
         print(f"Hook teaser burn command: {command}")
-        result = subprocess.call(command, shell=True)
+        result = run_ffmpeg_command(command)
         teaser_path = f"tmp/{HOOK_TEASER_OUTPUT_FILE}"
         if (
             result != 0
@@ -5539,7 +5598,7 @@ def assemble_hook_teaser_final(
                 f.write(f"file '{os.path.abspath(entry)}'\n")
         command = build_teaser_concat_command(concat_list_path, published_path)
         print(f"Hook teaser concat command: {command}")
-        result = subprocess.call(command, shell=True)
+        result = run_ffmpeg_command(command)
         if (
             result == 0
             and os.path.exists(published_path)
@@ -5555,7 +5614,7 @@ def assemble_hook_teaser_final(
             concat_list_path, published_path
         )
         print(f"Hook teaser fallback command: {command}")
-        result = subprocess.call(command, shell=True)
+        result = run_ffmpeg_command(command)
         if result == 0 and os.path.exists(published_path):
             print(f"Hook teaser fallback assembly complete: {published_path}")
             return True
@@ -5567,7 +5626,7 @@ def assemble_hook_teaser_final(
                 concat_list_path, published_path
             )
             print(f"Hook teaser full fallback command: {command}")
-            result = subprocess.call(command, shell=True)
+            result = run_ffmpeg_command(command)
             if result == 0 and os.path.exists(published_path):
                 print(
                     f"Hook teaser full fallback assembly complete: "
@@ -5900,8 +5959,11 @@ def generate_subtitle(
             # Extract audio from video for transcription
             audio_path = f"tmp/subtitle_audio_{os.path.basename(video_path)}.wav"
             print(f"Extracting audio for subtitle transcription: {audio_path}")
-            audio_cmd = f"ffmpeg -y -i {video_path} -vn -acodec pcm_s16le -ac 1 -ar 16000 {audio_path}"
-            subprocess.call(audio_cmd, shell=True)
+            audio_cmd = (
+                f"ffmpeg -y -i {shlex.quote(video_path)} "
+                f"-vn -acodec pcm_s16le -ac 1 -ar 16000 {shlex.quote(audio_path)}"
+            )
+            run_ffmpeg_command(audio_cmd)
 
             if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
                 print(f"Failed to extract audio from {video_path}")
@@ -6010,12 +6072,12 @@ def generate_subtitle(
 
     # Prefer karaoke captions from the master transcript words (no
     # re-transcription); fall back to the legacy SRT path otherwise.
-    input_base = os.path.basename(input_file).split(".")[0]
+    input_base = sanitize_filename(os.path.basename(input_file).split(".")[0])
     temp_ass_file = None
     if subtitle_words:
         ass_content = build_karaoke_ass(subtitle_words)
         if ass_content:
-            temp_ass_file = f"tmp/{input_base}.ass"
+            temp_ass_file = _contained_path("tmp", f"{input_base}.ass")
             try:
                 with open(temp_ass_file, "w", encoding="utf-8") as f:
                     f.write(ass_content)
@@ -6026,7 +6088,7 @@ def generate_subtitle(
         else:
             print("No word timestamps available, falling back to SRT subtitles")
 
-    temp_srt_file = f"tmp/{input_base}.srt"
+    temp_srt_file = _contained_path("tmp", f"{input_base}.srt")
     if temp_ass_file:
         srt_content = None
         temp_srt_file = None
@@ -6116,8 +6178,8 @@ def generate_subtitle(
                 else "-c copy"
             )
             ffmpeg_command = (
-                f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '
-                f'-stream_loop -1 -i "{music_bed}" '
+                f"ffmpeg -y -hwaccel cuda -i tmp/{shlex.quote(input_file)} "
+                f'-stream_loop -1 -i {shlex.quote(music_bed)} '
                 f'-filter_complex "{filter_complex}" '
                 f'{video_map} -map "[aout2]" '
                 f"{video_codec} "
@@ -6127,31 +6189,31 @@ def generate_subtitle(
                 # the first stream's parameters and emits a container longer
                 # than the sum of the pieces. Pin the shared shape here.
                 f"-c:a aac -b:a 192k -ar {ASSEMBLY_AUDIO_RATE} "
-                f"-ac {ASSEMBLY_AUDIO_CHANNELS} \"{output_path}\""
+                f"-ac {ASSEMBLY_AUDIO_CHANNELS} {shlex.quote(output_path)}"
             )
         elif filter_parts:
             filter_complex = ";".join(filter_parts)
             ffmpeg_command = (
-                f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
-                f'-filter_complex "{filter_complex}" '  # Added space
+                f"ffmpeg -y -hwaccel cuda -i tmp/{shlex.quote(input_file)} "
+                f'-filter_complex "{filter_complex}" '
                 f'-map "[{last_filter}]" -map 0:a '
                 f'-c:v h264_nvenc -profile:v high -rc:v vbr -qp 18 '
                 f'-b:v 10000k -maxrate:v 12000k -bufsize:v 15000k -pix_fmt yuv420p '
                 f'-video_track_timescale {ASSEMBLY_VIDEO_TIMESCALE} '
-                f'{build_audio_filter_args()} "{output_path}"'
+                f'{build_audio_filter_args()} {shlex.quote(output_path)}'
             )
     else:
         # No overlays, just copy
         ffmpeg_command = (
-            f'ffmpeg -y -hwaccel cuda -i "tmp/{input_file}" '  # Added space and quotes
-            f'-c copy "{output_path}"'  # Added quotes around output path
+            f"ffmpeg -y -hwaccel cuda -i tmp/{shlex.quote(input_file)} "
+            f"-c copy {shlex.quote(output_path)}"
         )
 
     print(f"Applying overlays with command: {ffmpeg_command}")
     
     # Add error handling and logging
     try:
-        result = subprocess.call(ffmpeg_command, shell=True)
+        result = run_ffmpeg_command(ffmpeg_command)
         if result == 0:
             print(f"Video with subtitles and overlays saved to: {output_path}")
             return True
